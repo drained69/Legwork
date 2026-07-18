@@ -35,7 +35,7 @@ async function demo(): Promise<void> {
 
   // 2. Buyer opens the deep link → binds Telegram user → onboards
   console.log(`2) Telegram: buyer opens t.me deep link (?start=${engagement.taskCode}) and onboards`);
-  const userId = 'demo-user-42';
+  const userId = `demo-user-${Date.now()}`; // fresh user each run — dedupe is per-user
   engagement.userId = userId;
   engagement.status = 'active';
   saveEngagement(engagement);

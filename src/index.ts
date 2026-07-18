@@ -32,14 +32,24 @@ async function main(): Promise<void> {
 
   if (bot) {
     console.log('[telegram] starting long polling…');
-    await bot.start();
+    // The bot must NEVER take down the OKX endpoint. A 409 polling conflict
+    // (two instances sharing a token) or a network blip would otherwise kill
+    // the paid x402 API and the marketplace endpoint with it.
+    bot.start().catch((err) => {
+      console.error('[telegram] polling stopped — OKX endpoint stays up:', err);
+    });
   } else {
     console.log('[telegram] TELEGRAM_BOT_TOKEN not set — bot disabled (OKX endpoint + scheduler still running).');
     console.log('           Run `npm run demo` for the keyless end-to-end demo.');
   }
 }
 
+// Keep the service alive through background faults: a rejected promise in a
+// cron scan or a Telegram call must not kill the paid API.
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
+process.on('uncaughtException', (err) => console.error('[uncaughtException]', err));
+
 main().catch((err) => {
-  console.error('fatal:', err);
+  console.error('fatal during startup:', err);
   process.exit(1);
 });

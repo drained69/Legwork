@@ -87,8 +87,9 @@ async function scoreWithLlm(profile: Profile, posting: Posting): Promise<LlmScor
     'culture = fit between posting culture signals and what the candidate profile implies. Be strict and specific.';
   const user =
     `Candidate skills: ${profile.skills.join(', ')}\n` +
-    `Candidate resume summary: ${profile.resumeText.slice(0, 2000)}\n` +
-    `Dealbreakers: ${profile.dealbreakers.join(', ') || 'none'}\n\n` +
+    `Candidate resume summary: ${profile.resumeText.slice(0, 2000) || '(not provided — score skills on the skills list alone)'}\n` +
+    `Dealbreakers: ${profile.dealbreakers.join(', ') || 'none'}\n` +
+    `Stated priorities (score culture against these when present): ${(profile.factors ?? []).join(', ') || 'none stated'}\n\n` +
     `Job: ${posting.title} at ${posting.company}\n${untrusted(posting.description.slice(0, 4000))}`;
   const reply = await llm(system, user, 400);
   if (!reply) return null;
@@ -107,6 +108,24 @@ function scoreHeuristic(profile: Profile, posting: Posting): LlmScores {
   const hits = profile.skills.filter((s) => text.includes(s.toLowerCase()));
   const frac = profile.skills.length ? hits.length / profile.skills.length : 0;
   const skillsScore = Math.round(frac * 40);
+
+  // Culture axis: when the user stated explicit priority factors, score how
+  // many the posting satisfies. Neutral 6/10 only when no factors were given.
+  const factors = profile.factors ?? [];
+  let culture: LlmScores['culture'];
+  if (factors.length) {
+    const fHits = factors.filter((f) => text.includes(f.toLowerCase()));
+    culture = {
+      score: Math.round((fHits.length / factors.length) * 10),
+      max: 10,
+      reason: fHits.length
+        ? `${fHits.length}/${factors.length} of your factors present: ${fHits.slice(0, 3).join(', ')}`
+        : `None of your stated factors (${factors.slice(0, 3).join(', ')}) appear in the posting`,
+    };
+  } else {
+    culture = { score: 6, max: 10, reason: 'No priority factors stated — neutral score' };
+  }
+
   return {
     skills: {
       score: skillsScore,
@@ -115,7 +134,7 @@ function scoreHeuristic(profile: Profile, posting: Posting): LlmScores {
         ? `${hits.length}/${profile.skills.length} of your skills appear: ${hits.slice(0, 4).join(', ')}`
         : 'None of your listed skills appear in the posting',
     },
-    culture: { score: 6, max: 10, reason: 'No LLM configured — neutral culture score' },
+    culture,
   };
 }
 

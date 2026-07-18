@@ -15,12 +15,28 @@ export interface SubmitResult {
   error?: string;
 }
 
+/**
+ * Where a submission will go. Resolved from the posting BEFORE approval so
+ * the owner sees the exact recipient in the final preview — a posting that
+ * embeds a hostile email address is visible, not silently used.
+ */
+export type SubmissionTarget = { method: 'email'; to: string } | { method: 'link'; url: string };
+
+export function resolveSubmissionTarget(posting: Posting): SubmissionTarget {
+  const email = extractEmail(posting.description);
+  return email ? { method: 'email', to: email } : { method: 'link', url: posting.url };
+}
+
 export async function submitApplication(
   app: Application,
   profile: Profile,
   posting: Posting,
 ): Promise<SubmitResult> {
   // ── the gate ─────────────────────────────────────────────────────────────
+  if (app.status === 'submitted') {
+    audit('apply-executor', 'REFUSED_DOUBLE_SUBMIT', `app=${app.id}`);
+    return { ok: false, error: 'Refused: this application was already submitted.' };
+  }
   if (app.status !== 'approved' || !app.approvalAt || !app.draftId) {
     audit('apply-executor', 'REFUSED_NO_APPROVAL', `app=${app.id} status=${app.status}`);
     return { ok: false, error: 'Refused: no recorded approval for this application.' };
@@ -35,14 +51,14 @@ export async function submitApplication(
   }
 
   let result: SubmitResult;
-  const emailTarget = extractEmail(posting.description);
-  if (emailTarget && config.gmail.enabled) {
-    result = await sendViaGmail(profile, draft, emailTarget);
-  } else if (emailTarget) {
+  const target = resolveSubmissionTarget(posting);
+  if (target.method === 'email' && config.gmail.enabled) {
+    result = await sendViaGmail(profile, draft, target.to);
+  } else if (target.method === 'email') {
     // Keyless demo mode: simulate the email path.
     result = {
       ok: true,
-      receipt: `SIMULATED email to ${emailTarget} at ${now()} (Gmail OAuth not configured) — subject: "${draft.emailSubject}"`,
+      receipt: `SIMULATED email to ${target.to} at ${now()} (Gmail OAuth not configured) — subject: "${draft.emailSubject}"`,
     };
   } else {
     // Direct-link path: no programmatic submit available for this ATS yet —

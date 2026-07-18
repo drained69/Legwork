@@ -41,18 +41,20 @@ export async function runScanCycle(engagement: Engagement): Promise<ScanSummary>
   const cards: MatchCard[] = [];
   let below = 0;
   let cappedOut = false;
+  // Snapshot BEFORE the loop — applications created this cycle are already
+  // counted via cards.length; querying inside the loop double-counts them.
+  const alreadyToday = countApplicationsToday(profile.userId);
 
   for (const posting of scan.newPostings) {
     // Daily cap: don't flood the chat.
-    if (countApplicationsToday(profile.userId) + cards.length >= profile.dailyCap) {
+    if (alreadyToday + cards.length >= profile.dailyCap) {
       cappedOut = true;
       break;
     }
     const breakdown = await scorePosting(profile, posting);
     if (breakdown.total < profile.threshold) {
       below++;
-      // Still record the skip-by-threshold so the digest can show near-misses.
-      continue;
+      continue; // below-threshold postings are counted per scan, not persisted
     }
     // Idempotency: never create two applications for the same posting.
     if (getApplicationByPosting(engagement.id, posting.id)) continue;

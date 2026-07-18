@@ -9,8 +9,9 @@ export interface Profile {
   remoteOk: boolean;
   compFloor: number; // annual, USD
   skills: string[];
-  resumeText: string; // pasted resume / structured summary
+  resumeText: string; // pasted resume / structured summary ('' for hunt-only)
   dealbreakers: string[];
+  factors?: string[]; // user-stated priorities ("4-day week", "equity", "healthcare") — scored on the culture axis
   threshold: number; // 0-100 score gate, default 70
   dailyCap: number; // max match cards per day
   email?: string; // address applications are sent from/for
@@ -96,10 +97,11 @@ export interface Engagement {
   okxBuyerAgentId?: string;
   taskCode: string; // one-time deep-link code
   userId?: string; // bound telegram user (after /start)
-  listing: string; // e.g. "job-search-sprint-7d"
+  listing: string; // e.g. "job-hunt" | "job-search-sprint-7d"
   status: EngagementStatus;
   startedAt: string;
   endsAt?: string;
+  shortlist?: string; // last hunt shortlist (full breakdowns) — the OKX deliverable for hunt listings
 }
 
 export interface OkxEnvelope {

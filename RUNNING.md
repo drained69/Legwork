@@ -4,6 +4,8 @@
 
 ```bash
 npm install
+npm test            # 19-test pre-launch suite: approval gate, idempotency,
+                    # OKX lifecycle, scoring rubric, dedupe, daily cap
 npm run demo        # full end-to-end loop with mock data:
                     # OKX hire → Telegram bind → scan → score → tailor →
                     # approval gate → submission → digest → OKX settlement

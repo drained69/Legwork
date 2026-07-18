@@ -1,10 +1,11 @@
 import cron from 'node-cron';
 import type { Bot } from 'grammy';
-import { listEngagements, saveEngagement } from './db.js';
+import { getProfile, listEngagements, saveEngagement } from './db.js';
 import { runScanCycle } from './pipeline.js';
 import { sendMatchCard } from './telegram/bot.js';
 import { buildDigest } from './digest.js';
 import { deliverEngagement } from './okx/server.js';
+import { chunkMessage, formatShortlist, runHunt } from './skills/jobHunt.js';
 
 /**
  * Background cadence:
@@ -16,6 +17,18 @@ export function startScheduler(bot: Bot | null): void {
   cron.schedule('0 */6 * * *', async () => {
     for (const e of listEngagements('active')) {
       try {
+        // Hunt listings: fresh shortlist of new matches (deduped per user) —
+        // no drafts, no application cards.
+        if (e.listing.startsWith('job-hunt')) {
+          const result = await runHunt(e);
+          if (bot && e.userId && result.matches.length) {
+            const profile = getProfile(e.userId)!;
+            for (const chunk of chunkMessage(formatShortlist(profile, result.matches, result.found))) {
+              await bot.api.sendMessage(Number(e.userId), chunk).catch(() => {});
+            }
+          }
+          continue;
+        }
         const summary = await runScanCycle(e);
         if (bot && e.userId) {
           for (const card of summary.cards) await sendMatchCard(bot, Number(e.userId), card);

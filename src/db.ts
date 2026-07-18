@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS onboarding_state (
   step TEXT NOT NULL,
   partial TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS x402_nonces (
+  nonce TEXT PRIMARY KEY,
+  at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS scan_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL,
@@ -234,6 +238,12 @@ export function listEngagements(status?: EngagementStatus): Engagement[] {
 // ── payments ───────────────────────────────────────────────────────────────
 export function savePayment(p: PaymentEvent): void {
   db.prepare('INSERT OR REPLACE INTO payments (id, data) VALUES (?, ?)').run(p.id, JSON.stringify(p));
+}
+
+/** Replay protection: returns true the FIRST time a nonce is seen, false after. */
+export function consumeNonce(nonce: string): boolean {
+  const res = db.prepare('INSERT OR IGNORE INTO x402_nonces (nonce, at) VALUES (?, ?)').run(nonce, now());
+  return res.changes > 0;
 }
 
 // ── scan runs ──────────────────────────────────────────────────────────────
