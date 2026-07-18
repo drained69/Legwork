@@ -1,0 +1,16 @@
+# Railway deploy config. Railway builds from the existing Dockerfile.
+# Persistence: attach a Volume to this service (dashboard or `railway volume add`)
+# mounted at /data — the Dockerfile already sets DATABASE_PATH=/data/legwork.db.
+# Railway injects PORT at runtime; the app listens on it (see src/config.ts).
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Bot long-polling + cron scheduler must stay resident.
+numReplicas = 1
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10

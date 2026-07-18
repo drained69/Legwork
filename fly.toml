@@ -1,0 +1,28 @@
+# fly.io deploy config — `fly launch --copy-config` then `fly deploy`
+app = "legwork"
+primary_region = "iad"
+
+[build]
+
+[env]
+  OKX_ENDPOINT_PORT = "8402"
+  DATABASE_PATH = "/data/legwork.db"
+
+[[mounts]]
+  source = "legwork_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8402
+  force_https = true
+  auto_stop_machines = false   # bot long-polling + scheduler must stay up
+  auto_start_machines = true
+  min_machines_running = 1
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 8402
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
