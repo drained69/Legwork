@@ -31,27 +31,57 @@ $0.10 ceiling binds, and it stays profitable only with prompt discipline.
 | One submission | Gmail API (free) + status tracking | ~$0.01 |
 | 7-day sprint | ~28 hunt passes + ~10 drafts + submissions + digest | ~$2.50–3.50 |
 
+## Launch pricing principle: one job, one price
+
+The two channels sell the same work, so they must not disagree about what it
+costs. A Telegram bundle is priced just above the API-call value of the work it
+contains — the premium covers the chat UX, the approval loop, scheduling, and
+persistence, not the analysis itself.
+
+| Bundle | Work it contains | API-call value | Launch price |
+|---|---|---|---|
+| `job-hunt` (24h) | 4 scheduled hunts | $0.20 | **$0.25** |
+| `job-hunt-weekly` (7d) | 28 hunts | $1.40 | **$1.00** (below cost of calls — deliberate: buys retention data) |
+| `tailor-one-application` | 1 tailor call | $0.10 | **$0.25** |
+| `job-search-sprint-7d` | 28 hunts + ~10 tailors | $2.40 | **$2.00** |
+
+The earlier $2/$9/$4/$19 ladder charged up to **40x** the API price for
+identical work (a $4 tailored application that costs $0.10 via API). For an
+unproven agent that reads as arbitrary, and the first thing a curious buyer
+does is compare the two lists.
+
+**Free tier**: `POST /api/hunt/preview` returns the top 3 matches with scores,
+free, 3 calls/hour per client. The cheapest way to prove quality is to let
+people see real scored matches before any payment. It costs ~$0.01 to serve and
+is rate-limited so it cannot substitute for the paid call.
+
+**Revisit trigger**: raise prices only after ~50 settled tasks show repeat
+usage. Cheap launch pricing buys the usage data; premium pricing without it is
+guessing.
+
 ## Marketplace listings (live in `src/okx/server.ts`)
 
 | Listing | Price | What the buyer gets | Why this price |
 |---|---|---|---|
-| **Job Hunt** (`job-hunt`) — *the entry product* | **$2.00** | Criteria intake → user approves → agent hunts for 24h → ranked shortlist of up to 10 matches, every score explained per axis | Impulse-priced: low enough to try without thinking, ~20x margin over COGS, and it's the funnel into everything else. A human doing this search honestly costs an hour. |
-| **Job Hunt Weekly** (`job-hunt-weekly`) | **$9.00** | Same approved criteria, hunted daily for 7 days, deduped (never the same posting twice) | 7 one-off hunts would be $14 — the ~35% bundle discount rewards commitment and creates recurring engagement without a subscription mechanism. |
-| **Tailor One Application** (`tailor-one-application`) | **$4.00** | One posting: tailored resume variant + cover letter, delivered for approval, never fabricated | Highest perceived-value single unit (this is the task people hate most). Priced above hunt to signal it, still under "resume service" market rates ($25–100+). |
-| **Job Search Sprint** (`job-search-sprint-7d`) — *the anchor bundle* | **$19.00** | Daily hunts + tailored drafts for top matches + approval-gated submission + weekly digest — the whole loop | À la carte equivalent ≈ $31 (weekly hunt $9 + ~4 tailors $16 + submissions). ~40% bundle discount makes it the obvious "serious searcher" choice, still ~6x margin. |
-
-**Internal unit (not listed yet):** approval-gated submission + tracking ≈ **$1.50/each**
-if we ever unbundle it. Kept inside the sprint for now — submission alone has
-no value without a tailored draft.
+| **Job Hunt** (`job-hunt`) — *the entry product* | **$0.25** | Criteria intake → user approves → agent hunts for 24h → ranked shortlist of up to 10 matches, every score explained per axis | Below the price of anything a person deliberates over. The goal at launch is a first transaction and a shortlist worth screenshotting, not margin. |
+| **Job Hunt Weekly** (`job-hunt-weekly`) | **$1.00** | Same approved criteria, hunted daily for 7 days, deduped (never the same posting twice) | Deliberately under the $1.40 of API calls it contains. A week of usage is the single most valuable thing to buy right now — it tells us whether people come back. |
+| **Tailor One Application** (`tailor-one-application`) | **$0.25** | One posting: tailored resume variant + cover letter, delivered for approval, never fabricated | One $0.10 API call plus delivery. Priced level with the hunt so the natural upsell in-thread ("want me to tailor #1?") is a trivial yes. |
+| **Job Search Sprint** (`job-search-sprint-7d`) | **$2.00** | Daily hunts + tailored drafts for top matches + approval-gated submission + weekly digest — the whole loop | The full week of work for the price of a coffee. Once retention data exists, this is the first listing to reprice upward. |
 
 ## Pricing principles
 
-1. **The hunt is the wedge, not the profit center.** $2 exists to get a
-   first transaction and a shortlist worth screenshotting. Upsell happens in
-   the thread: "Want me to tailor an application for #1? That's the $4 listing."
-2. **Ladder the perceived effort.** Hunt ($2) < Tailor ($4) < Weekly hunt ($9)
-   < Sprint ($19). Each step up is roughly 2x, which reads naturally.
-3. **Never price below 5x COGS** — leaves room for LLM price changes, OKX
-   marketplace fees, and dispute refunds without going underwater.
-4. **Revisit after 50 settled tasks**: if hunt→sprint conversion is >15%,
-   raise the sprint to $25; if hunts stall, drop to $1 before adding features.
+1. **The two channels must agree.** A job that costs $0.10 via API cannot cost
+   $4 in Telegram. Bundle prices are derived from their API-call value, not set
+   by feel.
+2. **Launch prices buy data, not revenue.** At this stage the scarce resource
+   is usage — people willing to test an unproven agent. Optimize for the first
+   transaction; several bundles run at or below cost on purpose.
+3. **Free before paid.** `POST /api/hunt/preview` shows real scored matches
+   with no payment at all. Nothing converts a skeptic faster than seeing the
+   scoring work on their own criteria.
+4. **Keep the per-call API at or under $0.10** — enforced in code, so the cap
+   cannot drift.
+5. **Reprice only on evidence.** After ~50 settled tasks: if people return
+   after their first hunt, raise the sprint first (it is the most underpriced).
+   If they do not return, the problem is match quality, not price — fix that
+   instead.

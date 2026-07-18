@@ -31,31 +31,37 @@ import type { Engagement, OkxEnvelope } from '../types.js';
  * listing: criteria in → approved → ranked shortlist out. No resume, no
  * email access, no submission liability. See PRICING.md for the rationale.
  */
+/**
+ * LAUNCH PRICING. Each bundle is priced just above the API-call value of the
+ * work it contains (a 24h hunt = 4 scheduled hunts = $0.20 of calls), so the
+ * two channels stay coherent and a first-time buyer risks pocket change.
+ * Revisit once there is retention data — see PRICING.md.
+ */
 export const LISTINGS = {
   'job-hunt': {
     title: 'Job Hunt — ranked shortlist',
     description:
       'Give your criteria (roles, location, qualification, comp floor, skills, priority factors). ' +
       'After you approve them, the agent hunts all day and returns a ranked, fully-explained shortlist of up to 10 matches.',
-    priceUsd: '2.00',
+    priceUsd: '0.25',
     days: 1,
   },
   'job-hunt-weekly': {
     title: 'Job Hunt — weekly (7 days)',
     description: 'Same criteria-approved hunt, running daily for 7 days with fresh shortlists (deduped — never the same posting twice).',
-    priceUsd: '9.00',
+    priceUsd: '1.00',
     days: 7,
   },
   'tailor-one-application': {
     title: 'Tailor one application',
     description: 'One posting: tailored resume variant + cover letter, delivered for your approval. Never fabricates.',
-    priceUsd: '4.00',
+    priceUsd: '0.25',
     days: 1,
   },
   'job-search-sprint-7d': {
     title: 'Job Search Sprint (7 days) — full loop',
     description: 'Daily hunt + tailored drafts for top matches + approval-gated submission + weekly digest. The whole search.',
-    priceUsd: '19.00',
+    priceUsd: '2.00',
     days: 7,
   },
 } as const;
@@ -203,6 +209,76 @@ function json(res: ServerResponse, status: number, data: unknown, headers: Recor
   res.end(JSON.stringify(data));
 }
 
+// ── free preview (try-before-you-pay) ──────────────────────────────────────
+
+/** Sliding-window rate limit so the free tier can't be farmed for full value. */
+const PREVIEW_LIMIT = 3;
+const PREVIEW_WINDOW_MS = 60 * 60 * 1000;
+const previewHits = new Map<string, number[]>();
+
+function previewAllowed(ip: string): { ok: boolean; remaining: number; retryAfterSec: number } {
+  const cutoff = Date.now() - PREVIEW_WINDOW_MS;
+  const hits = (previewHits.get(ip) ?? []).filter((t) => t > cutoff);
+  if (previewHits.size > 10_000) previewHits.clear(); // crude memory bound
+  if (hits.length >= PREVIEW_LIMIT) {
+    return { ok: false, remaining: 0, retryAfterSec: Math.ceil((hits[0] + PREVIEW_WINDOW_MS - Date.now()) / 1000) };
+  }
+  hits.push(Date.now());
+  previewHits.set(ip, hits);
+  return { ok: true, remaining: PREVIEW_LIMIT - hits.length, retryAfterSec: 0 };
+}
+
+function clientIp(req: IncomingMessage): string {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
+/**
+ * FREE preview: same hunt, top 3 matches only, scores + the two headline
+ * score reasons. Exists so buyers (human or agent) can judge quality before
+ * paying — the paid call returns all 10 with full per-axis breakdowns.
+ */
+async function handlePreview(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const gate = previewAllowed(clientIp(req));
+  if (!gate.ok) {
+    return json(res, 429, {
+      ok: false,
+      error: `Free preview limit reached (${PREVIEW_LIMIT}/hour). Try again later, or call POST /api/hunt for the full paid shortlist.`,
+      retryAfterSeconds: gate.retryAfterSec,
+    }, { 'retry-after': String(gate.retryAfterSec) });
+  }
+  const raw = await readBody(req, res);
+  if (raw === null) return;
+  try {
+    const criteria = raw ? (JSON.parse(raw) as HuntCriteria) : {};
+    const result = await runAdhocHunt(criteria);
+    const preview = result.matches.slice(0, 3).map((m) => ({
+      title: m.posting.title,
+      company: m.posting.company,
+      location: m.posting.location,
+      url: m.posting.url,
+      score: m.breakdown.total,
+      why: [m.breakdown.skills.reason, m.breakdown.comp.reason],
+    }));
+    json(res, 200, {
+      ok: true,
+      preview: true,
+      shown: preview.length,
+      totalMatches: result.matches.length,
+      previewsRemainingThisHour: gate.remaining,
+      matches: preview,
+      upgrade: {
+        message: `Showing top ${preview.length} of ${result.matches.length}. The paid call returns all matches with full per-axis breakdowns.`,
+        endpoint: 'POST /api/hunt',
+        priceUsd: '0.05',
+      },
+    });
+  } catch (err) {
+    json(res, 400, { ok: false, error: String(err) });
+  }
+}
+
 // ── paid x402 API handlers ─────────────────────────────────────────────────
 
 async function runPaidService(service: PricedService, body: Record<string, unknown>): Promise<unknown> {
@@ -305,6 +381,11 @@ export function startOkxServer(handlers: OkxHandlers = {}, port: number = config
       // Free, public service catalog — what agent directories index.
       if (req.method === 'GET' && path === '/api/services') {
         return json(res, 200, serviceCatalog());
+      }
+
+      // Free preview — try before you pay (rate-limited).
+      if (req.method === 'POST' && path === '/api/hunt/preview') {
+        return handlePreview(req, res);
       }
 
       // Paid x402-gated services.

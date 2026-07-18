@@ -8,6 +8,7 @@
 
 | # | Service | Endpoint | Price/call | What the caller gets |
 |---|---|---|---|---|
+| 0 | **Free Preview** | `POST /api/hunt/preview` | **Free** (3/hr) | Try before you pay: top 3 ranked matches with scores and headline reasons |
 | 1 | **Job Hunt** | `POST /api/hunt` | **$0.05** | Send criteria (roles, location, qualification, comp floor, skills, priority factors) → up to 10 ranked matches, each with a full per-axis score breakdown (skills 40 / comp 20 / location 15 / qualification 15 / factors 10) |
 | 2 | **Score Posting** | `POST /api/score` | **$0.01** | Score ONE job posting against candidate criteria on the 100-point rubric — every axis gets a one-line explanation, no black-box numbers |
 | 3 | **Tailor Application** | `POST /api/tailor` | **$0.10** | Tailored resume variant + cover letter + application email for one posting — never fabricates skills, employers, or dates |
@@ -25,12 +26,14 @@
 
 Multi-day engagements run in a private Telegram thread (hire on the marketplace → deep link binds the chat). Human-in-the-loop: criteria and every application are individually approved.
 
+**Launch pricing** — each bundle sits just above the API-call value of the work it contains, so nobody pays a premium for the same job twice.
+
 | Listing | Price | Duration | What the buyer gets |
 |---|---|---|---|
-| `job-hunt` | $2.00 | 24h | Criteria intake in Telegram → approval → continuous hunt → ranked shortlists |
-| `job-hunt-weekly` | $9.00 | 7 days | Daily hunts, deduped (never the same posting twice) |
-| `tailor-one-application` | $4.00 | 1 day | One tailored resume + cover letter, delivered for approval |
-| `job-search-sprint-7d` | $19.00 | 7 days | The full loop: daily hunts + tailored drafts + approval-gated submission + weekly digest |
+| `job-hunt` | $0.25 | 24h | Criteria intake in Telegram → approval → continuous hunt → ranked shortlists |
+| `job-hunt-weekly` | $1.00 | 7 days | Daily hunts, deduped (never the same posting twice) |
+| `tailor-one-application` | $0.25 | 1 day | One tailored resume + cover letter, delivered for approval |
+| `job-search-sprint-7d` | $2.00 | 7 days | The full loop: daily hunts + tailored drafts + approval-gated submission + weekly digest |
 
 ## Trust properties (both channels)
 

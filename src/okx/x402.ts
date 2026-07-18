@@ -354,6 +354,11 @@ export function serviceCatalog(): Record<string, unknown> {
       payTo: config.x402.payTo,
       maxPricePerCallUsd: '0.10',
     },
+    freeTier: {
+      endpoint: 'POST /api/hunt/preview',
+      description: 'Free ranked preview: top 3 matches with scores and headline reasons. 3 calls/hour per client.',
+      limitPerHour: 3,
+    },
     services: PRICED_SERVICES.map((s) => ({
       id: s.id,
       endpoint: `${s.method} ${s.path}`,

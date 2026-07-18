@@ -84,6 +84,49 @@ test('x402: GET /api/services is free and advertises payment terms', async () =>
   assert.equal(data.services.length, PRICED_SERVICES.length);
 });
 
+// ── free preview (try-before-you-pay) ──────────────────────────────────────
+
+test('preview: free call returns top-3 with scores and an upgrade pointer', async () => {
+  const res = await fetch(`${base}/api/hunt/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': '10.0.0.1' },
+    body: JSON.stringify({ roles: ['backend engineer'], skills: ['typescript'] }),
+  });
+  assert.equal(res.status, 200, 'preview must be free — no payment header sent');
+  const data = (await res.json()) as {
+    preview: boolean; shown: number; totalMatches: number;
+    matches: Array<{ score: number; why: string[] }>;
+    upgrade: { endpoint: string; priceUsd: string };
+  };
+  assert.equal(data.preview, true);
+  assert.ok(data.shown <= 3, 'preview caps at 3 matches');
+  assert.ok(data.totalMatches >= data.shown, 'must disclose how many were withheld');
+  assert.ok(data.matches[0].why.length === 2, 'preview shows headline reasons');
+  assert.equal(data.upgrade.endpoint, 'POST /api/hunt');
+});
+
+test('preview: rate limit blocks farming the free tier', async () => {
+  const ip = '10.0.0.99';
+  const call = () =>
+    fetch(`${base}/api/hunt/preview`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': ip },
+      body: JSON.stringify({ roles: ['engineer'], skills: ['typescript'] }),
+    });
+  for (let i = 0; i < 3; i++) assert.equal((await call()).status, 200, `call ${i + 1} should pass`);
+  const blocked = await call();
+  assert.equal(blocked.status, 429, '4th call in the window must be rate-limited');
+  assert.ok(blocked.headers.get('retry-after'), 'must tell the caller when to retry');
+});
+
+test('catalog advertises the free tier so directories can surface it', async () => {
+  const data = (await (await fetch(`${base}/api/services`)).json()) as {
+    freeTier: { endpoint: string; limitPerHour: number };
+  };
+  assert.equal(data.freeTier.endpoint, 'POST /api/hunt/preview');
+  assert.equal(data.freeTier.limitPerHour, 3);
+});
+
 // ── 402 challenge ──────────────────────────────────────────────────────────
 
 test('x402: unpaid call returns 402 with PAYMENT-REQUIRED header (v2) and x402Version body (v1)', async () => {

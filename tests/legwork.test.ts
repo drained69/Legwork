@@ -284,10 +284,29 @@ test('pipeline: daily cap limits match cards', async () => {
 
 // ── job-hunt: the entry product ────────────────────────────────────────────
 
-test('hunt: default listing is job-hunt with $2 escrow', () => {
+test('hunt: default listing is job-hunt', () => {
   handleEnvelope({ jobId: 'job-hunt-1', message: { source: 'system', event: 'task_assigned', jobId: 'job-hunt-1' } });
   const e = db.getEngagementByJob('job-hunt-1')!;
   assert.equal(e.listing, 'job-hunt');
+});
+
+test('pricing: bundles stay within a sane multiple of their API-call value', async () => {
+  const { LISTINGS } = await import('../src/okx/server.js');
+  // A hunt engagement runs 4 scheduled hunts/day at $0.05/call.
+  const apiValue = (days: number) => days * 4 * 0.05;
+  const checks: Array<[keyof typeof LISTINGS, number]> = [
+    ['job-hunt', apiValue(1)],
+    ['job-hunt-weekly', apiValue(7)],
+    ['job-search-sprint-7d', apiValue(7) + 10 * 0.1], // + ~10 tailors
+  ];
+  for (const [id, value] of checks) {
+    const price = Number(LISTINGS[id].priceUsd);
+    assert.ok(price <= value * 2, `${id} at $${price} is over 2x its $${value.toFixed(2)} API-call value`);
+  }
+  // A single tailored application is one $0.10 call — delivery premium only.
+  assert.ok(Number(LISTINGS['tailor-one-application'].priceUsd) <= 0.5);
+  // Entry point must stay impulse-priced for a new, unproven agent.
+  assert.ok(Number(LISTINGS['job-hunt'].priceUsd) <= 0.5, 'entry listing must stay under $0.50');
 });
 
 test('hunt: unknown listing falls back to job-hunt', () => {
