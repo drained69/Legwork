@@ -90,8 +90,15 @@ function askSetup(step: SetupStep): string {
 
 function mainMenu(profile?: Profile, engagement?: Engagement): InlineKeyboard {
   const kb = new InlineKeyboard();
+  // First run: one obvious next step, plus the two things a newcomer asks for.
+  if (!profile) {
+    return kb
+      .text('▶️  Set up my profile', 'setup:start')
+      .row()
+      .text('☰  Menu', 'menu:open')
+      .text('❓  How it works', 'nav:help');
+  }
   kb.text('☰  Menu — all activities', 'menu:open').row();
-  if (!profile) return kb.text('Set up profile', 'setup:start');
   if (engagement?.status === 'active') kb.text('Run job hunt', 'act:hunt');
   else kb.text('Free preview hunt', 'act:preview');
   kb.text('My profile', 'profile:view').row();
@@ -211,10 +218,8 @@ export function createBot(): Bot {
       { ...HTML, reply_markup: mainMenu(profile, engagement) },
     );
 
-    if (!profile) {
-      setOnboarding(userId, 'roles', {});
-      await ctx.reply(askSetup('roles'), HTML);
-    }
+    // First run: do NOT jump straight into questions — the welcome explains
+    // what Legwork is, and the user starts setup when they choose to.
   });
 
   // ── informational commands ───────────────────────────────────────────────

@@ -176,29 +176,64 @@ export interface WelcomeState {
 }
 
 export function renderWelcome(s: WelcomeState): string {
-  const lines: string[] = [];
+  return s.returning ? renderReturningWelcome(s) : renderFirstRunWelcome(s);
+}
 
-  lines.push(`<b>Legwork</b>`);
-  lines.push(`<i>Your job search, managed end to end</i>`);
-  lines.push(RULE);
-  lines.push('');
-  lines.push(
-    s.returning
-      ? `Welcome back, ${esc(s.firstName)}.`
-      : `Welcome, ${esc(s.firstName)}.`,
-  );
-  lines.push('');
+/**
+ * First run: this is the only chance to explain what Legwork is and how to
+ * use it, so it leads with the product, not with a status table.
+ */
+function renderFirstRunWelcome(s: WelcomeState): string {
+  return [
+    `👋 <b>Welcome to Legwork, ${esc(s.firstName)}</b>`,
+    `<i>Your job search, run from Telegram</i>`,
+    RULE,
+    '',
+    'Applying to jobs at volume is a part-time job in itself: finding postings, judging which are worth it, ' +
+      'rewriting your CV for each one, then filling in yet another form.',
+    '',
+    '<b>Legwork does that work for you.</b> I search job boards, score every posting against your real profile, ' +
+      'and write tailored applications — while you keep the final say on everything that goes out in your name.',
+    '',
+    '<b>How it works</b>',
+    '',
+    '<b>1 · Tell me about yourself</b>',
+    'Your target roles, level, locations, salary floor and skills. About a minute — then it is saved for good, ' +
+      'and you never type it again. Update any detail whenever you like.',
+    '',
+    '<b>2 · I hunt and score</b>',
+    'I scan live job boards and score each posting out of 100: skills 40, salary 20, location 15, level 15, ' +
+      'your own priorities 10. Every score comes with the reason behind it — never an unexplained "94% match".',
+    '',
+    '<b>3 · I draft your application</b>',
+    'For roles worth pursuing I write a tailored CV and cover letter, drawn strictly from your real experience. ' +
+      'Nothing is invented.',
+    '',
+    '<b>4 · You approve — then it sends</b>',
+    'You see the exact recipient and the exact wording first. Nothing is ever submitted without your explicit tap.',
+    '',
+    RULE,
+    '<b>Getting started</b>',
+    '',
+    '• <b>Set up your profile</b> below to begin',
+    '• <b>Free preview</b> — see your top 3 matches at no cost, before paying for anything',
+    '• <b>/menu</b> — every action in one place',
+    '• <b>/help</b> — how scoring and approvals work',
+    '',
+    'Optionally link an X Layer wallet to run paid engagements from the OKX marketplace. ' +
+      'A wallet is <b>not</b> required to set up your profile or try a preview.',
+  ].join('\n');
+}
 
-  if (!s.returning) {
-    lines.push(
-      'I scan job boards on your behalf, score every posting against your profile on a transparent 100-point rubric, ' +
-        'and draft tailored applications. Nothing is ever sent without your explicit approval.',
-    );
-    lines.push('');
-  }
-
-  // Status block — the answer to "where do I stand?"
-  lines.push('<b>Status</b>');
+/** Returning users get an orientation line, then the facts. */
+function renderReturningWelcome(s: WelcomeState): string {
+  const lines: string[] = [
+    `<b>Welcome back to Legwork, ${esc(s.firstName)}</b>`,
+    `<i>Your job search, run from Telegram</i>`,
+    RULE,
+    '',
+    '<b>Status</b>',
+  ];
 
   const wallet = s.profile?.wallet;
   lines.push(wallet ? `Wallet · <code>${esc(shortAddress(wallet))}</code> connected` : 'Wallet · not linked');
@@ -218,15 +253,20 @@ export function renderWelcome(s: WelcomeState): string {
     const ends = s.engagement.endsAt ? ` · ends ${s.engagement.endsAt.slice(0, 10)}` : '';
     lines.push(`Engagement · ${esc(listingLabel(s.engagement.listing))} — ${esc(s.engagement.status)}${ends}`);
   } else {
-    lines.push('Engagement · none active');
+    lines.push('Engagement · none active — free preview still available');
   }
 
   lines.push('');
-  lines.push(
-    s.profile
-      ? 'Choose an action below.'
-      : 'Set up your profile to begin — it takes about a minute, and you will never enter it again.',
-  );
+  if (!s.profile) {
+    lines.push('Set up your profile to begin — about a minute, and you will never enter it again.');
+  } else {
+    const c = profileCompleteness(s.profile);
+    lines.push(
+      c.missing.length
+        ? `Complete the missing details to sharpen your match scores, or pick an action below.`
+        : 'Pick an action below, or open <b>/menu</b> for everything I can do.',
+    );
+  }
 
   return lines.join('\n');
 }
