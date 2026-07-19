@@ -388,3 +388,45 @@ test('evidence bundle lists every application with approval + receipt fields', a
   assert.match(bundle, /approvedAt=20/); // ISO timestamp present
   assert.match(bundle, /receipt=/);
 });
+
+// ── wallet identity: one wallet = one profile ──────────────────────────────
+
+test('wallet: getProfileByWallet finds the owner case-insensitively', () => {
+  db.saveProfile({ ...profile, userId: 'w-owner', wallet: '0xAbCd00000000000000000000000000000000EF01' });
+  const found = db.getProfileByWallet('0xabcd00000000000000000000000000000000ef01');
+  assert.equal(found?.userId, 'w-owner');
+  assert.equal(db.getProfileByWallet('0x9999000000000000000000000000000000009999'), undefined);
+});
+
+test('wallet: transferProfile moves profile, history and live engagements to the new account', async () => {
+  const wallet = '0xBeeF00000000000000000000000000000000BeeF';
+  db.saveProfile({ ...profile, userId: 'old-tg', wallet, targetRoles: ['data engineer'] });
+  db.markSeen('old-tg', 'posting-w1');
+  handleEnvelope({ jobId: 'job-w1', message: { source: 'system', event: 'task_assigned', jobId: 'job-w1' } });
+  const eng = db.getEngagementByJob('job-w1')!;
+  eng.userId = 'old-tg';
+  eng.status = 'active';
+  db.saveEngagement(eng);
+
+  db.transferProfile('old-tg', 'new-tg');
+
+  assert.equal(db.getProfile('old-tg'), undefined, 'old account no longer holds the profile');
+  const moved = db.getProfile('new-tg');
+  assert.equal(moved?.wallet, wallet);
+  assert.deepEqual(moved?.targetRoles, ['data engineer']);
+  assert.equal(db.getEngagementByJob('job-w1')?.userId, 'new-tg', 'live engagement follows the wallet');
+  assert.equal(db.markSeen('new-tg', 'posting-w1'), false, 'seen history follows — no duplicate cards');
+  // Invariant: exactly one profile owns the wallet.
+  assert.equal(db.getProfileByWallet(wallet)?.userId, 'new-tg');
+});
+
+test('wallet: settled engagements do NOT follow a transfer', () => {
+  handleEnvelope({ jobId: 'job-w2', message: { source: 'system', event: 'task_assigned', jobId: 'job-w2' } });
+  const eng = db.getEngagementByJob('job-w2')!;
+  eng.userId = 'old-tg2';
+  eng.status = 'settled';
+  db.saveEngagement(eng);
+  db.saveProfile({ ...profile, userId: 'old-tg2', wallet: '0xCafe00000000000000000000000000000000Cafe' });
+  db.transferProfile('old-tg2', 'new-tg2');
+  assert.equal(db.getEngagementByJob('job-w2')?.userId, 'old-tg2', 'settled engagements stay for the record');
+});

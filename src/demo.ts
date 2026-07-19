@@ -7,12 +7,21 @@
  *
  * Run: npm run demo
  */
-import { handleEnvelope, deliverEngagement } from './okx/server.js';
-import { getEngagementByJob, saveEngagement, saveProfile, updateApplication, now } from './db.js';
-import { runScanCycle, renderBreakdown } from './pipeline.js';
-import { submitApplication } from './skills/applyExecutor.js';
-import { buildDigest } from './digest.js';
-import { getPosting, getProfile, getDraft } from './db.js';
+// Deterministic demo: force mock sources + heuristics even when real keys
+// exist in .env. MUST be dynamic imports — static `import` hoists above these
+// assignments and dotenv would win.
+process.env.ADZUNA_APP_ID = '';
+process.env.ADZUNA_APP_KEY = '';
+process.env.USAJOBS_API_KEY = '';
+process.env.ANTHROPIC_API_KEY = '';
+process.env.GMAIL_CLIENT_ID = '';
+
+const { handleEnvelope, deliverEngagement } = await import('./okx/server.js');
+const { getEngagementByJob, saveEngagement, saveProfile, updateApplication, now, getPosting, getProfile, getDraft } =
+  await import('./db.js');
+const { runScanCycle, renderBreakdown } = await import('./pipeline.js');
+const { submitApplication } = await import('./skills/applyExecutor.js');
+const { buildDigest } = await import('./digest.js');
 
 const hr = () => console.log('\n' + '─'.repeat(72) + '\n');
 

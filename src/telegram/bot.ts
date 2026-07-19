@@ -10,10 +10,12 @@ import {
   getOnboarding,
   getPosting,
   getProfile,
+  getProfileByWallet,
   now,
   saveEngagement,
   saveProfile,
   setOnboarding,
+  transferProfile,
   updateApplication,
 } from '../db.js';
 import { buildDigest } from '../digest.js';
@@ -444,6 +446,46 @@ export function createBot(): Bot {
       ));
     }
 
+    // Wallet-profile conflict resolution (both sides had data)
+    if (ns === 'wladopt') {
+      await ctx.answerCallbackQuery();
+      const state = getOnboarding(userId);
+      if (state?.step !== 'walletadopt') {
+        return void (await ctx.reply(`${title('Expired')}\n\nThat choice is no longer pending. Open /wallet to link again.`, { ...HTML, reply_markup: backHome() }));
+      }
+      const wallet = String(state.partial.wallet ?? '');
+      const fromUserId = String(state.partial.fromUserId ?? '');
+      clearOnboarding(userId);
+      if (action === 'yes') {
+        // The wallet's profile wins — it replaces the chat's current one.
+        transferProfile(fromUserId, userId);
+        const loaded = getProfile(userId)!;
+        audit('telegram', 'WALLET_PROFILE_ADOPTED', `wallet=${wallet} -> user=${userId}`);
+        return void (await ctx.reply(
+          `${title('Profile loaded', 'Restored from your wallet')}\n\n${renderProfile(loaded)}`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
+        ));
+      }
+      // Keep current profile: wallet moves to it (one wallet = one profile,
+      // so it must be detached from the old one).
+      const current = getProfile(userId);
+      const other = getProfile(fromUserId);
+      if (other && other.wallet?.toLowerCase() === wallet.toLowerCase()) {
+        other.wallet = undefined;
+        saveProfile(other);
+      }
+      if (current) {
+        current.wallet = wallet;
+        current.updatedAt = now();
+        saveProfile(current);
+      }
+      audit('telegram', 'WALLET_REBOUND', `wallet=${wallet} kept current profile of user=${userId}`);
+      return void (await ctx.reply(
+        `${title('Wallet linked')}\n\n<code>${esc(wallet)}</code> is now attached to your current profile. The wallet's previous profile was detached.`,
+        { ...HTML, reply_markup: backHome() },
+      ));
+    }
+
     if (ns === 'wallet') {
       await ctx.answerCallbackQuery();
       if (action === 'link') {
@@ -666,6 +708,12 @@ export function createBot(): Bot {
     // Single-field edit
     if (state.step.startsWith('edit:')) {
       const field = state.step.slice('edit:'.length) as ProfileField;
+
+      // ── wallet is special: it is an identity key, not just a field ───────
+      if (field === 'wallet') {
+        return void (await handleWalletLink(ctx, userId, text));
+      }
+
       const profile = getProfile(userId);
       if (!profile) {
         clearOnboarding(userId);
@@ -677,11 +725,10 @@ export function createBot(): Bot {
       saveProfile(profile);
       clearOnboarding(userId);
       audit('telegram', 'PROFILE_UPDATED', `user=${userId} field=${field}`);
-      const confirmation =
-        field === 'wallet'
-          ? `${title('Wallet linked')}\n\n<code>${esc(profile.wallet ?? '')}</code>\n\nThis address is saved to your profile.`
-          : `${title('Updated')}\n\n<b>${PROFILE_FIELDS[field]}</b>\n${esc(fieldValue(profile, field) || '—')}`;
-      await ctx.reply(confirmation, { ...HTML, reply_markup: new InlineKeyboard().text('Edit another', 'profile:edit').text('‹ Menu', 'nav:home') });
+      await ctx.reply(
+        `${title('Updated')}\n\n<b>${PROFILE_FIELDS[field]}</b>\n${esc(fieldValue(profile, field) || '—')}`,
+        { ...HTML, reply_markup: new InlineKeyboard().text('Edit another', 'profile:edit').text('‹ Menu', 'nav:home') },
+      );
       return;
     }
 
@@ -703,7 +750,7 @@ export function createBot(): Bot {
     const existing = getProfile(userId);
     const profile: Profile = {
       userId,
-      name: existing?.name ?? ctx.from.first_name ?? 'Candidate',
+      name: existing?.name || ctx.from.first_name || 'Candidate', // || not ??: wallet-first shell profiles carry name ''
       targetRoles: (partial.targetRoles as string[]) ?? [],
       seniority: String(partial.seniority ?? 'mid'),
       locations: (partial.locations as string[]) ?? [],
@@ -761,6 +808,104 @@ function walletPrompt(): string {
     'Used to identify you across OKX engagements and to settle payments. ' +
     '<b>Never send a private key or seed phrase</b> — an address alone is all I need, and it is safe to share.'
   );
+}
+
+/**
+ * Wallet linking — the wallet is an identity key.
+ *
+ * Rules:
+ *  1. One wallet ↔ one profile, always (enforced here, nowhere else to slip in).
+ *  2. Connecting a wallet that already carries a profile LOADS that profile —
+ *     saved details, history and live engagements follow the wallet.
+ *  3. If the current chat already has its own profile, the user chooses which
+ *     survives — never silently overwrite either side.
+ */
+async function handleWalletLink(ctx: Ctx, userId: string, text: string): Promise<void> {
+  // Refuse anything that looks like key material, loudly.
+  if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
+    return void (await ctx.reply(
+      `${title('Never share that')}\n\n⚠️ That looks like a private key or seed phrase — <b>never share it with anyone, including me</b>. ` +
+        'Send your public address instead (<code>0x…</code>, 42 characters).',
+      { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+    ));
+  }
+  if (!isEvmAddress(text)) {
+    return void (await ctx.reply(
+      `${title('Invalid address')}\n\nSend a valid X Layer address — <code>0x</code> followed by 40 hex characters.`,
+      { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+    ));
+  }
+
+  const wallet = text.trim();
+  const owner = getProfileByWallet(wallet);
+  const current = getProfile(userId);
+  clearOnboarding(userId);
+
+  // Already yours — nothing to do.
+  if (owner && owner.userId === userId) {
+    return void (await ctx.reply(
+      `${title('Already linked')}\n\n<code>${esc(wallet)}</code> is already the wallet on your profile.`,
+      { ...HTML, reply_markup: backHome() },
+    ));
+  }
+
+  // Wallet carries an existing profile → load it (the whole point of wallet identity).
+  if (owner) {
+    if (current) {
+      // Both sides have data: the user decides which profile survives.
+      setOnboarding(userId, 'walletadopt', { wallet, fromUserId: owner.userId });
+      return void (await ctx.reply(
+        `${title('This wallet already has a profile', esc(owner.name || 'Saved profile'))}\n\n` +
+          `<code>${esc(wallet)}</code> is attached to an existing Legwork profile ` +
+          `(${esc(owner.targetRoles.join(', ') || 'no roles set')}).\n\n` +
+          'You also have a profile in this chat. Which should this account use?',
+        {
+          ...HTML,
+          reply_markup: new InlineKeyboard()
+            .text('Load the wallet profile', 'wladopt:yes')
+            .row()
+            .text('Keep my current profile', 'wladopt:no'),
+        },
+      ));
+    }
+    transferProfile(owner.userId, userId);
+    const loaded = getProfile(userId)!;
+    audit('telegram', 'WALLET_PROFILE_LOADED', `wallet=${wallet} -> user=${userId}`);
+    return void (await ctx.reply(
+      `${title('Welcome back', 'Profile loaded from your wallet')}\n\n` +
+        `<code>${esc(wallet)}</code> connected — your saved profile, history and engagements are restored.\n\n${renderProfile(loaded)}`,
+      { ...HTML, reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
+    ));
+  }
+
+  // Fresh wallet.
+  if (current) {
+    current.wallet = wallet;
+    current.updatedAt = now();
+    saveProfile(current);
+    audit('telegram', 'WALLET_LINKED', `wallet=${wallet} user=${userId}`);
+    return void (await ctx.reply(
+      `${title('Wallet linked')}\n\n<code>${esc(wallet)}</code> is now attached to your profile. ` +
+        'From now on, connecting this wallet anywhere loads this profile.',
+      { ...HTML, reply_markup: backHome() },
+    ));
+  }
+
+  // No profile at all yet: start one anchored to the wallet.
+  const shell: Profile = {
+    userId, name: '', targetRoles: [], seniority: 'mid', locations: [], remoteOk: false,
+    compFloor: 0, skills: [], resumeText: '', dealbreakers: [], factors: [],
+    threshold: 0, dailyCap: 10, wallet, updatedAt: now(),
+  };
+  saveProfile(shell);
+  setOnboarding(userId, 'roles', {});
+  audit('telegram', 'WALLET_LINKED_NEW', `wallet=${wallet} user=${userId}`);
+  await ctx.reply(
+    `${title('Wallet connected', 'New wallet — no profile yet')}\n\n<code>${esc(wallet)}</code> is linked. ` +
+      'Let’s set up the profile it will carry.',
+    HTML,
+  );
+  await ctx.reply(askSetup('roles'), HTML);
 }
 
 async function showWallet(ctx: Ctx & { from?: { id: number } }, userId: string): Promise<void> {

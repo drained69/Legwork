@@ -119,6 +119,45 @@ export function getProfile(userId: string): Profile | undefined {
   return row ? (JSON.parse(row.data) as Profile) : undefined;
 }
 
+/**
+ * Wallet is an identity key: one wallet belongs to at most ONE profile.
+ * Lookup is case-insensitive (EVM addresses compare lowercased).
+ */
+export function getProfileByWallet(wallet: string): Profile | undefined {
+  const target = wallet.trim().toLowerCase();
+  const rows = db.prepare('SELECT data FROM profiles').all() as Array<{ data: string }>;
+  for (const r of rows) {
+    const p = JSON.parse(r.data) as Profile;
+    if (p.wallet && p.wallet.toLowerCase() === target) return p;
+  }
+  return undefined;
+}
+
+/**
+ * Move a profile (and its live engagements) to a new Telegram account.
+ * Used when a user connects a wallet that already carries a profile — their
+ * saved data follows the wallet.
+ */
+export function transferProfile(fromUserId: string, toUserId: string): void {
+  const p = getProfile(fromUserId);
+  if (!p || fromUserId === toUserId) return;
+  db.prepare('DELETE FROM profiles WHERE user_id = ?').run(fromUserId);
+  p.userId = toUserId;
+  saveProfile(p);
+  // Seen-postings history and live engagements follow the profile.
+  db.prepare('UPDATE OR IGNORE seen_postings SET user_id = ? WHERE user_id = ?').run(toUserId, fromUserId);
+  db.prepare('SELECT id, data FROM engagements WHERE user_id = ?')
+    .all(fromUserId)
+    .forEach((row) => {
+      const e = JSON.parse((row as { data: string }).data) as Engagement;
+      if (!['settled', 'disputed'].includes(e.status)) {
+        e.userId = toUserId;
+        saveEngagement(e);
+      }
+    });
+  audit('db', 'PROFILE_TRANSFERRED', `wallet-based transfer ${fromUserId} -> ${toUserId}`);
+}
+
 // ── onboarding state machine persistence ──────────────────────────────────
 export function setOnboarding(userId: string, step: string, partial: Record<string, unknown>): void {
   db.prepare('INSERT OR REPLACE INTO onboarding_state (user_id, step, partial) VALUES (?, ?, ?)').run(
