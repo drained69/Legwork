@@ -15,6 +15,8 @@ export interface Profile {
   threshold: number; // 0-100 score gate, default 70
   dailyCap: number; // max match cards per day
   email?: string; // address applications are sent from/for
+  wallet?: string; // linked X Layer (EVM) address — settlement + identity
+  updatedAt?: string;
 }
 
 export interface Posting {
