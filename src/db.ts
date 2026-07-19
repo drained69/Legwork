@@ -11,6 +11,7 @@ import type {
   Posting,
   Profile,
   ScoreBreakdown,
+  UsageRecord,
 } from './types.js';
 
 const db = new Database(config.dbPath);
@@ -68,6 +69,14 @@ CREATE TABLE IF NOT EXISTS onboarding_state (
   user_id TEXT PRIMARY KEY,
   step TEXT NOT NULL,
   partial TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_records (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  engagement_id TEXT,
+  service TEXT NOT NULL,
+  at TEXT NOT NULL,
+  data TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS x402_nonces (
   nonce TEXT PRIMARY KEY,
@@ -213,6 +222,10 @@ export function getEngagementByCode(taskCode: string): Engagement | undefined {
     | undefined;
   return row ? (JSON.parse(row.data) as Engagement) : undefined;
 }
+export function getEngagementById(id: string): Engagement | undefined {
+  const row = db.prepare('SELECT data FROM engagements WHERE id = ?').get(id) as { data: string } | undefined;
+  return row ? (JSON.parse(row.data) as Engagement) : undefined;
+}
 export function getEngagementByJob(okxJobId: string): Engagement | undefined {
   const row = db.prepare('SELECT data FROM engagements WHERE okx_job_id = ?').get(okxJobId) as
     | { data: string }
@@ -238,6 +251,23 @@ export function listEngagements(status?: EngagementStatus): Engagement[] {
 // ── payments ───────────────────────────────────────────────────────────────
 export function savePayment(p: PaymentEvent): void {
   db.prepare('INSERT OR REPLACE INTO payments (id, data) VALUES (?, ?)').run(p.id, JSON.stringify(p));
+}
+
+// ── usage ledger ───────────────────────────────────────────────────────────
+export function recordUsage(u: UsageRecord): void {
+  db.prepare('INSERT OR REPLACE INTO usage_records (id, user_id, engagement_id, service, at, data) VALUES (?, ?, ?, ?, ?, ?)').run(
+    u.id, u.userId, u.engagementId ?? null, u.service, u.at, JSON.stringify(u),
+  );
+}
+export function listUsage(userId: string, limit = 50): UsageRecord[] {
+  const rows = db
+    .prepare('SELECT data FROM usage_records WHERE user_id = ? ORDER BY at DESC LIMIT ?')
+    .all(userId, limit) as Array<{ data: string }>;
+  return rows.map((r) => JSON.parse(r.data) as UsageRecord);
+}
+export function countUsage(engagementId: string): number {
+  const row = db.prepare('SELECT COUNT(*) as n FROM usage_records WHERE engagement_id = ?').get(engagementId) as { n: number };
+  return row.n;
 }
 
 /** Replay protection: returns true the FIRST time a nonce is seen, false after. */

@@ -2,21 +2,66 @@
 
 export interface Profile {
   userId: string; // telegram user id
+
+  // ── identity & contact ───────────────────────────────────────────────────
   name: string;
-  targetRoles: string[];
-  seniority: string; // e.g. "junior" | "mid" | "senior" | "staff"
-  locations: string[]; // includes "remote" if acceptable
-  remoteOk: boolean;
-  compFloor: number; // annual, USD
+  email?: string; // address applications are sent from/for
+  phone?: string;
+  currentLocation?: string;
+  wallet?: string; // linked X Layer (EVM) address — settlement + identity
+
+  // ── professional standing ────────────────────────────────────────────────
+  currentTitle?: string;
+  yearsExperience?: number;
+  seniority: string; // "junior" | "mid" | "senior" | "staff" | "principal"
   skills: string[];
   resumeText: string; // pasted resume / structured summary ('' for hunt-only)
+  education?: string; // highest degree + field
+  certifications?: string[];
+  languages?: string[];
+
+  // ── links ────────────────────────────────────────────────────────────────
+  linkedin?: string;
+  github?: string;
+  portfolio?: string;
+
+  // ── what they want ───────────────────────────────────────────────────────
+  targetRoles: string[];
+  locations: string[]; // includes "remote" if acceptable
+  remoteOk: boolean;
+  compFloor: number; // annual, USD — the hard floor used in scoring
+  compTarget?: number; // aspirational, shown in tailoring
+  employmentTypes?: string[]; // full-time | contract | part-time | internship
+  industries?: string[];
+  companySizes?: string[]; // startup | scaleup | enterprise
+  factors?: string[]; // priorities ("4-day week", "equity") — scored on the culture axis
   dealbreakers: string[];
-  factors?: string[]; // user-stated priorities ("4-day week", "equity", "healthcare") — scored on the culture axis
-  threshold: number; // 0-100 score gate, default 70
+
+  // ── eligibility & availability ───────────────────────────────────────────
+  workAuthorization?: string; // e.g. "US citizen", "EU work permit"
+  needsSponsorship?: boolean;
+  willingToRelocate?: boolean;
+  noticePeriod?: string; // e.g. "2 weeks", "immediate"
+  availableFrom?: string; // ISO date or free text
+
+  // ── engine settings ──────────────────────────────────────────────────────
+  threshold: number; // 0-100 score gate
   dailyCap: number; // max match cards per day
-  email?: string; // address applications are sent from/for
-  wallet?: string; // linked X Layer (EVM) address — settlement + identity
   updatedAt?: string;
+}
+
+/** One billable/served API call made on a user's behalf. */
+export interface UsageRecord {
+  id: string;
+  userId: string;
+  engagementId?: string;
+  wallet?: string;
+  service: string; // job-hunt | score-posting | tailor-application | preview
+  endpoint: string;
+  priceUsd: string;
+  paid: boolean; // false = covered by a prepaid engagement
+  status: number;
+  at: string;
 }
 
 export interface Posting {

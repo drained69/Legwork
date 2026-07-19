@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { PAYMENT_HEADERS, buildChallenge, findService, serviceCatalog, verifyAndSettle, type PricedService } from './x402.js';
 import { criteriaToProfile, runAdhocHunt, type HuntCriteria } from '../skills/jobHunt.js';
@@ -8,6 +8,8 @@ import { tailorApplication } from '../skills/applicationTailor.js';
 import type { Posting, Profile } from '../types.js';
 import {
   audit,
+  countUsage,
+  getEngagementById,
   getEngagementByJob,
   now,
   saveEngagement,
@@ -328,8 +330,62 @@ async function runPaidService(service: PricedService, body: Record<string, unkno
   }
 }
 
+/**
+ * Engagement-authorized access: a buyer who already paid for a Telegram
+ * engagement on the OKX marketplace must NOT be charged x402 again per call.
+ * The bot presents the engagement id + an HMAC over it; we verify the
+ * engagement exists, is live, and is within its call quota.
+ */
+const ENGAGEMENT_CALL_QUOTA: Record<string, number> = {
+  'job-hunt': 40,
+  'job-hunt-weekly': 250,
+  'tailor-one-application': 10,
+  'job-search-sprint-7d': 400,
+};
+
+export function engagementToken(engagementId: string): string {
+  return createHmac('sha256', config.okx.inboundSecret || 'legwork-dev-secret').update(engagementId).digest('hex');
+}
+
+function engagementAuthorized(req: IncomingMessage): { ok: boolean; engagementId?: string; error?: string } {
+  const id = req.headers['x-engagement-id'];
+  const token = req.headers['x-engagement-token'];
+  if (typeof id !== 'string' || typeof token !== 'string') return { ok: false };
+  const expected = engagementToken(id);
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return { ok: false, error: 'invalid engagement token' };
+  const engagement = getEngagementById(id);
+  if (!engagement) return { ok: false, error: 'unknown engagement' };
+  if (!['active', 'onboarding', 'delivering'].includes(engagement.status)) {
+    return { ok: false, error: `engagement is ${engagement.status}` };
+  }
+  if (engagement.endsAt && new Date(engagement.endsAt) < new Date()) return { ok: false, error: 'engagement expired' };
+  const quota = ENGAGEMENT_CALL_QUOTA[engagement.listing] ?? 40;
+  if (countUsage(engagement.id) >= quota) return { ok: false, error: `engagement call quota (${quota}) reached` };
+  return { ok: true, engagementId: engagement.id };
+}
+
 async function handlePaidRoute(service: PricedService, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const resource = `${config.okx.publicUrl ?? ''}${service.path}` || service.path;
+
+  // Prepaid engagement path — no second charge for work already bought.
+  const prepaid = engagementAuthorized(req);
+  if (prepaid.ok) {
+    const raw = await readBody(req, res);
+    if (raw === null) return;
+    try {
+      const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      const result = await runPaidService(service, body);
+      audit('x402', 'ENGAGEMENT_CALL', `service=${service.id} engagement=${prepaid.engagementId}`);
+      return json(res, 200, { ok: true, service: service.id, billing: 'engagement', engagementId: prepaid.engagementId, result });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: String(err) });
+    }
+  }
+  if (prepaid.error) {
+    return json(res, 402, { ok: false, error: prepaid.error, hint: 'Engagement no longer covers this call — pay per call via x402 or renew on the marketplace.' });
+  }
   // x402 v2 buyers send `PAYMENT-SIGNATURE`; legacy v1 sends `X-PAYMENT`.
   let paymentHeader: string | undefined;
   for (const name of PAYMENT_HEADERS) {

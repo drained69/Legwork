@@ -311,3 +311,73 @@ test('x402: garbage payment header returns 400', async () => {
   });
   assert.equal(res.status, 400);
 });
+
+// ── engagement-authorized access (prepaid, no double-charge) ───────────────
+
+test('engagement: valid token serves the call without an x402 payment', async () => {
+  const db = await import('../src/db.js');
+  const { engagementToken } = await import('../src/okx/server.js');
+  const engagement = {
+    id: 'eng-live-1', okxJobId: 'okx-live-1', taskCode: 'tc1', userId: 'u-live',
+    listing: 'job-hunt-weekly', status: 'active' as const, startedAt: new Date().toISOString(),
+    endsAt: new Date(Date.now() + 86400_000).toISOString(),
+  };
+  db.saveEngagement(engagement);
+  const res = await fetch(`${base}/api/hunt`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-engagement-id': engagement.id,
+      'x-engagement-token': engagementToken(engagement.id),
+      'x-user-wallet': '0x4e9bb70743a3a33bc47514389167903f70f69a07',
+    },
+    body: JSON.stringify({ roles: ['engineer'], skills: ['typescript'] }),
+  });
+  assert.equal(res.status, 200, 'a prepaid engagement must not be charged again');
+  const data = (await res.json()) as { billing: string; result: { matches: unknown[] } };
+  assert.equal(data.billing, 'engagement');
+  assert.ok(Array.isArray(data.result.matches));
+});
+
+test('engagement: forged token is rejected', async () => {
+  const res = await fetch(`${base}/api/hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-engagement-id': 'eng-live-1', 'x-engagement-token': 'deadbeef' },
+    body: '{}',
+  });
+  assert.equal(res.status, 402);
+  assert.match(((await res.json()) as { error: string }).error, /invalid engagement token/);
+});
+
+test('engagement: expired engagement falls back to payment required', async () => {
+  const db = await import('../src/db.js');
+  const { engagementToken } = await import('../src/okx/server.js');
+  const expired = {
+    id: 'eng-expired', okxJobId: 'okx-exp', taskCode: 'tc2', userId: 'u-exp',
+    listing: 'job-hunt', status: 'active' as const, startedAt: '2020-01-01T00:00:00Z',
+    endsAt: '2020-01-02T00:00:00Z',
+  };
+  db.saveEngagement(expired);
+  const res = await fetch(`${base}/api/hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-engagement-id': expired.id, 'x-engagement-token': engagementToken(expired.id) },
+    body: '{}',
+  });
+  assert.equal(res.status, 402);
+  assert.match(((await res.json()) as { error: string }).error, /expired/);
+});
+
+test('usage ledger records wallet attribution for every call', async () => {
+  const db = await import('../src/db.js');
+  const records = db.listUsage('u-ledger');
+  assert.equal(records.length, 0, 'clean slate');
+  db.recordUsage({
+    id: db.uid(), userId: 'u-ledger', engagementId: 'eng-live-1',
+    wallet: '0x4e9bb70743a3a33bc47514389167903f70f69a07', service: 'job-hunt',
+    endpoint: '/api/hunt', priceUsd: '0.05', paid: false, status: 200, at: db.now(),
+  });
+  const after = db.listUsage('u-ledger');
+  assert.equal(after.length, 1);
+  assert.equal(after[0].wallet, '0x4e9bb70743a3a33bc47514389167903f70f69a07');
+  assert.equal(after[0].paid, false);
+});

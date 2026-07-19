@@ -49,36 +49,108 @@ export function scoreVerdict(score: number): string {
 // ── profile rendering ──────────────────────────────────────────────────────
 
 export const PROFILE_FIELDS = {
-  name: 'Name',
-  roles: 'Target roles',
-  seniority: 'Level',
-  locations: 'Locations',
-  compFloor: 'Minimum salary',
-  skills: 'Skills',
-  factors: 'Priorities',
+  // Identity & contact
+  name: 'Full name',
   email: 'Email',
-  resume: 'Résumé',
+  phone: 'Phone',
+  currentLocation: 'Current location',
   wallet: 'X Layer wallet',
+  // Professional
+  currentTitle: 'Current title',
+  yearsExperience: 'Years of experience',
+  seniority: 'Level',
+  skills: 'Skills',
+  resume: 'Résumé',
+  education: 'Education',
+  certifications: 'Certifications',
+  languages: 'Languages',
+  // Links
+  linkedin: 'LinkedIn',
+  github: 'GitHub',
+  portfolio: 'Portfolio',
+  // Preferences
+  roles: 'Target roles',
+  locations: 'Preferred locations',
+  compFloor: 'Minimum salary',
+  compTarget: 'Target salary',
+  employmentTypes: 'Employment type',
+  industries: 'Industries',
+  companySizes: 'Company size',
+  factors: 'Priorities',
+  dealbreakers: 'Dealbreakers',
+  // Eligibility
+  workAuthorization: 'Work authorization',
+  needsSponsorship: 'Needs sponsorship',
+  willingToRelocate: 'Open to relocation',
+  noticePeriod: 'Notice period',
+  availableFrom: 'Available from',
 } as const;
 
 export type ProfileField = keyof typeof PROFILE_FIELDS;
 
+export const PROFILE_SECTIONS: Array<{ label: string; fields: ProfileField[] }> = [
+  { label: 'Identity & contact', fields: ['name', 'email', 'phone', 'currentLocation', 'wallet'] },
+  { label: 'Professional', fields: ['currentTitle', 'yearsExperience', 'seniority', 'skills', 'resume', 'education', 'certifications', 'languages'] },
+  { label: 'Links', fields: ['linkedin', 'github', 'portfolio'] },
+  { label: 'What you want', fields: ['roles', 'locations', 'compFloor', 'compTarget', 'employmentTypes', 'industries', 'companySizes', 'factors', 'dealbreakers'] },
+  { label: 'Eligibility & availability', fields: ['workAuthorization', 'needsSponsorship', 'willingToRelocate', 'noticePeriod', 'availableFrom'] },
+];
+
+export function fieldValue(p: Profile, field: ProfileField): string {
+  const list = (a?: string[]) => (a && a.length ? a.join(', ') : '');
+  const bool = (b?: boolean) => (b === undefined ? '' : b ? 'Yes' : 'No');
+  switch (field) {
+    case 'name': return p.name;
+    case 'email': return p.email ?? '';
+    case 'phone': return p.phone ?? '';
+    case 'currentLocation': return p.currentLocation ?? '';
+    case 'wallet': return p.wallet ?? '';
+    case 'currentTitle': return p.currentTitle ?? '';
+    case 'yearsExperience': return p.yearsExperience ? `${p.yearsExperience}` : '';
+    case 'seniority': return p.seniority;
+    case 'skills': return list(p.skills);
+    case 'resume': return p.resumeText ? `${p.resumeText.length.toLocaleString()} characters on file` : '';
+    case 'education': return p.education ?? '';
+    case 'certifications': return list(p.certifications);
+    case 'languages': return list(p.languages);
+    case 'linkedin': return p.linkedin ?? '';
+    case 'github': return p.github ?? '';
+    case 'portfolio': return p.portfolio ?? '';
+    case 'roles': return list(p.targetRoles);
+    case 'locations': return list(p.locations) + (p.remoteOk ? ' · remote OK' : '');
+    case 'compFloor': return p.compFloor ? money(p.compFloor) : '';
+    case 'compTarget': return p.compTarget ? money(p.compTarget) : '';
+    case 'employmentTypes': return list(p.employmentTypes);
+    case 'industries': return list(p.industries);
+    case 'companySizes': return list(p.companySizes);
+    case 'factors': return list(p.factors);
+    case 'dealbreakers': return list(p.dealbreakers);
+    case 'workAuthorization': return p.workAuthorization ?? '';
+    case 'needsSponsorship': return bool(p.needsSponsorship);
+    case 'willingToRelocate': return bool(p.willingToRelocate);
+    case 'noticePeriod': return p.noticePeriod ?? '';
+    case 'availableFrom': return p.availableFrom ?? '';
+  }
+}
+
 export function renderProfile(p: Profile): string {
-  const rows: string[] = [];
-  const row = (label: string, value: string) => rows.push(`<b>${label}</b>\n${value}`);
-
-  row(PROFILE_FIELDS.name, esc(p.name || '—'));
-  row(PROFILE_FIELDS.roles, esc(p.targetRoles.join(', ') || '—'));
-  row(PROFILE_FIELDS.seniority, esc(p.seniority || '—'));
-  row(PROFILE_FIELDS.locations, esc(p.locations.join(', ') || '—') + (p.remoteOk ? ' · remote OK' : ''));
-  row(PROFILE_FIELDS.compFloor, p.compFloor ? money(p.compFloor) : '—');
-  row(PROFILE_FIELDS.skills, esc(p.skills.join(', ') || '—'));
-  row(PROFILE_FIELDS.factors, esc((p.factors ?? []).join(', ') || '—'));
-  row(PROFILE_FIELDS.email, esc(p.email || '—'));
-  row(PROFILE_FIELDS.resume, p.resumeText ? `${p.resumeText.length.toLocaleString()} characters on file` : '— (not required for job hunting)');
-  row(PROFILE_FIELDS.wallet, p.wallet ? `<code>${esc(p.wallet)}</code>` : '— not linked');
-
-  return `${title('Your profile', 'Saved — you never re-enter this')}\n\n${rows.join('\n\n')}`;
+  const blocks: string[] = [];
+  for (const section of PROFILE_SECTIONS) {
+    const rows = section.fields
+      .map((f) => {
+        const v = fieldValue(p, f);
+        const display = f === 'wallet' && v ? `<code>${esc(v)}</code>` : esc(v || '—');
+        return `<b>${PROFILE_FIELDS[f]}</b> · ${display}`;
+      })
+      .join('\n');
+    blocks.push(`<u>${section.label}</u>\n${rows}`);
+  }
+  const filled = PROFILE_SECTIONS.flatMap((s) => s.fields).filter((f) => fieldValue(p, f)).length;
+  const total = PROFILE_SECTIONS.flatMap((s) => s.fields).length;
+  return (
+    `${title('Your profile', `${filled} of ${total} fields complete — saved, never re-entered`)}\n\n` +
+    blocks.join('\n\n')
+  );
 }
 
 export function profileCompleteness(p: Profile): { done: number; total: number; missing: string[] } {

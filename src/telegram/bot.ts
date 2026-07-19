@@ -23,7 +23,9 @@ import { tailorApplication } from '../skills/applicationTailor.js';
 import { chunkMessage, formatShortlist, runHunt } from '../skills/jobHunt.js';
 import {
   PROFILE_FIELDS,
+  PROFILE_SECTIONS,
   RULE,
+  fieldValue,
   atsLabel,
   esc,
   isEvmAddress,
@@ -39,6 +41,15 @@ import {
   title,
   type ProfileField,
 } from './ui.js';
+import {
+  fetchCatalog,
+  huntViaApi,
+  previewViaApi,
+  scoreViaApi,
+  serviceHealthy,
+  tailorViaApi,
+} from './apiClient.js';
+import { listUsage } from '../db.js';
 import type { Engagement, Profile } from '../types.js';
 
 /**
@@ -79,26 +90,49 @@ function askSetup(step: SetupStep): string {
 
 function mainMenu(profile?: Profile, engagement?: Engagement): InlineKeyboard {
   const kb = new InlineKeyboard();
-  if (!profile) {
-    kb.text('Set up profile', 'setup:start').row();
-  } else {
-    if (engagement && engagement.status === 'active') kb.text('Run job hunt', 'hunt:run').row();
-    kb.text('My profile', 'profile:view').text('Edit profile', 'profile:edit').row();
-  }
-  kb.text(profile?.wallet ? 'Wallet' : 'Link wallet', 'wallet:view');
-  if (engagement) kb.text('Status', 'nav:status');
-  kb.row().text('Help', 'nav:help');
+  kb.text('☰  Menu — all activities', 'menu:open').row();
+  if (!profile) return kb.text('Set up profile', 'setup:start');
+  if (engagement?.status === 'active') kb.text('Run job hunt', 'act:hunt');
+  else kb.text('Free preview hunt', 'act:preview');
+  kb.text('My profile', 'profile:view').row();
+  kb.text(profile.wallet ? 'Wallet' : 'Link wallet', 'wallet:view').text('Help', 'nav:help');
   return kb;
 }
 
-function profileEditKeyboard(): InlineKeyboard {
-  const fields: ProfileField[] = ['roles', 'seniority', 'locations', 'compFloor', 'skills', 'factors', 'name', 'email', 'resume', 'wallet'];
+/** The full activity menu — every action the bot can perform. */
+function activityMenu(profile?: Profile, engagement?: Engagement): InlineKeyboard {
   const kb = new InlineKeyboard();
-  fields.forEach((f, i) => {
+  const live = engagement?.status === 'active';
+  kb.text('🔎  Job hunt — ranked matches', live ? 'act:hunt' : 'act:hunt_locked').row();
+  kb.text('👁  Free preview (top 3)', 'act:preview').row();
+  kb.text('📊  Score a posting', 'act:score').row();
+  kb.text('✍️  Tailor an application', 'act:tailor').row();
+  kb.text('👤  My profile', 'profile:view').text('✏️  Edit', 'profile:edit').row();
+  kb.text(profile?.wallet ? '💳  Wallet' : '💳  Link wallet', 'wallet:view').row();
+  kb.text('🧾  Usage & billing', 'act:usage').text('📈  Status', 'nav:status').row();
+  kb.text('🛠  Services & pricing', 'act:catalog').text('❓  Help', 'nav:help').row();
+  kb.text('‹ Back', 'nav:home');
+  return kb;
+}
+
+/** Section picker, then field picker — keeps keyboards small and readable. */
+function editSectionKeyboard(): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  PROFILE_SECTIONS.forEach((sec, i) => {
+    kb.text(sec.label, `sect:${i}`);
+    kb.row();
+  });
+  return kb.text('‹ Back', 'nav:home');
+}
+
+function editFieldKeyboard(sectionIndex: number): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const section = PROFILE_SECTIONS[sectionIndex];
+  section.fields.forEach((f, i) => {
     kb.text(PROFILE_FIELDS[f], `edit:${f}`);
     if (i % 2 === 1) kb.row();
   });
-  return kb.row().text('‹ Back', 'nav:home');
+  return kb.row().text('‹ Sections', 'profile:edit');
 }
 
 function backHome(): InlineKeyboard {
@@ -114,12 +148,15 @@ export function createBot(): Bot {
   void bot.api
     .setMyCommands([
       { command: 'start', description: 'Home — status and actions' },
+      { command: 'menu', description: 'All activities' },
       { command: 'hunt', description: 'Run a job hunt now' },
       { command: 'profile', description: 'View your saved profile' },
       { command: 'edit', description: 'Update a profile field' },
       { command: 'wallet', description: 'Link or view your X Layer wallet' },
       { command: 'status', description: 'Engagement and application status' },
       { command: 'digest', description: 'Summary of applications and matches' },
+      { command: 'usage', description: 'Service calls and billing' },
+      { command: 'services', description: 'Live services and pricing' },
       { command: 'pause', description: 'Pause scanning' },
       { command: 'resume', description: 'Resume scanning' },
       { command: 'help', description: 'How Legwork works' },
@@ -182,6 +219,16 @@ export function createBot(): Bot {
 
   // ── informational commands ───────────────────────────────────────────────
 
+  bot.command('menu', async (ctx) => {
+    const userId = String(ctx.from?.id);
+    const p = getProfile(userId);
+    const e = getEngagementByUser(userId);
+    await ctx.reply(menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) });
+  });
+
+  bot.command('usage', async (ctx) => showUsage(ctx, String(ctx.from?.id), getEngagementByUser(String(ctx.from?.id))));
+  bot.command('services', async (ctx) => showCatalog(ctx));
+
   bot.command('help', (ctx) => ctx.reply(helpText(), { ...HTML, reply_markup: backHome() }));
 
   bot.command('profile', async (ctx) => {
@@ -193,7 +240,7 @@ export function createBot(): Bot {
   bot.command('edit', async (ctx) => {
     const p = getProfile(String(ctx.from?.id));
     if (!p) return void (await promptSetup(ctx));
-    await ctx.reply(`${title('Edit profile', 'Choose a field to update')}`, { ...HTML, reply_markup: profileEditKeyboard() });
+    await ctx.reply(`${title('Edit profile', 'Choose a section')}`, { ...HTML, reply_markup: editSectionKeyboard() });
   });
 
   bot.command('wallet', async (ctx) => showWallet(ctx, String(ctx.from?.id)));
@@ -256,6 +303,77 @@ export function createBot(): Bot {
     const userId = String(ctx.from.id);
     const [ns, action, extra] = ctx.callbackQuery.data.split(':');
 
+    // ── activity menu ──────────────────────────────────────────────────────
+    if (ns === 'menu') {
+      await ctx.answerCallbackQuery();
+      const p = getProfile(userId);
+      const e = getEngagementByUser(userId);
+      return void (await ctx.reply(menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) }));
+    }
+
+    // ── live API-backed activities ─────────────────────────────────────────
+    if (ns === 'act') {
+      const p = getProfile(userId);
+      const e = getEngagementByUser(userId);
+      if (!p && action !== 'catalog') {
+        await ctx.answerCallbackQuery();
+        return void (await promptSetup(ctx));
+      }
+      await ctx.answerCallbackQuery();
+
+      switch (action) {
+        case 'hunt_locked':
+          return void (await ctx.reply(
+            `${title('Hunt requires an active engagement')}\n\nHire Legwork on the OKX marketplace to unlock full ranked hunts, or run a free preview now.`,
+            { ...HTML, reply_markup: new InlineKeyboard().text('Free preview', 'act:preview').text('‹ Menu', 'menu:open') },
+          ));
+        case 'hunt':
+          return void (await runHuntFlow(ctx, userId));
+        case 'preview':
+          return void (await runPreviewFlow(ctx, p!));
+        case 'score': {
+          setOnboarding(userId, 'act:score', {});
+          return void (await ctx.reply(
+            `${title('Score a posting', 'Live call · $0.01')}\n\nPaste the job posting — title, company and description. I will score it against your profile on the 100-point rubric.`,
+            { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+          ));
+        }
+        case 'tailor': {
+          if (!p!.resumeText) {
+            return void (await ctx.reply(
+              `${title('Résumé needed')}\n\nTailoring writes from your real experience only. Add your résumé first — it is stored and reused.`,
+              { ...HTML, reply_markup: new InlineKeyboard().text('Add résumé', 'edit:resume').text('‹ Menu', 'menu:open') },
+            ));
+          }
+          setOnboarding(userId, 'act:tailor', {});
+          return void (await ctx.reply(
+            `${title('Tailor an application', 'Live call · $0.10')}\n\nPaste the job posting — title, company and description. I will draft a tailored résumé, cover letter and application email.`,
+            { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+          ));
+        }
+        case 'usage':
+          return void (await showUsage(ctx, userId, e));
+        case 'catalog':
+          return void (await showCatalog(ctx));
+      }
+      return;
+    }
+
+    // ── profile edit: section picker ───────────────────────────────────────
+    if (ns === 'sect') {
+      await ctx.answerCallbackQuery();
+      const idx = Number(action);
+      const section = PROFILE_SECTIONS[idx];
+      if (!section) return;
+      const p = getProfile(userId);
+      if (!p) return void (await promptSetup(ctx));
+      const rows = section.fields.map((f) => `<b>${PROFILE_FIELDS[f]}</b> · ${esc(fieldValue(p, f) || '—')}`).join('\n');
+      return void (await ctx.reply(`${title(section.label, 'Choose a field to update')}\n\n${rows}`, {
+        ...HTML,
+        reply_markup: editFieldKeyboard(idx),
+      }));
+    }
+
     // Navigation and profile management
     if (ns === 'nav') {
       await ctx.answerCallbackQuery();
@@ -297,18 +415,22 @@ export function createBot(): Bot {
         }));
       }
       if (action === 'edit') {
-        return void (await ctx.reply(title('Edit profile', 'Choose a field to update'), { ...HTML, reply_markup: profileEditKeyboard() }));
+        return void (await ctx.reply(title('Edit profile', 'Choose a section'), { ...HTML, reply_markup: editSectionKeyboard() }));
       }
       return;
     }
 
     if (ns === 'edit') {
       await ctx.answerCallbackQuery();
+      if (action === 'cancel') {
+        clearOnboarding(userId);
+        return void (await ctx.reply(`${title('Cancelled')}\n\nNothing was changed.`, { ...HTML, reply_markup: backHome() }));
+      }
       const field = action as ProfileField;
       if (!(field in PROFILE_FIELDS)) return;
       setOnboarding(userId, `edit:${field}`, {});
       const p = getProfile(userId);
-      const current = p ? currentValue(p, field) : '—';
+      const current = p ? fieldValue(p, field) || '—' : '—';
       return void (await ctx.reply(
         `${title(`Update ${PROFILE_FIELDS[field].toLowerCase()}`)}\n\n<b>Current</b>\n${esc(current)}\n\nSend the new value.${
           field === 'wallet' ? '\n<i>Your X Layer address, starting 0x.</i>' : ''
@@ -478,6 +600,64 @@ export function createBot(): Bot {
       return;
     }
 
+    // Live API activities that need a pasted posting
+    if (state.step === 'act:score' || state.step === 'act:tailor') {
+      const profile = getProfile(userId);
+      if (!profile) {
+        clearOnboarding(userId);
+        return void (await promptSetup(ctx));
+      }
+      const posting = parsePosting(text);
+      if (!posting) {
+        return void (await ctx.reply(
+          `${title('Could not read that posting')}\n\nInclude at least a job title, a company name and the description. Paste the posting text directly.`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+        ));
+      }
+      clearOnboarding(userId);
+      const engagement = getEngagementByUser(userId);
+
+      if (state.step === 'act:score') {
+        await ctx.reply(`${title('Scoring', 'Calling the live service')}`, HTML);
+        const res = await scoreViaApi(profile, posting, engagement);
+        if (!res.ok) {
+          return void (await ctx.reply(`${title('Scoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+            ...HTML,
+            reply_markup: backHome(),
+          }));
+        }
+        const b = res.data!.breakdown;
+        return void (await ctx.reply(
+          `${title(posting.title, posting.company)}\n\n<b>${meter(b.total)}/100</b> — ${scoreVerdict(b.total)}\n\n` +
+            `<b>Skills ${b.skills.score}/${b.skills.max}</b> — ${esc(b.skills.reason)}\n` +
+            `<b>Salary ${b.comp.score}/${b.comp.max}</b> — ${esc(b.comp.reason)}\n` +
+            `<b>Location ${b.location.score}/${b.location.max}</b> — ${esc(b.location.reason)}\n` +
+            `<b>Level ${b.seniority.score}/${b.seniority.max}</b> — ${esc(b.seniority.reason)}\n` +
+            `<b>Priorities ${b.culture.score}/${b.culture.max}</b> — ${esc(b.culture.reason)}\n\n${RULE}\n` +
+            `<b>Billing</b> · ${res.billing === 'engagement' ? 'covered by your engagement' : '$0.01 per call'}`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Tailor for this role', 'act:tailor').text('‹ Menu', 'menu:open') },
+        ));
+      }
+
+      await ctx.reply(`${title('Drafting', 'Calling the live service')}`, HTML);
+      const res = await tailorViaApi(profile, posting, engagement);
+      if (!res.ok) {
+        return void (await ctx.reply(`${title('Tailoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+          ...HTML,
+          reply_markup: backHome(),
+        }));
+      }
+      const d = res.data!;
+      await ctx.reply(`${title('Tailored résumé', posting.title)}\n\n${esc(d.resume.slice(0, 3000))}`, HTML);
+      await ctx.reply(`${title('Cover letter')}\n\n${esc(d.coverLetter.slice(0, 3000))}`, HTML);
+      return void (await ctx.reply(
+        `${title('Application email')}\n\n<b>Subject</b> · ${esc(d.emailSubject)}\n\n${esc(d.emailBody.slice(0, 2500))}\n\n${RULE}\n` +
+          `<b>Billing</b> · ${res.billing === 'engagement' ? 'covered by your engagement' : '$0.10 per call'}\n` +
+          `<i>Nothing has been sent — these drafts are yours to use.</i>`,
+        { ...HTML, reply_markup: backHome() },
+      ));
+    }
+
     // Single-field edit
     if (state.step.startsWith('edit:')) {
       const field = state.step.slice('edit:'.length) as ProfileField;
@@ -495,7 +675,7 @@ export function createBot(): Bot {
       const confirmation =
         field === 'wallet'
           ? `${title('Wallet linked')}\n\n<code>${esc(profile.wallet ?? '')}</code>\n\nThis address is saved to your profile.`
-          : `${title('Updated')}\n\n<b>${PROFILE_FIELDS[field]}</b>\n${esc(currentValue(profile, field))}`;
+          : `${title('Updated')}\n\n<b>${PROFILE_FIELDS[field]}</b>\n${esc(fieldValue(profile, field) || '—')}`;
       await ctx.reply(confirmation, { ...HTML, reply_markup: new InlineKeyboard().text('Edit another', 'profile:edit').text('‹ Menu', 'nav:home') });
       return;
     }
@@ -600,8 +780,8 @@ async function runHuntFlow(ctx: Ctx, userId: string): Promise<void> {
   const engagement = getEngagementByUser(userId);
   if (!engagement) {
     return void (await ctx.reply(
-      `${title('No active engagement')}\n\nHire Legwork on the OKX marketplace to run a hunt. Your profile is saved and ready.`,
-      { ...HTML, reply_markup: backHome() },
+      `${title('No active engagement')}\n\nA full ranked hunt needs an engagement from the OKX marketplace. You can run a free preview right now instead.`,
+      { ...HTML, reply_markup: new InlineKeyboard().text('Free preview', 'act:preview').text('‹ Menu', 'menu:open') },
     ));
   }
   if (engagement.status === 'paused') {
@@ -613,91 +793,262 @@ async function runHuntFlow(ctx: Ctx, userId: string): Promise<void> {
 
   const c = profileCompleteness(profile);
   if (c.missing.length) {
-    return void (await ctx.reply(
-      `${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`,
-      { ...HTML, reply_markup: new InlineKeyboard().text('Complete profile', 'profile:edit') },
-    ));
+    return void (await ctx.reply(`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
+      ...HTML,
+      reply_markup: new InlineKeyboard().text('Complete profile', 'profile:edit'),
+    }));
   }
 
-  await ctx.reply(`${title('Hunting', 'Scanning sources and scoring against your profile')}`, HTML);
+  await ctx.reply(`${title('Hunting', 'Calling the live scoring service')}`, HTML);
 
-  if (engagement.listing.startsWith('job-hunt')) {
-    const result = await runHunt(engagement);
-    if (result.sourceErrors.length) {
-      await ctx.reply(`${title('Partial results')}\n\nSome sources were unavailable: ${esc(result.sourceErrors.join('; '))}`, HTML);
-    }
-    if (!result.matches.length) {
-      return void (await ctx.reply(
-        `${title('No new matches')}\n\nEverything currently listed has already been shown to you. I will keep scanning and message you when something new appears.`,
-        { ...HTML, reply_markup: backHome() },
-      ));
-    }
-    for (const chunk of chunkMessage(formatShortlist(profile, result.matches, result.found))) {
-      await ctx.reply(chunk, { link_preview_options: { is_disabled: true } });
-    }
+  // LIVE call to Legwork's own public API — same endpoint external agents pay for.
+  const res = await huntViaApi(profile, engagement);
+  if (!res.ok) {
+    return void (await ctx.reply(`${title('Hunt failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+      ...HTML,
+      reply_markup: new InlineKeyboard().text('Try again', 'act:hunt').text('‹ Menu', 'menu:open'),
+    }));
+  }
+  const data = res.data!;
+  if (data.sourceErrors?.length) {
+    await ctx.reply(`${title('Partial results')}\n\nSome sources were unavailable: ${esc(data.sourceErrors.join('; '))}`, HTML);
+  }
+  if (!data.matches.length) {
     return void (await ctx.reply(
-      `${title('Hunt complete')}\n\n<b>${result.matches.length}</b> matches from <b>${result.found}</b> postings scanned.`,
+      `${title('No new matches')}\n\nEverything currently listed has already been shown to you. I keep scanning and will message you when something new appears.`,
       { ...HTML, reply_markup: backHome() },
     ));
   }
 
-  // Full-loop engagements produce individual approval cards.
-  const summary = await runScanCycle(engagement);
+  for (const [i, m] of data.matches.entries()) {
+    await ctx.reply(renderMatchCard(m.posting, m.breakdown, i + 1, data.matches.length), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  }
   await ctx.reply(
-    `${title('Hunt complete')}\n\n<b>${summary.found}</b> postings scanned · <b>${summary.cards.length}</b> above your threshold · <b>${summary.scoredBelowThreshold}</b> below${
-      summary.cappedOut ? '\n\nDaily limit reached.' : ''
-    }`,
-    HTML,
+    `${title('Hunt complete')}\n\n<b>${data.matches.length}</b> matches from <b>${data.found}</b> postings scanned.\n` +
+      `<b>Billing</b> · ${res.billing === 'engagement' ? 'covered by your engagement' : 'per-call'}` +
+      (profile.wallet ? `\n<b>Wallet</b> · <code>${esc(shortAddress(profile.wallet))}</code>` : ''),
+    { ...HTML, reply_markup: backHome() },
   );
 }
 
-function currentValue(p: Profile, field: ProfileField): string {
-  switch (field) {
-    case 'name': return p.name || '—';
-    case 'roles': return p.targetRoles.join(', ') || '—';
-    case 'seniority': return p.seniority || '—';
-    case 'locations': return p.locations.join(', ') || '—';
-    case 'compFloor': return p.compFloor ? money(p.compFloor) : '—';
-    case 'skills': return p.skills.join(', ') || '—';
-    case 'factors': return (p.factors ?? []).join(', ') || '—';
-    case 'email': return p.email || '—';
-    case 'resume': return p.resumeText ? `${p.resumeText.length} characters on file` : '—';
-    case 'wallet': return p.wallet || '— not linked';
+async function runPreviewFlow(ctx: Ctx, profile: Profile): Promise<void> {
+  const c = profileCompleteness(profile);
+  if (c.missing.length) {
+    return void (await ctx.reply(`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
+      ...HTML,
+      reply_markup: new InlineKeyboard().text('Complete profile', 'profile:edit'),
+    }));
   }
+  await ctx.reply(`${title('Free preview', 'Top 3 matches — no charge')}`, HTML);
+  const res = await previewViaApi(profile);
+  if (!res.ok) {
+    return void (await ctx.reply(`${title('Preview unavailable')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+      ...HTML,
+      reply_markup: backHome(),
+    }));
+  }
+  const d = res.data!;
+  if (!d.matches?.length) {
+    return void (await ctx.reply(`${title('No matches right now')}\n\nNothing new matched your criteria this pass.`, {
+      ...HTML,
+      reply_markup: backHome(),
+    }));
+  }
+  const lines = d.matches.map(
+    (m, i) =>
+      `<b>${i + 1}. ${esc(m.title)}</b>\n${esc(m.company)} · ${esc(m.location)}\n${meter(m.score)}/100 — ${scoreVerdict(m.score)}\n` +
+      m.why.map((w) => `· ${esc(w)}`).join('\n') +
+      `\n<a href="${esc(m.url)}">View posting</a>`,
+  );
+  await ctx.reply(
+    `${title('Preview results', `Showing ${d.shown} of ${d.totalMatches}`)}\n\n${lines.join('\n\n')}\n\n${RULE}\n` +
+      `Previews left this hour · ${d.previewsRemainingThisHour}`,
+    { ...HTML, reply_markup: new InlineKeyboard().text('Full ranked hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
+  );
+}
+
+async function showUsage(ctx: Ctx, userId: string, engagement?: Engagement): Promise<void> {
+  const records = listUsage(userId, 20);
+  const profile = getProfile(userId);
+  if (!records.length) {
+    return void (await ctx.reply(`${title('Usage & billing')}\n\nNo service calls yet.`, { ...HTML, reply_markup: backHome() }));
+  }
+  const covered = records.filter((r) => !r.paid).length;
+  const rows = records
+    .slice(0, 10)
+    .map((r) => `${r.at.slice(0, 16).replace('T', ' ')} · ${esc(r.service)} · ${r.paid ? `$${r.priceUsd}` : 'engagement'} · ${r.status}`)
+    .join('\n');
+  await ctx.reply(
+    `${title('Usage & billing', `${records.length} recent calls`)}\n\n` +
+      (profile?.wallet ? `<b>Wallet</b> · <code>${esc(profile.wallet)}</code>\n` : '') +
+      (engagement ? `<b>Engagement</b> · ${esc(listingLabel(engagement.listing))}\n` : '') +
+      `<b>Covered by engagement</b> · ${covered} of ${records.length}\n\n<code>${rows}</code>`,
+    { ...HTML, reply_markup: backHome() },
+  );
+}
+
+async function showCatalog(ctx: Ctx): Promise<void> {
+  const [catalog, healthy] = await Promise.all([fetchCatalog(), serviceHealthy()]);
+  if (!catalog) {
+    return void (await ctx.reply(`${title('Services unavailable')}\n\nCould not reach the service catalog.`, {
+      ...HTML,
+      reply_markup: backHome(),
+    }));
+  }
+  const rows = catalog.services
+    .map((s) => `<b>${esc(s.id)}</b> · $${esc(s.priceUsd)} per call\n<code>${esc(s.endpoint)}</code>\n${esc(s.description)}`)
+    .join('\n\n');
+  await ctx.reply(
+    `${title('Services & pricing', healthy ? 'Live' : 'Service unreachable')}\n\n${rows}` +
+      (catalog.freeTier ? `\n\n<b>Free tier</b> · ${esc(catalog.freeTier.endpoint)} — ${catalog.freeTier.limitPerHour}/hour` : '') +
+      (catalog.payment ? `\n\n<b>Settlement</b> · ${esc(catalog.payment.assetSymbol)} on ${esc(catalog.payment.network)}` : ''),
+    { ...HTML, reply_markup: backHome() },
+  );
+}
+
+function menuText(profile?: Profile, engagement?: Engagement): string {
+  const lines = [title('Menu', 'Everything Legwork can do'), ''];
+  if (!profile) {
+    lines.push('Set up your profile first — every activity below scores against it.');
+    return lines.join('\n');
+  }
+  lines.push(
+    engagement?.status === 'active'
+      ? `Engagement · <b>${esc(listingLabel(engagement.listing))}</b> — calls are covered.`
+      : 'No active engagement — free preview is available, full hunts need a marketplace engagement.',
+  );
+  if (profile.wallet) lines.push(`Wallet · <code>${esc(shortAddress(profile.wallet))}</code>`);
+  lines.push('', 'Each action calls the live Legwork service.');
+  return lines.join('\n');
 }
 
 function applyField(p: Profile, field: ProfileField, text: string): { ok: true } | { ok: false; error: string } {
+  const list = () => splitList(text);
+  const num = () => Number(text.replace(/[^0-9]/g, ''));
+  const yesNo = (): boolean | undefined => {
+    const t = text.trim().toLowerCase();
+    if (['yes', 'y', 'true'].includes(t)) return true;
+    if (['no', 'n', 'false'].includes(t)) return false;
+    return undefined;
+  };
+  const url = (label: string): { ok: true } | { ok: false; error: string } => {
+    if (!/^https?:\/\/\S+$/i.test(text.trim())) return { ok: false, error: `Send a full ${label} URL starting with https://` };
+    return { ok: true };
+  };
+
   switch (field) {
+    // Identity & contact
     case 'name': p.name = text; return { ok: true };
-    case 'roles': p.targetRoles = splitList(text); return { ok: true };
-    case 'seniority': p.seniority = text.toLowerCase(); return { ok: true };
-    case 'locations': {
-      p.locations = splitList(text);
-      p.remoteOk = p.locations.some((l) => l.toLowerCase() === 'remote');
-      return { ok: true };
-    }
-    case 'compFloor': {
-      const n = Number(text.replace(/[^0-9]/g, ''));
-      if (!n) return { ok: false, error: 'Send a number — for example <i>120000</i>.' };
-      p.compFloor = n;
-      return { ok: true };
-    }
-    case 'skills': p.skills = splitList(text); return { ok: true };
-    case 'factors': p.factors = text.toLowerCase() === 'none' ? [] : splitList(text); return { ok: true };
     case 'email': {
       if (!/^[\w.+-]+@[\w-]+\.[\w.]+$/.test(text)) return { ok: false, error: 'That does not look like an email address.' };
-      p.email = text;
+      p.email = text.trim();
       return { ok: true };
     }
-    case 'resume': p.resumeText = text; return { ok: true };
+    case 'phone': {
+      if (!/^[+\d][\d\s().-]{6,}$/.test(text.trim())) return { ok: false, error: 'Send a valid phone number, including country code.' };
+      p.phone = text.trim();
+      return { ok: true };
+    }
+    case 'currentLocation': p.currentLocation = text.trim(); return { ok: true };
     case 'wallet': {
       if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
-        return { ok: false, error: '⚠️ That looks like a private key or seed phrase — <b>never share it with anyone, including me</b>. Send your public address instead (0x…, 42 characters).' };
+        return {
+          ok: false,
+          error: '⚠️ That looks like a private key or seed phrase — <b>never share it with anyone, including me</b>. Send your public address instead (0x…, 42 characters).',
+        };
       }
       if (!isEvmAddress(text)) return { ok: false, error: 'Send a valid X Layer address — <code>0x</code> followed by 40 hex characters.' };
       p.wallet = text.trim();
       return { ok: true };
     }
+
+    // Professional
+    case 'currentTitle': p.currentTitle = text.trim(); return { ok: true };
+    case 'yearsExperience': {
+      const n = num();
+      if (!Number.isFinite(n) || n < 0 || n > 60) return { ok: false, error: 'Send a number of years — for example <i>7</i>.' };
+      p.yearsExperience = n;
+      return { ok: true };
+    }
+    case 'seniority': {
+      const t = text.trim().toLowerCase();
+      const allowed = ['intern', 'junior', 'mid', 'senior', 'staff', 'principal'];
+      if (!allowed.includes(t)) return { ok: false, error: `Choose one of: <i>${allowed.join(' · ')}</i>` };
+      p.seniority = t;
+      return { ok: true };
+    }
+    case 'skills': {
+      const v = list();
+      if (!v.length) return { ok: false, error: 'Send at least one skill.' };
+      p.skills = v;
+      return { ok: true };
+    }
+    case 'resume': {
+      if (text.trim().length < 50) return { ok: false, error: 'Send your résumé text — at least a few sentences of real experience.' };
+      p.resumeText = text;
+      return { ok: true };
+    }
+    case 'education': p.education = text.trim(); return { ok: true };
+    case 'certifications': p.certifications = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
+    case 'languages': p.languages = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
+
+    // Links
+    case 'linkedin': { const r = url('LinkedIn'); if (!r.ok) return r; p.linkedin = text.trim(); return { ok: true }; }
+    case 'github': { const r = url('GitHub'); if (!r.ok) return r; p.github = text.trim(); return { ok: true }; }
+    case 'portfolio': { const r = url('portfolio'); if (!r.ok) return r; p.portfolio = text.trim(); return { ok: true }; }
+
+    // Preferences
+    case 'roles': {
+      const v = list();
+      if (!v.length) return { ok: false, error: 'Send at least one target role.' };
+      p.targetRoles = v;
+      return { ok: true };
+    }
+    case 'locations': {
+      const v = list();
+      if (!v.length) return { ok: false, error: 'Send at least one location, or <i>remote</i>.' };
+      p.locations = v;
+      p.remoteOk = v.some((l) => l.toLowerCase() === 'remote');
+      return { ok: true };
+    }
+    case 'compFloor': {
+      const n = num();
+      if (!n) return { ok: false, error: 'Send a number — for example <i>120000</i>.' };
+      p.compFloor = n;
+      return { ok: true };
+    }
+    case 'compTarget': {
+      const n = num();
+      if (!n) return { ok: false, error: 'Send a number — for example <i>150000</i>.' };
+      if (p.compFloor && n < p.compFloor) return { ok: false, error: `Your target should be at or above your ${money(p.compFloor)} floor.` };
+      p.compTarget = n;
+      return { ok: true };
+    }
+    case 'employmentTypes': p.employmentTypes = list(); return { ok: true };
+    case 'industries': p.industries = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
+    case 'companySizes': p.companySizes = list(); return { ok: true };
+    case 'factors': p.factors = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
+    case 'dealbreakers': p.dealbreakers = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
+
+    // Eligibility & availability
+    case 'workAuthorization': p.workAuthorization = text.trim(); return { ok: true };
+    case 'needsSponsorship': {
+      const v = yesNo();
+      if (v === undefined) return { ok: false, error: 'Reply <i>yes</i> or <i>no</i>.' };
+      p.needsSponsorship = v;
+      return { ok: true };
+    }
+    case 'willingToRelocate': {
+      const v = yesNo();
+      if (v === undefined) return { ok: false, error: 'Reply <i>yes</i> or <i>no</i>.' };
+      p.willingToRelocate = v;
+      return { ok: true };
+    }
+    case 'noticePeriod': p.noticePeriod = text.trim(); return { ok: true };
+    case 'availableFrom': p.availableFrom = text.trim(); return { ok: true };
   }
 }
 
@@ -727,6 +1078,25 @@ function validateSetup(step: SetupStep, text: string): { ok: true; patch: Record
     case 'factors':
       return { ok: true, patch: { factors: text.toLowerCase() === 'none' ? [] : splitList(text) } };
   }
+}
+
+/**
+ * Best-effort parse of a pasted job posting. Title and company are taken from
+ * the first two non-empty lines when not explicitly labelled.
+ */
+function parsePosting(text: string): { title: string; company: string; description: string; location?: string } | null {
+  const labelled = (key: string): string | undefined =>
+    text.match(new RegExp(`^\\s*${key}\\s*[:\\-]\\s*(.+)$`, 'im'))?.[1]?.trim();
+
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2 || text.trim().length < 40) return null;
+
+  const title = labelled('title') ?? labelled('role') ?? labelled('position') ?? lines[0];
+  const company = labelled('company') ?? labelled('employer') ?? lines[1];
+  const location = labelled('location') ?? labelled('where');
+  const description = text.trim();
+  if (!title || !company) return null;
+  return { title: title.slice(0, 200), company: company.slice(0, 200), description, location };
 }
 
 function splitList(text: string): string[] {
