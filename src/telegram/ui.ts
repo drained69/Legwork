@@ -54,7 +54,7 @@ export const PROFILE_FIELDS = {
   email: 'Email',
   phone: 'Phone',
   currentLocation: 'Current location',
-  wallet: 'X Layer wallet',
+  wallet: 'OKX wallet',
   // Professional
   currentTitle: 'Current title',
   yearsExperience: 'Years of experience',
@@ -104,7 +104,7 @@ export function fieldValue(p: Profile, field: ProfileField): string {
     case 'email': return p.email ?? '';
     case 'phone': return p.phone ?? '';
     case 'currentLocation': return p.currentLocation ?? '';
-    case 'wallet': return p.wallet ?? '';
+    case 'wallet': return p.wallet ? `${p.wallet}${p.walletEmail ? ` (${p.walletEmail})` : ''}` : '';
     case 'currentTitle': return p.currentTitle ?? '';
     case 'yearsExperience': return p.yearsExperience ? `${p.yearsExperience}` : '';
     case 'seniority': return p.seniority;

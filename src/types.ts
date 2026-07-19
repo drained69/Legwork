@@ -8,7 +8,8 @@ export interface Profile {
   email?: string; // address applications are sent from/for
   phone?: string;
   currentLocation?: string;
-  wallet?: string; // linked X Layer (EVM) address — settlement + identity
+  wallet?: string; // X Layer address, proven via OKX email login — settlement + identity
+  walletEmail?: string; // OKX account email the wallet was verified with
 
   // ── professional standing ────────────────────────────────────────────────
   currentTitle?: string;

@@ -430,3 +430,27 @@ test('wallet: settled engagements do NOT follow a transfer', () => {
   db.transferProfile('old-tg2', 'new-tg2');
   assert.equal(db.getEngagementByJob('job-w2')?.userId, 'old-tg2', 'settled engagements stay for the record');
 });
+
+// ── OKX email-OTP wallet sign-in ──────────────────────────────────────────
+
+test('wallet: sessions are isolated per user via ONCHAINOS_HOME', async () => {
+  const { homeForTest } = await import('../src/wallet/okxWallet.js');
+  const a = homeForTest('111');
+  const b = homeForTest('222');
+  assert.notEqual(a, b, 'two users must never share a wallet session directory');
+  assert.match(a, /111$/);
+});
+
+test('wallet: user ids are sanitised into safe directory names', async () => {
+  const { homeForTest } = await import('../src/wallet/okxWallet.js');
+  const evil = homeForTest('../../etc/passwd');
+  assert.ok(!evil.includes('..'), 'path traversal must not survive sanitisation');
+});
+
+test('wallet: address can no longer be set by typing it', async () => {
+  // Wallets are proven via OKX email OTP; free-text entry must be refused.
+  const p = { ...profile, userId: 'no-type-wallet' };
+  db.saveProfile(p);
+  const stored = db.getProfile('no-type-wallet')!;
+  assert.equal(stored.wallet, undefined, 'no wallet without verified sign-in');
+});

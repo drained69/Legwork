@@ -52,6 +52,7 @@ import {
   tailorViaApi,
 } from './apiClient.js';
 import { listUsage } from '../db.js';
+import { startEmailLogin, verifyEmailOtp, walletCliAvailable, walletLogout, walletStatus } from '../wallet/okxWallet.js';
 import type { Engagement, Profile } from '../types.js';
 
 /**
@@ -489,8 +490,46 @@ export function createBot(): Bot {
     if (ns === 'wallet') {
       await ctx.answerCallbackQuery();
       if (action === 'link') {
-        setOnboarding(userId, 'edit:wallet', {});
+        if (!(await walletCliAvailable())) {
+          return void (await ctx.reply(
+            `${title('Wallet sign-in unavailable')}\n\nThe OKX wallet service is not reachable from this deployment right now. ` +
+              'Everything else — profile, hunts, scoring and drafts — works normally.',
+            { ...HTML, reply_markup: backHome() },
+          ));
+        }
+        setOnboarding(userId, 'wallet:email', {});
         return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
+      }
+      if (action === 'resend') {
+        const state = getOnboarding(userId);
+        const email = String(state?.partial?.email ?? '');
+        if (!email) {
+          setOnboarding(userId, 'wallet:email', {});
+          return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
+        }
+        await ctx.reply(`${title('Sending a new code')}`, HTML);
+        const res = await startEmailLogin(userId, email);
+        setOnboarding(userId, 'wallet:otp', { email });
+        return void (await ctx.reply(
+          res.ok
+            ? `${title('New code sent')}\n\nCheck <b>${esc(email)}</b> and send me the code.`
+            : `${title('Could not send the code')}\n\n${esc(res.error ?? 'Unknown error')}`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+        ));
+      }
+      if (action === 'logout') {
+        await walletLogout(userId);
+        const p = getProfile(userId);
+        if (p) {
+          p.wallet = undefined;
+          p.walletEmail = undefined;
+          p.updatedAt = now();
+          saveProfile(p);
+        }
+        return void (await ctx.reply(
+          `${title('Wallet disconnected')}\n\nYour OKX session on this bot has ended. Your wallet and funds are untouched — sign in again any time.`,
+          { ...HTML, reply_markup: backHome() },
+        ));
       }
       return void (await showWallet(ctx, userId));
     }
@@ -705,13 +744,68 @@ export function createBot(): Bot {
       ));
     }
 
+    // ── OKX wallet sign-in: email → one-time code ────────────────────────
+    if (state.step === 'wallet:email') {
+      if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
+        return void (await ctx.reply(
+          `${title('Never share that')}\n\n⚠️ That looks like a private key or seed phrase. <b>Never share it with anyone, including me.</b>\n\n` +
+            'I only need your email address.',
+          { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
+        ));
+      }
+      if (!/^[\w.+-]+@[\w-]+\.[\w.]+$/.test(text.trim())) {
+        return void (await ctx.reply(`${title('Invalid email')}\n\nSend the email address for your OKX wallet.`, {
+          ...HTML,
+          reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel'),
+        }));
+      }
+      const email = text.trim();
+      await ctx.reply(`${title('Contacting OKX', 'Sending your one-time code')}`, HTML);
+      const res = await startEmailLogin(userId, email);
+      if (!res.ok) {
+        clearOnboarding(userId);
+        return void (await ctx.reply(
+          `${title('Could not send the code')}\n\n${esc(res.error ?? 'Unknown error')}`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Try again', 'wallet:link').text('‹ Menu', 'nav:home') },
+        ));
+      }
+      setOnboarding(userId, 'wallet:otp', { email });
+      return void (await ctx.reply(
+        `${title('Check your email', esc(email))}\n\nOKX has sent you a one-time code. Send it here to finish connecting.\n\n` +
+          '<i>The code expires shortly. It is issued by OKX — never share it anywhere else.</i>',
+        { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
+      ));
+    }
+
+    if (state.step === 'wallet:otp') {
+      const code = text.trim().replace(/\s+/g, '');
+      if (!/^\d{4,8}$/.test(code)) {
+        return void (await ctx.reply(
+          `${title('That does not look like the code')}\n\nOKX codes are 4–8 digits. Send just the number.`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
+        ));
+      }
+      await ctx.reply(`${title('Verifying')}`, HTML);
+      const res = await verifyEmailOtp(userId, code);
+      if (!res.ok || !res.address) {
+        return void (await ctx.reply(
+          `${title('Verification failed')}\n\n${esc(res.error ?? 'That code was not accepted.')}`,
+          { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
+        ));
+      }
+      const email = String(state.partial.email ?? '');
+      clearOnboarding(userId);
+      return void (await completeWalletConnection(ctx, userId, res.address, email, Boolean(res.isNew)));
+    }
+
     // Single-field edit
     if (state.step.startsWith('edit:')) {
       const field = state.step.slice('edit:'.length) as ProfileField;
 
       // ── wallet is special: it is an identity key, not just a field ───────
       if (field === 'wallet') {
-        return void (await handleWalletLink(ctx, userId, text));
+        setOnboarding(userId, 'wallet:email', {});
+        return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
       }
 
       const profile = getProfile(userId);
@@ -803,60 +897,59 @@ async function promptSetup(ctx: Ctx): Promise<void> {
 
 function walletPrompt(): string {
   return (
-    `${title('Link your X Layer wallet')}\n\n` +
-    'Send your <b>X Layer address</b> — it begins with <code>0x</code> and is 42 characters long.\n\n' +
-    'Used to identify you across OKX engagements and to settle payments. ' +
-    '<b>Never send a private key or seed phrase</b> — an address alone is all I need, and it is safe to share.'
+    `${title('Connect your OKX wallet', 'Sign in with email')}\n\n` +
+    'Send the <b>email address</b> for your OKX Agentic Wallet.\n\n' +
+    'OKX will email you a one-time code. Enter that code here and your X Layer wallet is connected — ' +
+    'created automatically if you do not have one yet.\n\n' +
+    '<b>Legwork never sees your keys.</b> They are generated inside OKX’s secure enclave and cannot leave it. ' +
+    'I only ever receive your public address.\n\n' +
+    '<i>Never send a private key or seed phrase to anyone, including me.</i>'
   );
 }
 
 /**
- * Wallet linking — the wallet is an identity key.
+ * Completes an OKX email-verified wallet connection.
  *
- * Rules:
- *  1. One wallet ↔ one profile, always (enforced here, nowhere else to slip in).
- *  2. Connecting a wallet that already carries a profile LOADS that profile —
- *     saved details, history and live engagements follow the wallet.
- *  3. If the current chat already has its own profile, the user chooses which
- *     survives — never silently overwrite either side.
+ * The address here is PROVEN — the user demonstrated control of the OKX
+ * account by entering a code emailed to them, and OKX returned the address
+ * from its TEE. That is what makes wallet-as-identity safe: connecting a
+ * wallet loads the profile behind it.
+ *
+ * Invariant: one wallet ↔ one profile, enforced at this single entry point.
  */
-async function handleWalletLink(ctx: Ctx, userId: string, text: string): Promise<void> {
-  // Refuse anything that looks like key material, loudly.
-  if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
-    return void (await ctx.reply(
-      `${title('Never share that')}\n\n⚠️ That looks like a private key or seed phrase — <b>never share it with anyone, including me</b>. ` +
-        'Send your public address instead (<code>0x…</code>, 42 characters).',
-      { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
-    ));
-  }
-  if (!isEvmAddress(text)) {
-    return void (await ctx.reply(
-      `${title('Invalid address')}\n\nSend a valid X Layer address — <code>0x</code> followed by 40 hex characters.`,
-      { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
-    ));
-  }
-
-  const wallet = text.trim();
-  const owner = getProfileByWallet(wallet);
+async function completeWalletConnection(
+  ctx: Ctx,
+  userId: string,
+  address: string,
+  email: string,
+  isNew: boolean,
+): Promise<void> {
+  const owner = getProfileByWallet(address);
   const current = getProfile(userId);
-  clearOnboarding(userId);
 
-  // Already yours — nothing to do.
+  const connected = (extra: string, kb: InlineKeyboard) =>
+    ctx.reply(
+      `${title(isNew ? 'Wallet created' : 'Wallet connected', esc(email))}\n\n` +
+        `<b>X Layer address</b>\n<code>${esc(address)}</code>\n\n${extra}`,
+      { ...HTML, reply_markup: kb },
+    );
+
+  // Already this account's wallet — refresh the record and move on.
   if (owner && owner.userId === userId) {
-    return void (await ctx.reply(
-      `${title('Already linked')}\n\n<code>${esc(wallet)}</code> is already the wallet on your profile.`,
-      { ...HTML, reply_markup: backHome() },
-    ));
+    owner.wallet = address;
+    owner.walletEmail = email;
+    owner.updatedAt = now();
+    saveProfile(owner);
+    return void (await connected('Your wallet session has been refreshed.', backHome()));
   }
 
-  // Wallet carries an existing profile → load it (the whole point of wallet identity).
+  // The wallet carries a profile from another Telegram account → load it.
   if (owner) {
     if (current) {
-      // Both sides have data: the user decides which profile survives.
-      setOnboarding(userId, 'walletadopt', { wallet, fromUserId: owner.userId });
+      setOnboarding(userId, 'walletadopt', { wallet: address, fromUserId: owner.userId, email });
       return void (await ctx.reply(
         `${title('This wallet already has a profile', esc(owner.name || 'Saved profile'))}\n\n` +
-          `<code>${esc(wallet)}</code> is attached to an existing Legwork profile ` +
+          `<code>${esc(address)}</code> carries an existing Legwork profile ` +
           `(${esc(owner.targetRoles.join(', ') || 'no roles set')}).\n\n` +
           'You also have a profile in this chat. Which should this account use?',
         {
@@ -870,57 +963,65 @@ async function handleWalletLink(ctx: Ctx, userId: string, text: string): Promise
     }
     transferProfile(owner.userId, userId);
     const loaded = getProfile(userId)!;
-    audit('telegram', 'WALLET_PROFILE_LOADED', `wallet=${wallet} -> user=${userId}`);
-    return void (await ctx.reply(
-      `${title('Welcome back', 'Profile loaded from your wallet')}\n\n` +
-        `<code>${esc(wallet)}</code> connected — your saved profile, history and engagements are restored.\n\n${renderProfile(loaded)}`,
-      { ...HTML, reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
-    ));
+    loaded.walletEmail = email;
+    saveProfile(loaded);
+    audit('telegram', 'WALLET_PROFILE_LOADED', `user=${userId}`);
+    await connected('Your saved profile, history and engagements have been restored.', new InlineKeyboard());
+    return void (await ctx.reply(renderProfile(loaded), {
+      ...HTML,
+      reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open'),
+    }));
   }
 
-  // Fresh wallet.
+  // Wallet is new to Legwork.
   if (current) {
-    current.wallet = wallet;
+    current.wallet = address;
+    current.walletEmail = email;
     current.updatedAt = now();
     saveProfile(current);
-    audit('telegram', 'WALLET_LINKED', `wallet=${wallet} user=${userId}`);
-    return void (await ctx.reply(
-      `${title('Wallet linked')}\n\n<code>${esc(wallet)}</code> is now attached to your profile. ` +
-        'From now on, connecting this wallet anywhere loads this profile.',
-      { ...HTML, reply_markup: backHome() },
+    audit('telegram', 'WALLET_LINKED', `user=${userId}`);
+    return void (await connected(
+      'This wallet is now attached to your profile. Signing in with the same email anywhere restores it.',
+      backHome(),
     ));
   }
 
-  // No profile at all yet: start one anchored to the wallet.
+  // No profile yet — anchor a fresh one to the wallet and start setup.
   const shell: Profile = {
     userId, name: '', targetRoles: [], seniority: 'mid', locations: [], remoteOk: false,
     compFloor: 0, skills: [], resumeText: '', dealbreakers: [], factors: [],
-    threshold: 0, dailyCap: 10, wallet, updatedAt: now(),
+    threshold: 0, dailyCap: 10, wallet: address, walletEmail: email, updatedAt: now(),
   };
   saveProfile(shell);
   setOnboarding(userId, 'roles', {});
-  audit('telegram', 'WALLET_LINKED_NEW', `wallet=${wallet} user=${userId}`);
-  await ctx.reply(
-    `${title('Wallet connected', 'New wallet — no profile yet')}\n\n<code>${esc(wallet)}</code> is linked. ` +
-      'Let’s set up the profile it will carry.',
-    HTML,
-  );
+  audit('telegram', 'WALLET_LINKED_NEW', `user=${userId}`);
+  await connected('Now let\u2019s set up the profile this wallet will carry.', new InlineKeyboard());
   await ctx.reply(askSetup('roles'), HTML);
 }
 
 async function showWallet(ctx: Ctx & { from?: { id: number } }, userId: string): Promise<void> {
   const p = getProfile(userId);
-  if (!p?.wallet) {
+  const status = await walletStatus(userId);
+
+  if (!status.loggedIn || !p?.wallet) {
     return void (await ctx.reply(walletPrompt(), {
       ...HTML,
-      reply_markup: new InlineKeyboard().text('Link wallet', 'wallet:link').text('‹ Back', 'nav:home'),
+      reply_markup: new InlineKeyboard().text('Sign in with email', 'wallet:link').text('\u2039 Back', 'nav:home'),
     }));
   }
+
   await ctx.reply(
-    `${title('X Layer wallet', 'Connected')}\n\n<code>${esc(p.wallet)}</code>\n\n<b>Network</b> · X Layer (chain 196)\n<b>Linked</b> · ${
-      p.updatedAt?.slice(0, 10) ?? '—'
-    }`,
-    { ...HTML, reply_markup: new InlineKeyboard().text('Change wallet', 'edit:wallet').text('‹ Back', 'nav:home') },
+    `${title('OKX Agentic Wallet', 'Connected')}\n\n` +
+      `<b>Signed in as</b> · ${esc(status.email ?? p.walletEmail ?? '\u2014')}\n` +
+      `<b>X Layer address</b>\n<code>${esc(p.wallet)}</code>\n\n` +
+      `<b>Network</b> · X Layer (chain 196)\n` +
+      `<b>Account</b> · ${esc(status.accountName ?? 'Account 1')}\n` +
+      `<b>Connected</b> · ${p.updatedAt?.slice(0, 10) ?? '\u2014'}\n\n` +
+      '<i>Keys are held in OKX\u2019s secure enclave. Legwork can never access or export them.</i>',
+    {
+      ...HTML,
+      reply_markup: new InlineKeyboard().text('Disconnect', 'wallet:logout').text('\u2039 Back', 'nav:home'),
+    },
   );
 }
 
@@ -1103,17 +1204,9 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
       return { ok: true };
     }
     case 'currentLocation': p.currentLocation = text.trim(); return { ok: true };
-    case 'wallet': {
-      if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
-        return {
-          ok: false,
-          error: '⚠️ That looks like a private key or seed phrase — <b>never share it with anyone, including me</b>. Send your public address instead (0x…, 42 characters).',
-        };
-      }
-      if (!isEvmAddress(text)) return { ok: false, error: 'Send a valid X Layer address — <code>0x</code> followed by 40 hex characters.' };
-      p.wallet = text.trim();
-      return { ok: true };
-    }
+    case 'wallet':
+      // Wallet is never set from free text — it is proven via OKX email login.
+      return { ok: false, error: 'Use <b>/wallet</b> to sign in with your OKX email — wallets cannot be typed in by hand.' };
 
     // Professional
     case 'currentTitle': p.currentTitle = text.trim(); return { ok: true };
