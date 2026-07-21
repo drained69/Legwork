@@ -51,6 +51,13 @@ let timer: NodeJS.Timeout | undefined;
 let running = false;
 let consecutiveFailures = 0;
 let lastHeartbeat = 0;
+/**
+ * Is the OKX A2A chat channel up? Set once from gate-check at startup.
+ *
+ * When it is down we still claim tasks: applying is what stops the expiry
+ * clock, and a chat outage must not also cost us the task.
+ */
+let commsReady = true;
 
 const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 
@@ -73,12 +80,24 @@ export async function startMarketplacePoller(deps: PollerDeps): Promise<PollerHa
   }
 
   const gate = await gateCheck();
-  if (!gate.ready) {
+  // Claiming needs the wallet and the ASP identity. It does NOT need chat:
+  // `asp-apply` is what stops the expiry clock. OKX's gate-check folds A2A
+  // comms into `ready`, but treating that as fatal means a chat outage
+  // silently costs us every task — the exact failure this poller exists to
+  // prevent. So gate on the two that matter and degrade on the third.
+  if (!gate.wallet || !gate.identity) {
     console.error(
       `[okx-poller] gate-check failed (wallet=${gate.wallet} identity=${gate.identity} comms=${gate.communication}` +
         `${gate.error ? ` error=${gate.error}` : ''}) — polling disabled until the service wallet is signed in.`,
     );
     return null;
+  }
+  commsReady = gate.communication;
+  if (!commsReady) {
+    console.warn(
+      '[okx-poller] A2A chat is unavailable — claiming still runs so tasks do not expire, but the buyer greeting is skipped ' +
+        'and negotiation messages will not be delivered. Fix with `okx-a2a doctor --fix`.',
+    );
   }
   if (gate.agentId && gate.agentId !== config.okx.aspAgentId) {
     console.warn(`[okx-poller] configured OKX_ASP_AGENT_ID=${config.okx.aspAgentId} but the signed-in identity is ${gate.agentId}.`);
@@ -235,17 +254,27 @@ function plannedAction(task: MarketplaceTask, engagement: Engagement): string {
  */
 async function claim(task: MarketplaceTask, engagement: Engagement, deps: PollerDeps): Promise<void> {
   if (!engagement.claimedAt) {
-    const contact = await contactUser(task.jobId);
-    if (contact.ok) {
-      engagement.claimedAt = now();
-      saveEngagement(engagement);
-      console.log(`[okx-poller] claimed ${task.jobId} — "${task.title}"`);
-    } else if (!/already|exists|duplicate/i.test(contact.error ?? '')) {
-      console.error(`[okx-poller] contact-user failed for ${task.jobId}: ${contact.error}`);
-      return; // retry next tick rather than applying to a buyer we never greeted
+    if (!commsReady) {
+      // No chat channel at all, so the greeting is impossible rather than
+      // merely failing. Fall through to apply: an ungreeted buyer is
+      // recoverable, an expired task is not. claimedAt stays unset so the
+      // greeting is retried if comms come back.
+      if (!engagement.appliedAt) {
+        console.warn(`[okx-poller] ${task.jobId}: A2A chat down — applying without the buyer greeting so the task does not expire.`);
+      }
     } else {
-      engagement.claimedAt = now(); // channel already open from an earlier run
-      saveEngagement(engagement);
+      const contact = await contactUser(task.jobId);
+      if (contact.ok) {
+        engagement.claimedAt = now();
+        saveEngagement(engagement);
+        console.log(`[okx-poller] claimed ${task.jobId} — "${task.title}"`);
+      } else if (!/already|exists|duplicate/i.test(contact.error ?? '')) {
+        console.error(`[okx-poller] contact-user failed for ${task.jobId}: ${contact.error}`);
+        return; // retry next tick rather than applying to a buyer we never greeted
+      } else {
+        engagement.claimedAt = now(); // channel already open from an earlier run
+        saveEngagement(engagement);
+      }
     }
   }
 
@@ -324,6 +353,11 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
  * negotiation the protocol requires.
  */
 async function coldStartDiscovery(): Promise<void> {
+  // Cold start's only action is opening a chat. With comms down every call
+  // would fail, so skip the sweep rather than burn a CLI round-trip per task
+  // per tick. Designated tasks still get claimed — see claim().
+  if (!commsReady) return;
+
   const { ok, tasks, error } = await recommendedTasks();
   if (!ok) {
     // Expected while the agent listing is still under review — the backend
