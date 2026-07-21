@@ -17,6 +17,28 @@ export const config = {
     inboundSecret: env('OKX_INBOUND_SECRET'),
     // Public base URL of this deployment (used as the x402 `resource` field).
     publicUrl: env('PUBLIC_URL', ''),
+
+    // ── marketplace polling (the seller side of the task protocol) ─────────
+    // Numeric ERC-8004 agent id of the ASP identity, e.g. "6658". Tasks are
+    // routed to this id; without it the poller cannot act and stays off.
+    aspAgentId: env('OKX_ASP_AGENT_ID', ''),
+    // onchainos home holding the SERVICE's wallet session (not a user's).
+    home: env('OKX_ONCHAINOS_HOME', ''),
+    // How often to pull the task list. Tasks expire on the backend's clock,
+    // so this is the single most important number in this file.
+    pollIntervalMs: Number(env('OKX_POLL_INTERVAL_MS', '30000')),
+    // Apply on-chain to tasks that already designate this agent as provider.
+    // Off → the poller only opens the chat and waits for a human.
+    autoApply: env('OKX_AUTO_APPLY', 'true') !== 'false',
+    // Never auto-apply above this budget — a large task deserves a human look.
+    maxAutoApplyBudget: Number(env('OKX_MAX_AUTO_APPLY_BUDGET', '10')),
+    // Auto-run the hunt and submit the deliverable once escrow is funded.
+    autoDeliver: env('OKX_AUTO_DELIVER', 'true') !== 'false',
+    // Log what the poller WOULD claim without touching the chain. Use this to
+    // verify wiring on a live account before letting it act.
+    dryRun: env('OKX_POLL_DRY_RUN') === 'true',
+    // X Layer. Used for the online-status heartbeat.
+    chainIndex: Number(env('OKX_CHAIN_INDEX', '196')),
   },
   adzuna: {
     appId: env('ADZUNA_APP_ID'),

@@ -2,6 +2,7 @@ import { audit, getProfile, saveEngagement } from '../db.js';
 import { scanForUser } from './jobScraper.js';
 import { scorePosting } from './matchScorer.js';
 import { renderBreakdown } from '../pipeline.js';
+import { INJECTION_GUARD, extractJson, llm, untrusted } from '../llm.js';
 import type { Engagement, Posting, Profile, ScoreBreakdown } from '../types.js';
 
 /**
@@ -93,6 +94,67 @@ export async function runAdhocHunt(criteria: HuntCriteria): Promise<HuntResult> 
   scored.sort((a, b) => b.breakdown.total - a.breakdown.total);
   audit('job-hunt', 'API_HUNT', `found=${scan.found} shortlisted=${Math.min(scored.length, TOP_N)}`);
   return { matches: scored.slice(0, TOP_N), found: scan.found, sourceErrors: scan.sourceErrors };
+}
+
+/**
+ * Turn a marketplace buyer's free-text brief into hunt criteria.
+ *
+ * A task published on OKX carries a title + description ("Find senior React
+ * roles, remote, $150k+"), not a filled-in form. This is the bridge that lets
+ * the agent serve a task autonomously instead of waiting for the buyer to
+ * finish a Telegram onboarding they may never start.
+ *
+ * SECURITY: the brief is untrusted third-party text. It is wrapped in the
+ * standard guard tags and only ever used to fill these six fields — it never
+ * becomes an instruction.
+ */
+export async function criteriaFromBrief(title: string, description = ''): Promise<HuntCriteria> {
+  const brief = `${title}\n${description}`.trim();
+  const reply = await llm(
+    'You extract job-search criteria from a buyer request. ' +
+      INJECTION_GUARD +
+      ' Reply with ONLY a JSON object: {"roles":string[],"seniority":"junior|mid|senior|staff|principal",' +
+      '"locations":string[],"compFloor":number,"skills":string[],"factors":string[]}. ' +
+      'Use [] / 0 for anything the request does not state. Never invent a comp floor.',
+    untrusted(brief),
+    600,
+  );
+  const parsed = reply ? extractJson<HuntCriteria>(reply) : null;
+  if (parsed && (parsed.roles?.length || parsed.skills?.length)) return normalizeCriteria(parsed);
+  return heuristicCriteria(brief);
+}
+
+function normalizeCriteria(c: HuntCriteria): HuntCriteria {
+  const arr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).slice(0, 12) : [];
+  return {
+    roles: arr(c.roles),
+    seniority: typeof c.seniority === 'string' && c.seniority.trim() ? c.seniority.trim() : 'mid',
+    locations: arr(c.locations).length ? arr(c.locations) : ['remote'],
+    compFloor: Number.isFinite(Number(c.compFloor)) ? Math.max(0, Number(c.compFloor)) : 0,
+    skills: arr(c.skills),
+    factors: arr(c.factors),
+  };
+}
+
+/** Keyless fallback: pull what a regex can honestly see, guess nothing else. */
+export function heuristicCriteria(brief: string): HuntCriteria {
+  const text = brief.toLowerCase();
+  const seniority =
+    ['principal', 'staff', 'senior', 'junior'].find((s) => text.includes(s)) ??
+    (/\bentry|graduate|intern\b/.test(text) ? 'junior' : 'mid');
+  // "$150k" / "$150,000" / "150k+"
+  const comp = /\$?\s*(\d{2,3})\s*k\b/.exec(text) ?? /\$\s*([\d,]{5,9})/.exec(text);
+  const compFloor = comp ? (comp[0].includes('k') ? Number(comp[1]) * 1000 : Number(comp[1].replace(/,/g, ''))) : 0;
+  const locations = /\bremote\b/.test(text) ? ['remote'] : ['remote'];
+  // The role is the most useful signal we can extract without a model: keep
+  // the meaningful words of the brief and let the scorer do the rest.
+  const roles = brief
+    .split(/[,.\n;]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 2 && s.length < 60 && /[a-z]/i.test(s))
+    .slice(0, 3);
+  return { roles, seniority, locations, compFloor, skills: [], factors: [] };
 }
 
 /**

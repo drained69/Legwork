@@ -52,7 +52,7 @@ import {
   tailorViaApi,
 } from './apiClient.js';
 import { listUsage } from '../db.js';
-import { startEmailLogin, verifyEmailOtp, walletCliAvailable, walletLogout, walletStatus } from '../wallet/okxWallet.js';
+import { pollLogin, startLogin, walletCliAvailable, walletLogout, walletStatus } from '../wallet/okxWallet.js';
 import type { Engagement, Profile } from '../types.js';
 
 /**
@@ -456,11 +456,15 @@ export function createBot(): Bot {
       }
       const wallet = String(state.partial.wallet ?? '');
       const fromUserId = String(state.partial.fromUserId ?? '');
+      // Undefined for Google/Apple sign-ins, which carry no email address.
+      const walletEmail = String(state.partial.email ?? '') || undefined;
       clearOnboarding(userId);
       if (action === 'yes') {
         // The wallet's profile wins — it replaces the chat's current one.
         transferProfile(fromUserId, userId);
         const loaded = getProfile(userId)!;
+        loaded.walletEmail = walletEmail;
+        saveProfile(loaded);
         audit('telegram', 'WALLET_PROFILE_ADOPTED', `wallet=${wallet} -> user=${userId}`);
         return void (await ctx.reply(
           `${title('Profile loaded', 'Restored from your wallet')}\n\n${renderProfile(loaded)}`,
@@ -477,6 +481,7 @@ export function createBot(): Bot {
       }
       if (current) {
         current.wallet = wallet;
+        current.walletEmail = walletEmail;
         current.updatedAt = now();
         saveProfile(current);
       }
@@ -489,33 +494,31 @@ export function createBot(): Bot {
 
     if (ns === 'wallet') {
       await ctx.answerCallbackQuery();
-      if (action === 'link') {
-        if (!(await walletCliAvailable())) {
+      if (action === 'link') return void (await beginWalletLogin(ctx, userId));
+      if (action === 'check') {
+        const state = getOnboarding(userId);
+        const sessionId = String(state?.partial?.sessionId ?? '');
+        // No live session (bot restarted, or the user never started one).
+        if (state?.step !== 'wallet:pending' || !sessionId) return void (await beginWalletLogin(ctx, userId));
+
+        await ctx.reply(`${title('Checking with OKX')}`, HTML);
+        const res = await pollLogin(userId, sessionId);
+
+        if (res.pending) {
           return void (await ctx.reply(
-            `${title('Wallet sign-in unavailable')}\n\nThe OKX wallet service is not reachable from this deployment right now. ` +
-              'Everything else — profile, hunts, scoring and drafts — works normally.',
-            { ...HTML, reply_markup: backHome() },
+            `${title('Not signed in yet')}\n\nFinish signing in on the OKX page, then tap <b>I’ve signed in</b> again.`,
+            { ...HTML, reply_markup: walletPendingKeyboard(String(state.partial.loginUrl ?? '')) },
           ));
         }
-        setOnboarding(userId, 'wallet:email', {});
-        return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
-      }
-      if (action === 'resend') {
-        const state = getOnboarding(userId);
-        const email = String(state?.partial?.email ?? '');
-        if (!email) {
-          setOnboarding(userId, 'wallet:email', {});
-          return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
+        if (!res.ok || !res.address) {
+          clearOnboarding(userId);
+          return void (await ctx.reply(
+            `${title('Sign-in failed')}\n\n${esc(res.error ?? 'OKX could not confirm that sign-in.')}`,
+            { ...HTML, reply_markup: new InlineKeyboard().text('Start again', 'wallet:link').text('‹ Menu', 'nav:home') },
+          ));
         }
-        await ctx.reply(`${title('Sending a new code')}`, HTML);
-        const res = await startEmailLogin(userId, email);
-        setOnboarding(userId, 'wallet:otp', { email });
-        return void (await ctx.reply(
-          res.ok
-            ? `${title('New code sent')}\n\nCheck <b>${esc(email)}</b> and send me the code.`
-            : `${title('Could not send the code')}\n\n${esc(res.error ?? 'Unknown error')}`,
-          { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
-        ));
+        clearOnboarding(userId);
+        return void (await completeWalletConnection(ctx, userId, res.address, res.email, Boolean(res.isNew), res.loginType));
       }
       if (action === 'logout') {
         await walletLogout(userId);
@@ -744,58 +747,23 @@ export function createBot(): Bot {
       ));
     }
 
-    // ── OKX wallet sign-in: email → one-time code ────────────────────────
-    if (state.step === 'wallet:email') {
-      if (/^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text)) {
-        return void (await ctx.reply(
-          `${title('Never share that')}\n\n⚠️ That looks like a private key or seed phrase. <b>Never share it with anyone, including me.</b>\n\n` +
-            'I only need your email address.',
-          { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
-        ));
-      }
-      if (!/^[\w.+-]+@[\w-]+\.[\w.]+$/.test(text.trim())) {
-        return void (await ctx.reply(`${title('Invalid email')}\n\nSend the email address for your OKX wallet.`, {
-          ...HTML,
-          reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel'),
-        }));
-      }
-      const email = text.trim();
-      await ctx.reply(`${title('Contacting OKX', 'Sending your one-time code')}`, HTML);
-      const res = await startEmailLogin(userId, email);
-      if (!res.ok) {
+    // ── OKX wallet sign-in happens on OKX's own page, not in this chat ───
+    // Nothing typed here can advance it, so nudge back to the button. The
+    // secret-shaped guard stays: a user mid-sign-in may paste the wrong thing.
+    if (state.step.startsWith('wallet:')) {
+      if (looksLikeSecret(text)) return void (await ctx.reply(secretWarning(), { ...HTML, reply_markup: backHome() }));
+      // Steps other than `pending` are from the retired email/OTP flow: a user
+      // mid-sign-in across a deploy. Restart them rather than stranding them —
+      // without this they fall through to a silent return and a dead chat.
+      if (state.step !== 'wallet:pending') {
         clearOnboarding(userId);
-        return void (await ctx.reply(
-          `${title('Could not send the code')}\n\n${esc(res.error ?? 'Unknown error')}`,
-          { ...HTML, reply_markup: new InlineKeyboard().text('Try again', 'wallet:link').text('‹ Menu', 'nav:home') },
-        ));
+        return void (await beginWalletLogin(ctx, userId));
       }
-      setOnboarding(userId, 'wallet:otp', { email });
       return void (await ctx.reply(
-        `${title('Check your email', esc(email))}\n\nOKX has sent you a one-time code. Send it here to finish connecting.\n\n` +
-          '<i>The code expires shortly. It is issued by OKX — never share it anywhere else.</i>',
-        { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
+        `${title('Finish on the OKX page')}\n\nSigning in happens on OKX’s site — there is nothing to type here. ` +
+          'Open the link, sign in, then tap <b>I’ve signed in</b>.',
+        { ...HTML, reply_markup: walletPendingKeyboard(String(state.partial.loginUrl ?? '')) },
       ));
-    }
-
-    if (state.step === 'wallet:otp') {
-      const code = text.trim().replace(/\s+/g, '');
-      if (!/^\d{4,8}$/.test(code)) {
-        return void (await ctx.reply(
-          `${title('That does not look like the code')}\n\nOKX codes are 4–8 digits. Send just the number.`,
-          { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
-        ));
-      }
-      await ctx.reply(`${title('Verifying')}`, HTML);
-      const res = await verifyEmailOtp(userId, code);
-      if (!res.ok || !res.address) {
-        return void (await ctx.reply(
-          `${title('Verification failed')}\n\n${esc(res.error ?? 'That code was not accepted.')}`,
-          { ...HTML, reply_markup: new InlineKeyboard().text('Resend code', 'wallet:resend').text('Cancel', 'edit:cancel') },
-        ));
-      }
-      const email = String(state.partial.email ?? '');
-      clearOnboarding(userId);
-      return void (await completeWalletConnection(ctx, userId, res.address, email, Boolean(res.isNew)));
     }
 
     // Single-field edit
@@ -803,10 +771,8 @@ export function createBot(): Bot {
       const field = state.step.slice('edit:'.length) as ProfileField;
 
       // ── wallet is special: it is an identity key, not just a field ───────
-      if (field === 'wallet') {
-        setOnboarding(userId, 'wallet:email', {});
-        return void (await ctx.reply(walletPrompt(), { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') }));
-      }
+      // It can only be set by proving control through OKX, never by typing.
+      if (field === 'wallet') return void (await beginWalletLogin(ctx, userId));
 
       const profile = getProfile(userId);
       if (!profile) {
@@ -897,23 +863,87 @@ async function promptSetup(ctx: Ctx): Promise<void> {
 
 function walletPrompt(): string {
   return (
-    `${title('Connect your OKX wallet', 'Sign in with email')}\n\n` +
-    'Send the <b>email address</b> for your OKX Agentic Wallet.\n\n' +
-    'OKX will email you a one-time code. Enter that code here and your X Layer wallet is connected — ' +
-    'created automatically if you do not have one yet.\n\n' +
-    '<b>Legwork never sees your keys.</b> They are generated inside OKX’s secure enclave and cannot leave it. ' +
-    'I only ever receive your public address.\n\n' +
+    `${title('Connect your OKX wallet', 'Sign in at OKX')}\n\n` +
+    'Tap <b>Get sign-in link</b> and I’ll ask OKX for a one-time sign-in page. ' +
+    'You sign in there with <b>Google, Apple or email</b> — whichever your OKX account uses — ' +
+    'then come back and tap <b>I’ve signed in</b>.\n\n' +
+    'Your X Layer wallet is connected on return, and created automatically if you don’t have one yet.\n\n' +
+    '<b>Legwork never sees your keys or your password.</b> You authenticate on OKX’s own site; ' +
+    'keys are generated inside OKX’s secure enclave and cannot leave it. I only ever receive your public address.\n\n' +
     '<i>Never send a private key or seed phrase to anyone, including me.</i>'
   );
 }
 
+function looksLikeSecret(text: string): boolean {
+  return /^(0x)?[a-fA-F0-9]{64}$/.test(text.trim()) || /\b(seed|mnemonic|private key)\b/i.test(text);
+}
+
+function secretWarning(): string {
+  return (
+    `${title('Never share that')}\n\n⚠️ That looks like a private key or seed phrase. ` +
+    '<b>Never share it with anyone, including me.</b>\n\n' +
+    'Legwork never needs it — you sign in on OKX’s own page.'
+  );
+}
+
+function loginTypeLabel(loginType?: string): string {
+  const map: Record<string, string> = { email: 'Email', google: 'Google', apple: 'Apple', ak: 'API Key' };
+  return map[String(loginType ?? '').toLowerCase()] ?? 'OKX account';
+}
+
+/** Keyboard shown while a sign-in is in flight. */
+function walletPendingKeyboard(loginUrl: string): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (loginUrl) kb.url('Open OKX sign-in', loginUrl).row();
+  return kb.text('I’ve signed in', 'wallet:check').row().text('Cancel', 'edit:cancel');
+}
+
 /**
- * Completes an OKX email-verified wallet connection.
+ * Starts the OKX browser sign-in: mint a login URL and hand it to the user.
  *
- * The address here is PROVEN — the user demonstrated control of the OKX
- * account by entering a code emailed to them, and OKX returned the address
- * from its TEE. That is what makes wallet-as-identity safe: connecting a
- * wallet loads the profile behind it.
+ * The URL is a bearer credential for one session, so it is sent only to the
+ * chat that requested it and never logged.
+ */
+async function beginWalletLogin(ctx: Ctx, userId: string): Promise<void> {
+  if (!(await walletCliAvailable())) {
+    return void (await ctx.reply(
+      `${title('Wallet sign-in unavailable')}\n\nThe OKX wallet service is not reachable from this deployment right now. ` +
+        'Everything else — profile, hunts, scoring and drafts — works normally.',
+      { ...HTML, reply_markup: backHome() },
+    ));
+  }
+
+  await ctx.reply(`${title('Contacting OKX', 'Preparing your sign-in link')}`, HTML);
+  const session = await startLogin(userId);
+  if (!session.ok || !session.loginUrl || !session.sessionId) {
+    clearOnboarding(userId);
+    return void (await ctx.reply(
+      `${title('Could not start sign-in')}\n\n${esc(session.error ?? 'Unknown error')}`,
+      { ...HTML, reply_markup: new InlineKeyboard().text('Try again', 'wallet:link').text('‹ Menu', 'nav:home') },
+    ));
+  }
+
+  setOnboarding(userId, 'wallet:pending', { sessionId: session.sessionId, loginUrl: session.loginUrl });
+  await ctx.reply(
+    `${title('Sign in at OKX', 'Then come back here')}\n\n` +
+      '1. Open the OKX sign-in page below\n' +
+      '2. Sign in with Google, Apple or email\n' +
+      '3. Return here and tap <b>I’ve signed in</b>\n\n' +
+      '<i>The link works once and expires shortly. It is personal to you — don’t forward it.</i>',
+    { ...HTML, reply_markup: walletPendingKeyboard(session.loginUrl) },
+  );
+}
+
+/**
+ * Completes an OKX-verified wallet connection.
+ *
+ * The address here is PROVEN — the user signed in on OKX's own page and OKX
+ * returned the address from its TEE. That is what makes wallet-as-identity
+ * safe: connecting a wallet loads the profile behind it.
+ *
+ * `email` is undefined for Google/Apple sign-ins, which carry no address; the
+ * display falls back to the method name while walletEmail stays genuinely
+ * empty rather than holding a provider name.
  *
  * Invariant: one wallet ↔ one profile, enforced at this single entry point.
  */
@@ -921,15 +951,17 @@ async function completeWalletConnection(
   ctx: Ctx,
   userId: string,
   address: string,
-  email: string,
+  email: string | undefined,
   isNew: boolean,
+  loginType?: string,
 ): Promise<void> {
   const owner = getProfileByWallet(address);
   const current = getProfile(userId);
+  const via = email || loginTypeLabel(loginType);
 
   const connected = (extra: string, kb: InlineKeyboard) =>
     ctx.reply(
-      `${title(isNew ? 'Wallet created' : 'Wallet connected', esc(email))}\n\n` +
+      `${title(isNew ? 'Wallet created' : 'Wallet connected', esc(via))}\n\n` +
         `<b>X Layer address</b>\n<code>${esc(address)}</code>\n\n${extra}`,
       { ...HTML, reply_markup: kb },
     );
@@ -981,7 +1013,7 @@ async function completeWalletConnection(
     saveProfile(current);
     audit('telegram', 'WALLET_LINKED', `user=${userId}`);
     return void (await connected(
-      'This wallet is now attached to your profile. Signing in with the same email anywhere restores it.',
+      'This wallet is now attached to your profile. Signing in to the same OKX account anywhere restores it.',
       backHome(),
     ));
   }
@@ -1006,15 +1038,15 @@ async function showWallet(ctx: Ctx & { from?: { id: number } }, userId: string):
   if (!status.loggedIn || !p?.wallet) {
     return void (await ctx.reply(walletPrompt(), {
       ...HTML,
-      reply_markup: new InlineKeyboard().text('Sign in with email', 'wallet:link').text('\u2039 Back', 'nav:home'),
+      reply_markup: new InlineKeyboard().text('Get sign-in link', 'wallet:link').text('\u2039 Back', 'nav:home'),
     }));
   }
 
   await ctx.reply(
     `${title('OKX Agentic Wallet', 'Connected')}\n\n` +
-      `<b>Signed in as</b> · ${esc(status.email ?? p.walletEmail ?? '\u2014')}\n` +
+      `<b>Signed in as</b> · ${esc(status.email ?? p.walletEmail ?? loginTypeLabel(status.loginType))}\n` +
       `<b>X Layer address</b>\n<code>${esc(p.wallet)}</code>\n\n` +
-      `<b>Network</b> · X Layer (chain 196)\n` +
+      `<b>Network</b> · X Layer (chain 196) — gas-free\n` +
       `<b>Account</b> · ${esc(status.accountName ?? 'Account 1')}\n` +
       `<b>Connected</b> · ${p.updatedAt?.slice(0, 10) ?? '\u2014'}\n\n` +
       '<i>Keys are held in OKX\u2019s secure enclave. Legwork can never access or export them.</i>',
@@ -1205,8 +1237,8 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
     }
     case 'currentLocation': p.currentLocation = text.trim(); return { ok: true };
     case 'wallet':
-      // Wallet is never set from free text — it is proven via OKX email login.
-      return { ok: false, error: 'Use <b>/wallet</b> to sign in with your OKX email — wallets cannot be typed in by hand.' };
+      // Wallet is never set from free text — it is proven via OKX sign-in.
+      return { ok: false, error: 'Use <b>/wallet</b> to sign in with OKX — wallets cannot be typed in by hand.' };
 
     // Professional
     case 'currentTitle': p.currentTitle = text.trim(); return { ok: true };

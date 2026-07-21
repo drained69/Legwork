@@ -1,20 +1,38 @@
 import { config } from './config.js';
 import { createBot } from './telegram/bot.js';
 import { startOkxServer } from './okx/server.js';
+import { pollOnce, startMarketplacePoller } from './okx/poller.js';
 import { startScheduler } from './scheduler.js';
+import { walletCliAvailable } from './wallet/okxWallet.js';
 
 /**
  * Legwork — an ASP for the OKX AI marketplace.
  *
  * Process layout:
- *  1. OKX A2A endpoint  — inbound task lifecycle + buyer chat (the marketplace side)
- *  2. Telegram bot      — the only user surface (onboarding, cards, approvals)
- *  3. Scheduler         — scans, digests, delivery
+ *  1. Marketplace poller — PULLS tasks addressed to this agent and claims them
+ *  2. OKX A2A endpoint   — inbound task lifecycle + buyer chat (the push side)
+ *  3. Telegram bot       — the only user surface (onboarding, cards, approvals)
+ *  4. Scheduler          — scans, digests, delivery
+ *
+ * (1) and (2) are two views of the same state. A push is an optimisation; the
+ * poll is what guarantees a task addressed to this agent gets claimed before
+ * the marketplace expires it, whether or not an envelope ever arrives.
  */
 async function main(): Promise<void> {
   console.log('Legwork starting…');
   console.log(`  sources: adzuna=${config.adzuna.enabled} usajobs=${config.usajobs.enabled} (mock fallback when both off)`);
   console.log(`  llm=${config.llm.enabled} gmail=${config.gmail.enabled}`);
+
+  // Surface wallet availability at boot: without the CLI, sign-in reports
+  // itself unavailable in-chat, and that should not be the first time anyone
+  // finds out. Probed in the background — never block startup on it.
+  void walletCliAvailable().then((ok) =>
+    console.log(
+      ok
+        ? '  wallet: onchainos CLI found — OKX sign-in enabled'
+        : '  wallet: onchainos CLI NOT found — OKX sign-in disabled (set ONCHAINOS_INSTALL_URL at build time). Everything else works.',
+    ),
+  );
 
   const bot = config.telegram.token ? createBot() : null;
 
@@ -26,7 +44,17 @@ async function main(): Promise<void> {
           .catch(() => {});
       }
     },
+    // A pushed system event means the task list moved. Reconcile immediately
+    // instead of waiting out the poll interval — whatever the event was, the
+    // task list is the authority on what to do about it.
+    onSystemEvent: (event, jobId) => {
+      console.log(`[okx] system event ${event}${jobId ? ` job=${jobId}` : ''} — reconciling task list`);
+      void pollOnce({ bot });
+    },
   });
+
+  // A marketplace-side failure must never take down the endpoint or the bot.
+  void startMarketplacePoller({ bot }).catch((err) => console.error('[okx-poller] failed to start:', err));
 
   startScheduler(bot);
 

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { PAYMENT_HEADERS, buildChallenge, findService, serviceCatalog, verifyAndSettle, type PricedService } from './x402.js';
+import { deliverTask } from './marketplace.js';
 import { criteriaToProfile, runAdhocHunt, type HuntCriteria } from '../skills/jobHunt.js';
 import { scorePosting } from '../skills/matchScorer.js';
 import { tailorApplication } from '../skills/applicationTailor.js';
@@ -82,15 +83,42 @@ function newTaskCode(): string {
 export interface OkxHandlers {
   /** Called when a buyer accepts delivery → notify the bound Telegram user. */
   onSettled?: (engagement: Engagement) => Promise<void> | void;
+  /**
+   * Called for every system event. Wired to the marketplace poller so a push
+   * and a pull converge on the same state instead of racing: whatever the
+   * event was, re-reading the task list settles what to do about it.
+   */
+  onSystemEvent?: (event: string, jobId?: string) => void;
 }
+
+/**
+ * OKX task lifecycle event names, grouped by what they mean for this agent.
+ *
+ * The legacy `task_*` / `delivery_accepted` / `dispute_opened` names are kept
+ * as aliases: they are what the demo and the test suite speak, and dropping
+ * them would break a working local flow to no benefit.
+ */
+const EVENTS = {
+  /** A task now names this agent — the claim clock is running. */
+  assigned: ['job_created', 'job_asp_selected', 'task_assigned', 'task_created'],
+  /** Escrow funded; the delivery window is open. */
+  accepted: ['job_accepted', 'task_accepted'],
+  /** Buyer accepted the deliverable; funds released. */
+  settled: ['job_completed', 'job_auto_completed', 'delivery_accepted'],
+  /** Buyer pushed back — evidence matters from here on. */
+  contested: ['job_disputed', 'job_rejected', 'dispute_opened'],
+  /** Terminal without payment. */
+  closed: ['job_expired', 'job_closed', 'job_refunded', 'job_auto_refunded'],
+} as const;
 
 export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Record<string, unknown> {
   const jobId = env.jobId ?? env.message?.jobId;
   const event = env.message?.source === 'system' ? env.message.event : undefined;
   audit('okx-endpoint', 'ENVELOPE', JSON.stringify({ jobId, event, msgType: env.msgType }).slice(0, 500));
+  if (event) handlers.onSystemEvent?.(event, jobId);
 
   // ── system lifecycle events ──────────────────────────────────────────────
-  if (event === 'task_assigned' || event === 'task_created') {
+  if (event && EVENTS.assigned.includes(event as (typeof EVENTS.assigned)[number])) {
     if (!jobId) return { ok: false, error: 'missing jobId' };
     let engagement = getEngagementByJob(jobId);
     if (!engagement) {
@@ -127,7 +155,20 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
     };
   }
 
-  if (event === 'delivery_accepted') {
+  // Escrow funded. The poller does the work and submits it — the reply here
+  // only has to acknowledge, and must not block the marketplace's request on
+  // a job hunt that takes tens of seconds.
+  if (event && EVENTS.accepted.includes(event as (typeof EVENTS.accepted)[number])) {
+    if (!jobId) return { ok: false, error: 'missing jobId' };
+    const engagement = getEngagementByJob(jobId);
+    if (engagement && engagement.status === 'awaiting_link') {
+      engagement.status = 'active';
+      saveEngagement(engagement);
+    }
+    return { ok: true, reply: 'Accepted — Legwork is running your hunt now and will submit the deliverable shortly.' };
+  }
+
+  if (event && EVENTS.settled.includes(event as (typeof EVENTS.settled)[number])) {
     if (!jobId) return { ok: false, error: 'missing jobId' };
     const engagement = getEngagementByJob(jobId);
     if (engagement) {
@@ -142,7 +183,7 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
     return { ok: true };
   }
 
-  if (event === 'dispute_opened') {
+  if (event && EVENTS.contested.includes(event as (typeof EVENTS.contested)[number])) {
     if (!jobId) return { ok: false, error: 'missing jobId' };
     const engagement = getEngagementByJob(jobId);
     if (!engagement) return { ok: false, error: 'unknown job' };
@@ -150,6 +191,17 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
     saveEngagement(engagement);
     // Evidence bundle: approvals log + frozen drafts + submission receipts.
     return { ok: true, evidence: buildEvidenceBundle(engagement) };
+  }
+
+  if (event && EVENTS.closed.includes(event as (typeof EVENTS.closed)[number])) {
+    if (!jobId) return { ok: false, error: 'missing jobId' };
+    const engagement = getEngagementByJob(jobId);
+    if (engagement) {
+      engagement.status = 'closed';
+      saveEngagement(engagement);
+      audit('okx-endpoint', 'CLOSED', `job=${jobId} event=${event}`);
+    }
+    return { ok: true };
   }
 
   // ── buyer chat through the marketplace ───────────────────────────────────
@@ -170,7 +222,7 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
   return { ok: true, note: 'event ignored' };
 }
 
-/** Submit the deliverable back through the OKX task lifecycle. */
+/** Build the deliverable payload for an engagement (pure — no I/O). */
 export function deliverEngagement(engagement: Engagement): string {
   engagement.status = 'delivering';
   saveEngagement(engagement);
@@ -181,9 +233,26 @@ export function deliverEngagement(engagement: Engagement): string {
       ? engagement.shortlist
       : buildDigest(engagement) + '\n\n' + buildEvidenceBundle(engagement);
   audit('okx-endpoint', 'DELIVERED', `job=${engagement.okxJobId}`);
-  // In production this posts to the OKX task `deliver` API; the payload is
-  // returned so the caller (or the marketplace poller) can transmit it.
   return deliverable;
+}
+
+/**
+ * Build the deliverable AND submit it on-chain.
+ *
+ * `deliverEngagement` alone only ever produced a string — nothing transmitted
+ * it, so an engagement that "completed" locally still hit the marketplace's
+ * submit timeout and auto-refunded the buyer. Delivery is only legal while
+ * the task is `accepted`; outside that window the CLI rejects it, which is
+ * reported rather than swallowed.
+ */
+export async function deliverEngagementOnChain(engagement: Engagement): Promise<{ ok: boolean; deliverable: string; error?: string }> {
+  const deliverable = deliverEngagement(engagement);
+  const res = await deliverTask(engagement.okxJobId, deliverable);
+  if (res.ok) {
+    engagement.deliveredAt = now();
+    saveEngagement(engagement);
+  }
+  return { ok: res.ok, deliverable, error: res.error };
 }
 
 // ── HTTP plumbing ──────────────────────────────────────────────────────────

@@ -1,0 +1,317 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { config } from '../config.js';
+import { audit } from '../db.js';
+
+const run = promisify(execFile);
+
+/**
+ * OKX Task Marketplace client — the ASP (seller) side of the protocol.
+ *
+ * Legwork used to be purely reactive: it did nothing until OKX pushed an
+ * envelope to /okx/a2a. That is not how the marketplace works. A task that
+ * names this agent as provider sits in `created` until the ASP retrieves it
+ * and claims it; if nobody claims it, the backend expires it (status 8) and
+ * the buyer sees a provider that timed out.
+ *
+ * So the agent has to pull. Every command here is `onchainos agent …` run
+ * against the SERVICE's own wallet session (not a per-user one — see
+ * wallet/okxWallet.ts for that), identified by OKX_ASP_AGENT_ID.
+ *
+ * Command semantics come from the OKX task state machine:
+ *   status 0 created → 1 accepted → 2 submitted → 6 completed
+ *   (7 close / 8 expired / 9 refunded are terminal failures)
+ */
+
+const CLI = process.env.ONCHAINOS_BIN || 'onchainos';
+const TIMEOUT_MS = Number(process.env.OKX_CLI_TIMEOUT_MS ?? 90_000);
+
+export interface CliResult<T> {
+  ok: boolean;
+  data?: T;
+  /** Raw stdout — several CLI commands print human text rather than JSON. */
+  raw: string;
+  error?: string;
+}
+
+/** Last JSON object printed on stdout; the CLI logs plain text above it. */
+function lastJson(stdout: string): string | undefined {
+  return stdout.trim().split('\n').filter((l) => l.trim().startsWith('{')).pop();
+}
+
+async function cli<T>(args: string[], timeoutMs = TIMEOUT_MS): Promise<CliResult<T>> {
+  const env = { ...process.env };
+  // The service's own agent session. Separate from per-user wallet homes so a
+  // Telegram user's sign-in can never be used to act as the ASP identity.
+  if (config.okx.home) env.ONCHAINOS_HOME = config.okx.home;
+
+  try {
+    const { stdout } = await run(CLI, ['agent', ...args], { env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
+    const line = lastJson(stdout);
+    if (!line) return { ok: true, raw: stdout }; // text-mode command (e.g. recommend-task)
+    const parsed = JSON.parse(line) as { ok?: boolean; data?: T; error?: string; msg?: string; message?: string };
+    return {
+      ok: parsed.ok !== false,
+      data: parsed.data,
+      raw: stdout,
+      error: parsed.ok === false ? parsed.error ?? parsed.msg ?? parsed.message ?? 'command failed' : undefined,
+    };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; killed?: boolean; message?: string };
+    const line = lastJson(e.stdout ?? '');
+    if (line) {
+      try {
+        const parsed = JSON.parse(line) as { error?: string; msg?: string; message?: string };
+        return { ok: false, raw: e.stdout ?? '', error: parsed.error ?? parsed.msg ?? parsed.message ?? 'command failed' };
+      } catch {
+        /* fall through */
+      }
+    }
+    if (e.killed) return { ok: false, raw: e.stdout ?? '', error: `TIMEOUT after ${timeoutMs}ms` };
+    return { ok: false, raw: e.stdout ?? '', error: (e.stderr || e.message || String(err)).split('\n')[0].slice(0, 300) };
+  }
+}
+
+// ── task shapes ────────────────────────────────────────────────────────────
+
+/** OKX task status ints — see the task state machine. */
+export const TaskStatus = {
+  CREATED: 0,
+  ACCEPTED: 1,
+  SUBMITTED: 2,
+  REJECTED: 3,
+  DISPUTED: 4,
+  ADMIN_STOPPED: 5,
+  COMPLETED: 6,
+  CLOSED: 7,
+  EXPIRED: 8,
+  REFUNDED: 9,
+} as const;
+
+export const TERMINAL_STATUSES: number[] = [
+  TaskStatus.ADMIN_STOPPED,
+  TaskStatus.COMPLETED,
+  TaskStatus.CLOSED,
+  TaskStatus.EXPIRED,
+  TaskStatus.REFUNDED,
+];
+
+export interface MarketplaceTask {
+  jobId: string;
+  title: string;
+  statusCode: number;
+  status?: string;
+  tokenAmount?: string;
+  tokenSymbol?: string;
+  /** The buyer's User Agent id. */
+  counterpartyAgentId?: string;
+  myAgentId?: string;
+  description?: string;
+  /** true when this task already names us as provider (private/designated). */
+  designated: boolean;
+}
+
+// ── read paths ─────────────────────────────────────────────────────────────
+
+/**
+ * Tasks where THIS account is the provider — the ones that expire if we do
+ * nothing. Returns JSON, so this is the poller's primary source of truth.
+ */
+export async function activeTasks(): Promise<{ ok: boolean; tasks: MarketplaceTask[]; error?: string }> {
+  const res = await cli<{ tasks?: Array<Record<string, unknown>> }>(['active-tasks', '--role', 'asp', '--include-terminal']);
+  if (!res.ok) return { ok: false, tasks: [], error: res.error };
+  const rows = res.data?.tasks ?? [];
+  const mine = rows
+    .filter((t) => String(t.myRole ?? 'asp') === 'asp')
+    .filter((t) => !config.okx.aspAgentId || String(t.myAgentId ?? '') === config.okx.aspAgentId)
+    .map((t) => ({
+      jobId: String(t.jobId ?? ''),
+      title: String(t.title ?? ''),
+      statusCode: Number(t.statusCode ?? -1),
+      status: t.status ? String(t.status) : undefined,
+      tokenAmount: t.tokenAmount ? String(t.tokenAmount) : undefined,
+      tokenSymbol: t.tokenSymbol ? String(t.tokenSymbol) : undefined,
+      counterpartyAgentId: t.counterpartyAgentId ? String(t.counterpartyAgentId) : undefined,
+      myAgentId: t.myAgentId ? String(t.myAgentId) : undefined,
+      // active-tasks only ever returns tasks already routed to this agent.
+      designated: true,
+    }))
+    .filter((t) => t.jobId);
+  return { ok: true, tasks: mine };
+}
+
+/**
+ * Public tasks the marketplace recommends for this agent's skill profile.
+ * Prints human-readable text (not JSON), hence the line parser.
+ *
+ * Only useful once the agent's listing is approved — while it is under review
+ * the backend answers `AgentApi.agentServices failed`, which is expected and
+ * must not stop the poll cycle.
+ */
+export async function recommendedTasks(): Promise<{ ok: boolean; tasks: MarketplaceTask[]; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, tasks: [], error: 'OKX_ASP_AGENT_ID not set' };
+  const res = await cli<unknown>(['recommend-task', '--agent-id', config.okx.aspAgentId]);
+  if (!res.ok) return { ok: false, tasks: [], error: res.error };
+  return { ok: true, tasks: parseRecommendedTasks(res.raw) };
+}
+
+/**
+ * Parse `recommend-task`'s text block into tasks.
+ *
+ *   1. jobId: 0xabc…
+ *      Title:      Find me a job
+ *      Description: …
+ *      Budget:     1 (token: 0x…)
+ *
+ * Exported for tests: the CLI's text format is the fragile part of this
+ * integration, so it is pinned by a fixture rather than trusted.
+ */
+export function parseRecommendedTasks(raw: string): MarketplaceTask[] {
+  const tasks: MarketplaceTask[] = [];
+  let current: MarketplaceTask | undefined;
+  for (const line of raw.split('\n')) {
+    const jobId = /jobId:\s*(0x[a-fA-F0-9]+|[\w-]+)/.exec(line);
+    if (jobId) {
+      if (current) tasks.push(current);
+      current = { jobId: jobId[1], title: '', statusCode: TaskStatus.CREATED, designated: false };
+      continue;
+    }
+    if (!current) continue;
+    const title = /^\s*Title:\s*(.+)$/.exec(line);
+    if (title) current.title = title[1].trim();
+    const desc = /^\s*Description:\s*(.+)$/.exec(line);
+    if (desc) current.description = desc[1].trim();
+    const budget = /^\s*Budget:\s*([\d.]+)/.exec(line);
+    if (budget) current.tokenAmount = budget[1];
+  }
+  if (current) tasks.push(current);
+  return tasks.filter((t) => t.jobId);
+}
+
+/** Full detail for one task — used to read the buyer's brief before working. */
+export async function taskDetail(jobId: string): Promise<{ ok: boolean; raw: string; error?: string }> {
+  const args = ['status', jobId];
+  if (config.okx.aspAgentId) args.push('--agent-id', config.okx.aspAgentId);
+  const res = await cli<unknown>(args);
+  return { ok: res.ok, raw: res.raw, error: res.error };
+}
+
+// ── write paths ────────────────────────────────────────────────────────────
+
+/**
+ * Claim step 1 — open the negotiation channel with the buyer's User Agent.
+ *
+ * `contact-user` creates the XMTP group and sends the canonical opener in one
+ * call. This is the non-financial half of claiming: it tells the buyer a
+ * provider picked the task up, which is precisely the signal that was missing.
+ */
+export async function contactUser(jobId: string): Promise<{ ok: boolean; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  const res = await cli<unknown>(['contact-user', jobId, '--agent-id', config.okx.aspAgentId]);
+  audit('okx-marketplace', res.ok ? 'CONTACTED' : 'CONTACT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return { ok: res.ok, error: res.error };
+}
+
+/**
+ * Claim step 2 — apply on-chain at the task's own budget.
+ *
+ * Only ever called for tasks that ALREADY designate this agent as provider:
+ * the buyer picked us, so applying is the response they are waiting for, and
+ * without it the task expires. Never called on cold-start discovery of public
+ * tasks — there the User Agent must designate us first.
+ */
+export async function applyForTask(
+  jobId: string,
+  tokenAmount: string,
+  tokenSymbol: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  if (!(Number(tokenAmount) > 0)) return { ok: false, error: `refusing to apply for free (amount=${tokenAmount})` };
+  const res = await cli<unknown>([
+    'apply', jobId,
+    '--token-amount', tokenAmount,
+    '--token-symbol', tokenSymbol,
+    '--agent-id', config.okx.aspAgentId,
+  ]);
+  audit('okx-marketplace', res.ok ? 'APPLIED' : 'APPLY_FAILED', `job=${jobId} ${tokenAmount} ${tokenSymbol} ${res.error ?? ''}`.trim());
+  return { ok: res.ok, error: res.error };
+}
+
+/** Submit the deliverable on-chain. Only valid while the task is `accepted`. */
+export async function deliverTask(jobId: string, deliverable: string): Promise<{ ok: boolean; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  const res = await cli<unknown>([
+    'deliver', jobId,
+    '--message', 'Legwork shortlist delivered — ranked matches with full score breakdowns.',
+    '--deliverable-text', deliverable,
+    '--agent-id', config.okx.aspAgentId,
+  ]);
+  audit('okx-marketplace', res.ok ? 'DELIVERED_ONCHAIN' : 'DELIVER_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return { ok: res.ok, error: res.error };
+}
+
+/** Decline a designated task we cannot serve (off-chain, no signing). */
+export async function rejectTask(jobId: string): Promise<{ ok: boolean; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  const res = await cli<unknown>(['asp-reject', jobId, '--agent-id', config.okx.aspAgentId]);
+  audit('okx-marketplace', res.ok ? 'DECLINED' : 'DECLINE_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return { ok: res.ok, error: res.error };
+}
+
+/**
+ * Report the agent as online.
+ *
+ * `recommend-task` / `find-jobs` only consider agents whose heartbeat is
+ * fresh, so a long-running ASP that never beats drops out of task matching
+ * even though its endpoint is up.
+ */
+export async function heartbeat(): Promise<boolean> {
+  const res = await cli<unknown>(['heartbeat', '--chain-index', String(config.okx.chainIndex)], 30_000);
+  return res.ok;
+}
+
+// ── readiness ──────────────────────────────────────────────────────────────
+
+export interface GateCheck {
+  ready: boolean;
+  wallet: boolean;
+  identity: boolean;
+  communication: boolean;
+  agentId?: string;
+  error?: string;
+}
+
+/**
+ * Read-only diagnostic: is the wallet logged in, is there an ASP identity, is
+ * the A2A channel up? Run once at startup so a misconfigured deployment says
+ * so in the logs instead of silently never claiming anything.
+ */
+export async function gateCheck(): Promise<GateCheck> {
+  const res = await cli<{
+    ready?: boolean;
+    wallet?: { ok?: boolean };
+    identity?: { ok?: boolean; agentId?: string };
+    communication?: { ok?: boolean };
+  }>(['gate-check', '--role', 'asp'], 120_000);
+  if (!res.ok || !res.data) {
+    return { ready: false, wallet: false, identity: false, communication: false, error: res.error ?? 'gate-check returned no data' };
+  }
+  const d = res.data;
+  return {
+    ready: Boolean(d.ready),
+    wallet: Boolean(d.wallet?.ok),
+    identity: Boolean(d.identity?.ok),
+    communication: Boolean(d.communication?.ok),
+    agentId: d.identity?.agentId,
+  };
+}
+
+/** Is the onchainos CLI present at all? */
+export async function cliAvailable(): Promise<boolean> {
+  try {
+    await run(CLI, ['--version'], { timeout: 15_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}

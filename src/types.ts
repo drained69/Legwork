@@ -137,7 +137,8 @@ export type EngagementStatus =
   | 'paused'
   | 'delivering'
   | 'settled'
-  | 'disputed';
+  | 'disputed'
+  | 'closed'; // terminal on the marketplace: expired / closed / refunded
 
 export interface Engagement {
   id: string;
@@ -150,6 +151,16 @@ export interface Engagement {
   startedAt: string;
   endsAt?: string;
   shortlist?: string; // last hunt shortlist (full breakdowns) — the OKX deliverable for hunt listings
+
+  // ── marketplace mirror (written by the poller) ───────────────────────────
+  title?: string; // buyer's task title
+  brief?: string; // buyer's task description — the hunt criteria source
+  budget?: string; // task budget, e.g. "0.25"
+  currency?: string; // USDT | USDG
+  okxStatusCode?: number; // last seen on-chain status (see TaskStatus)
+  claimedAt?: string; // contact-user succeeded
+  appliedAt?: string; // apply went on-chain
+  deliveredAt?: string; // deliverable submitted on-chain
 }
 
 export interface OkxEnvelope {
@@ -159,7 +170,9 @@ export interface OkxEnvelope {
   sender?: { role?: string; agentId?: string };
   message?: {
     source?: string; // "system"
-    event?: string; // task_assigned | task_accepted | delivery_accepted | dispute_opened ...
+    // OKX task events: job_created | job_asp_selected | job_accepted |
+    // job_submitted | job_completed | job_rejected | job_expired | …
+    event?: string;
     jobId?: string;
     [k: string]: unknown;
   };

@@ -18,13 +18,54 @@ cp .env.example .env   # fill in what you have — everything degrades gracefull
 npm run dev            # tsx, or: npm run build && npm start
 ```
 
-The process runs three things:
+The process runs four things:
 
 | Component | Enabled by | Without it |
 |---|---|---|
+| **OKX marketplace poller** (claims tasks every 30s) | `OKX_ASP_AGENT_ID` + a signed-in service wallet | **Tasks addressed to this agent expire unclaimed — buyers see a provider that timed out** |
 | Telegram bot (long polling) | `TELEGRAM_BOT_TOKEN` | Disabled; endpoint + scheduler still run |
 | OKX A2A endpoint (`:8402`, `POST /okx/a2a`) | always on | — |
 | Scheduler (scan 6h / digest Mon / delivery hourly) | always on | — |
+
+## The marketplace poller
+
+OKX does not guarantee a push for every task that names this agent, and a task
+sitting in `created` is expired by the backend. The provider is expected to
+**pull**. Each cycle the poller reads every task routed to `OKX_ASP_AGENT_ID`
+and moves it forward:
+
+| Task status | Poller action |
+|---|---|
+| `created` | `contact-user` (opens the buyer chat), then `apply` on-chain when the task designates us and the budget is within `OKX_MAX_AUTO_APPLY_BUDGET` |
+| `accepted` | escrow funded → extract criteria from the buyer's brief, run the hunt, `deliver` the ranked shortlist on-chain |
+| `submitted` | nothing — awaiting buyer review |
+| `completed` | mark settled, notify the bound Telegram user |
+| `expired` / `closed` / `refunded` | close the engagement locally |
+
+It also heartbeats every 5 minutes (`recommend-task` only matches agents that
+look online) and, once the listing is approved, cold-starts on relevant public
+tasks — contact only, never `apply`, since on a public task the buyer has not
+chosen us yet.
+
+Verify it against a live account without touching the chain:
+
+```bash
+npm run okx:poll            # readiness + task list + what a live tick would do
+npm run okx:poll -- --live  # actually claim
+```
+
+A healthy dry run looks like:
+
+```
+gate-check: ready=true wallet=true identity=true comms=true signed-in-agent=6658
+8 task(s) routed to this agent:
+  [created] 0x4931…f04d — 2 USDT — "Help find tech job matches"
+  ⚠ 8 task(s) still in "created" — these expire if the agent never claims them.
+```
+
+If `gate-check` reports `ready=false`, the service wallet is not signed in:
+run `onchainos wallet login` with `ONCHAINOS_HOME` pointed at
+`OKX_ONCHAINOS_HOME`, then re-run the poll.
 
 Feature flags by key:
 

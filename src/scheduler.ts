@@ -4,7 +4,7 @@ import { getProfile, listEngagements, saveEngagement } from './db.js';
 import { runScanCycle } from './pipeline.js';
 import { sendMatchCard } from './telegram/bot.js';
 import { buildDigest } from './digest.js';
-import { deliverEngagement } from './okx/server.js';
+import { deliverEngagementOnChain } from './okx/server.js';
 import { chunkMessage, formatShortlist, runHunt } from './skills/jobHunt.js';
 
 /**
@@ -54,13 +54,20 @@ export function startScheduler(bot: Bot | null): void {
   cron.schedule('0 * * * *', async () => {
     for (const e of listEngagements('active')) {
       if (e.endsAt && new Date(e.endsAt) < new Date()) {
-        const deliverable = deliverEngagement(e);
+        // Submit on-chain, not just locally: an engagement that "completes"
+        // without a `deliver` transaction still hits the marketplace's submit
+        // timeout and auto-refunds the buyer.
+        const { ok, deliverable, error } = await deliverEngagementOnChain(e);
         saveEngagement(e);
+        if (!ok) console.error(`[scheduler] on-chain delivery failed for ${e.okxJobId}: ${error}`);
         if (bot && e.userId) {
           await bot.api
             .sendMessage(
               Number(e.userId),
-              `🏁 Engagement complete — deliverable submitted to OKX for acceptance:\n\n${deliverable.slice(0, 3500)}`,
+              (ok
+                ? '🏁 Engagement complete — deliverable submitted to OKX for acceptance:\n\n'
+                : `🏁 Engagement complete. On-chain submission failed (${error}) and will be retried — your results:\n\n`) +
+                deliverable.slice(0, 3500),
             )
             .catch(() => {});
         }

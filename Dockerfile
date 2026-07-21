@@ -10,22 +10,30 @@ FROM node:20-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
-# ── Optional: OKX Onchain OS CLI (backs email-OTP wallet sign-in) ──────────
-# There is no public package for the Linux build, so the installer URL must be
-# supplied explicitly at build time:
-#   docker build --build-arg ONCHAINOS_INSTALL_URL=https://…/install.sh .
-#   railway variables --set ONCHAINOS_INSTALL_URL=…   (then redeploy)
-# Without it, wallet sign-in reports itself unavailable in-chat and every other
-# feature — profile, hunts, scoring, drafts, approvals — works normally.
-ARG ONCHAINOS_INSTALL_URL=""
-RUN if [ -n "$ONCHAINOS_INSTALL_URL" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-      curl -fsSL "$ONCHAINOS_INSTALL_URL" -o /tmp/install.sh && sh /tmp/install.sh && rm -f /tmp/install.sh && \
-      apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* ; \
-    else \
-      echo "onchainos CLI not installed — wallet sign-in will report as unavailable" ; \
-    fi
-ENV PATH="/root/.local/bin:/root/.onchainos/bin:${PATH}"
+# ── OKX Onchain OS CLI (backs wallet sign-in) ─────────────────────────────
+# Prebuilt static binaries are published on the official releases page
+# (github.com/okx/onchainos-skills) with a checksums.txt. Download the one for
+# this image's architecture and verify it before installing — the build FAILS
+# on a checksum mismatch rather than shipping a tampered or truncated binary.
+# Pin the version; bump deliberately after testing, since the bot's login flow
+# tracks the CLI's `wallet login --phase init/poll` contract.
+ARG ONCHAINOS_VERSION=v4.3.0
+RUN set -eu; \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="onchainos-x86_64-unknown-linux-gnu" ;; \
+      arm64) asset="onchainos-aarch64-unknown-linux-gnu" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/okx/onchainos-skills/releases/download/${ONCHAINOS_VERSION}"; \
+    curl -fsSL "$base/$asset" -o /usr/local/bin/onchainos; \
+    curl -fsSL "$base/checksums.txt" -o /tmp/checksums.txt; \
+    ( cd /usr/local/bin && grep " ${asset}\$" /tmp/checksums.txt | sed "s|${asset}|onchainos|" | sha256sum -c - ); \
+    rm -f /tmp/checksums.txt; \
+    chmod +x /usr/local/bin/onchainos; \
+    apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
+    onchainos --version
 
 COPY package*.json ./
 RUN npm ci --omit=dev
