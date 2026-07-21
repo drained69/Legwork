@@ -30,7 +30,7 @@ async function main(): Promise<void> {
     console.log(
       ok
         ? '  wallet: onchainos CLI found — OKX sign-in enabled'
-        : '  wallet: onchainos CLI NOT found — OKX sign-in disabled (set ONCHAINOS_INSTALL_URL at build time). Everything else works.',
+        : '  wallet: onchainos CLI NOT found — OKX sign-in disabled (the Docker build installs it; check that step succeeded). Everything else works.',
     ),
   );
 
