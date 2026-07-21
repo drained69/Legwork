@@ -1,4 +1,4 @@
-FROM node:20-slim AS build
+FROM node:22-slim AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -6,7 +6,10 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:20-slim
+# Node 22, not 20: the OKX A2A runtime below pulls @xmtp/node-bindings, whose
+# native module requires >=22. On 20 the install emits EBADENGINE and the
+# runtime fails to load. Legwork's own code runs fine on either.
+FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
@@ -35,6 +38,19 @@ RUN set -eu; \
     apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
     onchainos --version
 
+# ── OKX A2A communication runtime ─────────────────────────────────────────
+# The marketplace poller's gate-check requires `communication.ok`, which is
+# owned by this CLI. Without it gate-check fails and the poller never starts,
+# so tasks addressed to this ASP expire unclaimed. Pinned deliberately: the
+# runtime is bootstrapped by `okx-a2a doctor --fix` at boot (see entrypoint).
+#
+# The XMTP native bindings are a large download that has flaked with ECONNRESET
+# on a default single attempt, so retry rather than fail a whole deploy on it.
+ARG A2A_NODE_VERSION=0.1.9
+RUN npm i -g --fetch-retries=5 --fetch-retry-maxtimeout=120000 \
+      "@okxweb3/a2a-node@${A2A_NODE_VERSION}" \
+    && okx-a2a --version
+
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
@@ -47,4 +63,7 @@ ENV DATABASE_PATH=/data/legwork.db
 ENV WALLET_HOME_ROOT=/data/wallets
 RUN mkdir -p /data/wallets
 EXPOSE 8402
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]
