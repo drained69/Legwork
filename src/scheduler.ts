@@ -52,25 +52,32 @@ export function startScheduler(bot: Bot | null): void {
   });
 
   cron.schedule('0 * * * *', async () => {
-    for (const e of listEngagements('active')) {
-      if (e.endsAt && new Date(e.endsAt) < new Date()) {
-        // Submit on-chain, not just locally: an engagement that "completes"
-        // without a `deliver` transaction still hits the marketplace's submit
-        // timeout and auto-refunds the buyer.
-        const { ok, deliverable, error } = await deliverEngagementOnChain(e);
-        saveEngagement(e);
-        if (!ok) console.error(`[scheduler] on-chain delivery failed for ${e.okxJobId}: ${error}`);
-        if (bot && e.userId) {
-          await bot.api
-            .sendMessage(
-              Number(e.userId),
-              (ok
-                ? '🏁 Engagement complete — deliverable submitted to OKX for acceptance:\n\n'
-                : `🏁 Engagement complete. On-chain submission failed (${error}) and will be retried — your results:\n\n`) +
-                deliverable.slice(0, 3500),
-            )
-            .catch(() => {});
-        }
+    // `delivering` is included deliberately. A failed delivery leaves the
+    // engagement in that status, and sweeping only `active` meant the retry
+    // this code promised the user could never actually happen — the engagement
+    // was stranded mid-delivery for good. Anything already confirmed reaching
+    // the buyer is skipped, so a success is never re-sent.
+    const due = [...listEngagements('active'), ...listEngagements('delivering')].filter(
+      (e) => e.endsAt && new Date(e.endsAt) < new Date() && !e.deliverableSentAt,
+    );
+
+    for (const e of due) {
+      // Deliver to the buyer, not just locally: an engagement that "completes"
+      // without a `deliver` transaction still hits the marketplace's submit
+      // timeout and auto-refunds the buyer.
+      const { ok, deliverable, error } = await deliverEngagementOnChain(e);
+      saveEngagement(e);
+      if (!ok) console.error(`[scheduler] delivery failed for ${e.okxJobId}: ${error} — retrying next hour`);
+      if (bot && e.userId) {
+        await bot.api
+          .sendMessage(
+            Number(e.userId),
+            (ok
+              ? '🏁 Engagement complete — deliverable submitted to OKX for acceptance:\n\n'
+              : `🏁 Engagement complete. Delivery to the buyer failed (${error}) and will be retried hourly — your results:\n\n`) +
+              deliverable.slice(0, 3500),
+          )
+          .catch(() => {});
       }
     }
   });

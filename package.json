@@ -11,7 +11,7 @@
     "demo": "tsx src/demo.ts",
     "okx:poll": "tsx src/okx/pollCli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/legwork.test.ts tests/x402.test.ts"
+    "test": "node --import tsx --test tests/legwork.test.ts tests/x402.test.ts tests/delivery.test.ts"
   },
   "engines": {
     "node": ">=20"

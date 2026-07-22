@@ -160,7 +160,15 @@ export interface Engagement {
   okxStatusCode?: number; // last seen on-chain status (see TaskStatus)
   claimedAt?: string; // contact-user succeeded
   appliedAt?: string; // apply went on-chain
-  deliveredAt?: string; // deliverable submitted on-chain
+  deliveredAt?: string; // submit tx confirmed on-chain — says NOTHING about the payload
+  /**
+   * The buyer can actually retrieve the deliverable: it is persisted locally
+   * and the `[intent:deliver]` message reached their agent. Tracked separately
+   * from `deliveredAt` because the two legs fail independently — an on-chain
+   * submit with no payload is the "empty submission" the buyer rejects.
+   */
+  deliverableSentAt?: string;
+  deliverableFile?: string; // local .md artifact submitted as the deliverable
 }
 
 export interface OkxEnvelope {

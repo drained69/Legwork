@@ -24,6 +24,8 @@ const run = promisify(execFile);
  */
 
 const CLI = process.env.ONCHAINOS_BIN || 'onchainos';
+/** The XMTP side-car. Separate binary — it carries the deliverable payload. */
+const A2A_CLI = process.env.OKX_A2A_BIN || 'okx-a2a';
 const TIMEOUT_MS = Number(process.env.OKX_CLI_TIMEOUT_MS ?? 90_000);
 
 export interface CliResult<T> {
@@ -67,6 +69,23 @@ async function cli<T>(args: string[], timeoutMs = TIMEOUT_MS): Promise<CliResult
         /* fall through */
       }
     }
+    if (e.killed) return { ok: false, raw: e.stdout ?? '', error: `TIMEOUT after ${timeoutMs}ms` };
+    return { ok: false, raw: e.stdout ?? '', error: (e.stderr || e.message || String(err)).split('\n')[0].slice(0, 300) };
+  }
+}
+
+/** Run the XMTP side-car. Same env isolation as `cli`, different binary. */
+async function a2a(args: string[], timeoutMs = TIMEOUT_MS): Promise<{ ok: boolean; raw: string; error?: string }> {
+  const env = { ...process.env };
+  if (config.okx.home) env.ONCHAINOS_HOME = config.okx.home;
+  try {
+    const { stdout } = await run(A2A_CLI, args, { env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
+    const line = lastJson(stdout);
+    if (!line) return { ok: true, raw: stdout };
+    const parsed = JSON.parse(line) as { ok?: boolean; error?: string; message?: string };
+    return { ok: parsed.ok !== false, raw: stdout, error: parsed.ok === false ? parsed.error ?? parsed.message : undefined };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; killed?: boolean; message?: string };
     if (e.killed) return { ok: false, raw: e.stdout ?? '', error: `TIMEOUT after ${timeoutMs}ms` };
     return { ok: false, raw: e.stdout ?? '', error: (e.stderr || e.message || String(err)).split('\n')[0].slice(0, 300) };
   }
@@ -237,17 +256,101 @@ export async function applyForTask(
   return { ok: res.ok, error: res.error };
 }
 
-/** Submit the deliverable on-chain. Only valid while the task is `accepted`. */
-export async function deliverTask(jobId: string, deliverable: string): Promise<{ ok: boolean; error?: string }> {
-  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+export interface DeliverOutcome {
+  /** The submit tx is on-chain. The task is now `submitted` and cannot be re-delivered. */
+  submitted: boolean;
+  /** The payload is retrievable by the buyer — verified, not assumed. */
+  contentVerified: boolean;
+  error?: string;
+}
+
+/**
+ * Submit the deliverable. Only valid while the task is `accepted`.
+ *
+ * `agent deliver` does FOUR things behind one exit code: upload the file,
+ * xmtp-send `[intent:deliver]` to the buyer, submit on-chain, and save locally.
+ * The on-chain leg can succeed while the XMTP leg silently fails (daemon down),
+ * which the buyer experiences as a task that reached `submitted` with nothing
+ * in it — an empty submission they then reject, with no escrow ever funded.
+ *
+ * So a zero exit code is NOT proof of delivery. Every call verifies that the
+ * payload actually landed, and reports the two legs separately so the caller
+ * can repair the payload leg without re-submitting on-chain.
+ */
+export async function deliverTask(
+  jobId: string,
+  opts: { file: string; message: string },
+): Promise<DeliverOutcome> {
+  if (!config.okx.aspAgentId) return { submitted: false, contentVerified: false, error: 'OKX_ASP_AGENT_ID not set' };
+
   const res = await cli<unknown>([
     'deliver', jobId,
-    '--message', 'Legwork shortlist delivered — ranked matches with full score breakdowns.',
-    '--deliverable-text', deliverable,
+    // A real file, not `--deliverable-text`: the CLI converts any text over
+    // 200 chars into a temp .md anyway, and an explicit path gives us a stable
+    // filename plus a local artifact to fall back on and to keep as evidence.
+    '--file', opts.file,
+    '--message', opts.message,
     '--agent-id', config.okx.aspAgentId,
   ]);
-  audit('okx-marketplace', res.ok ? 'DELIVERED_ONCHAIN' : 'DELIVER_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
-  return { ok: res.ok, error: res.error };
+  if (!res.ok) {
+    audit('okx-marketplace', 'DELIVER_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+    return { submitted: false, contentVerified: false, error: res.error };
+  }
+
+  const contentVerified = await deliverableRetrievable(jobId);
+  audit(
+    'okx-marketplace',
+    contentVerified ? 'DELIVERED_ONCHAIN' : 'DELIVERED_EMPTY',
+    `job=${jobId} contentVerified=${contentVerified}`,
+  );
+  return { submitted: true, contentVerified };
+}
+
+/**
+ * Is there a deliverable the buyer can actually retrieve for this job?
+ *
+ * `deliver` persists the payload as its last step, so an empty list after a
+ * successful submit means the payload legs (upload / xmtp) did not complete —
+ * the precise state that looks delivered on-chain and empty to the buyer.
+ */
+export async function deliverableRetrievable(jobId: string): Promise<boolean> {
+  const res = await cli<{ results?: unknown[] }>(['task-deliverable-list', '--job-id', jobId, '--role', 'asp']);
+  return res.ok && (res.data?.results?.length ?? 0) > 0;
+}
+
+/**
+ * The `[intent:deliver]` payload the buyer's agent parses, in its inline-text
+ * form. Emitted by `deliver` itself; rebuilt here for the repair path so a
+ * re-send is a protocol message rather than an unstructured chat line the
+ * buyer's agent would never route to its review flow.
+ */
+export function textDeliverIntent(jobId: string, content: string): string {
+  return ['[intent:deliver]', `jobId: ${jobId}`, 'deliverableType: text', '- - -', content, '- - -'].join('\n');
+}
+
+/**
+ * Re-send the deliverable payload over XMTP.
+ *
+ * The repair path only. Normal delivery must go through `deliverTask` — the
+ * playbook is explicit that `deliver` owns the peer notification and a manual
+ * duplicate would double-notify. This exists for the one case the playbook
+ * does not cover: the submit landed but the payload leg did not, so the task
+ * is stuck in `submitted` where `deliver` is no longer legal.
+ */
+export async function resendDeliverable(
+  jobId: string,
+  toAgentId: string,
+  content: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await a2a([
+    'xmtp-send',
+    '--job-id', jobId,
+    '--to-agent-id', toAgentId,
+    '--message', textDeliverIntent(jobId, content),
+    '--json',
+  ]);
+  audit('okx-marketplace', res.ok ? 'DELIVERABLE_RESENT' : 'DELIVERABLE_RESEND_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return res;
 }
 
 /** Decline a designated task we cannot serve (off-chain, no signing). */
@@ -304,6 +407,28 @@ export async function gateCheck(): Promise<GateCheck> {
     communication: Boolean(d.communication?.ok),
     agentId: d.identity?.agentId,
   };
+}
+
+/**
+ * Is the XMTP daemon up right now?
+ *
+ * Cheap enough to run immediately before every delivery, which `gateCheck` is
+ * not (it shells out to `okx-a2a doctor` and takes tens of seconds). Delivery
+ * is the one action that is unrecoverable if the payload channel is down —
+ * once the submit tx lands the task leaves `accepted` and `deliver` is refused
+ * forever — so it gets its own pre-flight rather than trusting a flag sampled
+ * at startup.
+ */
+export async function a2aDaemonUp(): Promise<boolean> {
+  const res = await a2a(['status'], 20_000);
+  return res.ok && /running/i.test(res.raw);
+}
+
+/** Bring the XMTP daemon back up. Idempotent; safe to call when already running. */
+export async function startA2aDaemon(): Promise<boolean> {
+  const res = await a2a(['daemon', 'start'], 60_000);
+  audit('okx-marketplace', res.ok ? 'A2A_DAEMON_STARTED' : 'A2A_DAEMON_START_FAILED', res.error ?? '');
+  return res.ok;
 }
 
 /** Is the onchainos CLI present at all? */

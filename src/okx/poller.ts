@@ -5,14 +5,15 @@ import { audit, getEngagementByJob, now, saveEngagement, savePayment, uid } from
 import { criteriaFromBrief, formatShortlist, runAdhocHunt } from '../skills/jobHunt.js';
 import { criteriaToProfile } from '../skills/jobHunt.js';
 import type { Engagement } from '../types.js';
+import { payloadChannelReady, repairDeliverable, submitDeliverable } from './delivery.js';
 import {
   TERMINAL_STATUSES,
   TaskStatus,
+  a2aDaemonUp,
   activeTasks,
   applyForTask,
   cliAvailable,
   contactUser,
-  deliverTask,
   gateCheck,
   heartbeat,
   recommendedTasks,
@@ -128,6 +129,14 @@ export async function pollOnce(deps: PollerDeps): Promise<void> {
     if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
       lastHeartbeat = Date.now();
       await heartbeat().catch(() => false);
+      // Re-sample the chat channel on the same cadence. Sampling it only at
+      // startup meant a daemon that recovered stayed "down" for the process
+      // lifetime, permanently suppressing buyer greetings and cold-start.
+      const up = await a2aDaemonUp().catch(() => commsReady);
+      if (up !== commsReady) {
+        commsReady = up;
+        console.log(`[okx-poller] A2A chat is now ${up ? 'available — greetings and cold-start resumed' : 'unavailable — claiming continues without greetings'}.`);
+      }
     }
 
     const { ok, tasks, error } = await activeTasks();
@@ -187,7 +196,20 @@ async function handleTask(task: MarketplaceTask, deps: PollerDeps): Promise<void
       return;
 
     case TaskStatus.SUBMITTED:
-      return; // delivered; waiting on the buyer's review
+      // `submitted` means the tx landed — NOT that the buyer received anything.
+      // Until the payload is confirmed retrievable this task is an empty
+      // submission counting down to rejection, so keep repairing it.
+      if (!engagement.deliverableSentAt) {
+        if (!engagement.shortlist) {
+          console.error(`[okx-poller] ${task.jobId}: submitted with no local payload to re-send — buyer has nothing to review.`);
+          return;
+        }
+        const repair = await repairDeliverable(engagement, composeDeliverable(engagement, engagement.shortlist));
+        if (repair.ok) {
+          await notify(deps, engagement, `📤 Re-sent the deliverable for "${task.title}" — the first submission reached the chain without its payload.`);
+        }
+      }
+      return;
 
     case TaskStatus.COMPLETED:
       if (engagement.status !== 'settled') {
@@ -235,9 +257,11 @@ function plannedAction(task: MarketplaceTask, engagement: Engagement): string {
       return steps.join(' + ') || 'nothing (already claimed)';
     }
     case TaskStatus.ACCEPTED:
-      return engagement.deliveredAt ? 'nothing (already delivered)' : 'run hunt + deliver';
+      return engagement.deliveredAt ? 'nothing (already delivered)' : 'check xmtp + run hunt + deliver + verify payload';
     case TaskStatus.SUBMITTED:
-      return 'nothing (awaiting buyer review)';
+      return engagement.deliverableSentAt
+        ? 'nothing (awaiting buyer review)'
+        : 're-send deliverable over XMTP (submitted without a retrievable payload)';
     case TaskStatus.COMPLETED:
       return 'mark settled';
     default:
@@ -313,8 +337,18 @@ async function claim(task: MarketplaceTask, engagement: Engagement, deps: Poller
  * The buyer's brief is the criteria source, so a task can be served end to end
  * without waiting for a Telegram onboarding. The deep link still goes out with
  * the deliverable: the shortlist is the machine half, approvals stay human.
+ *
+ * Order matters and is not negotiable: the payload is produced, written to
+ * disk, and the payload channel confirmed up BEFORE anything touches the
+ * chain. Submitting first is what produces an empty submission — the buyer
+ * sees `submitted`, finds nothing to review, and rejects.
  */
 async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: PollerDeps): Promise<void> {
+  // Cheap early-out before the hunt spends API quota and LLM calls on work we
+  // would only have to hold. `submitDeliverable` re-checks immediately before
+  // the submit — that one is authoritative, this one just avoids the waste.
+  if (!(await payloadChannelReady(task.jobId))) return;
+
   const brief = engagement.brief ?? task.description ?? '';
   const criteria = await criteriaFromBrief(task.title, brief);
   const result = await runAdhocHunt(criteria);
@@ -325,24 +359,50 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
     result.found,
     true,
   );
-  const deepLink = `https://t.me/${config.telegram.username}?start=${engagement.taskCode}`;
-  const deliverable =
-    `${shortlist}\n\n` +
-    `— Continue in your private thread to refine criteria, get tailored drafts, and approve applications: ${deepLink}`;
-
+  // Persist the work before attempting delivery: if the submit is held or the
+  // process dies, the shortlist survives and the repair path can re-send it
+  // rather than re-running the whole hunt.
   engagement.shortlist = shortlist;
-  engagement.status = 'delivering';
   saveEngagement(engagement);
 
-  const res = await deliverTask(task.jobId, deliverable);
-  if (!res.ok) {
+  const summary =
+    `Legwork shortlist — ${result.matches.length} ranked matches from ${result.found} postings, ` +
+    'each with a full score breakdown. Full report attached.';
+
+  const res = await submitDeliverable(engagement, composeDeliverable(engagement, shortlist), summary);
+
+  if (!res.submitted) {
+    // Nothing went on-chain, so the task is still `accepted` and the next tick
+    // retries the whole thing cleanly.
     console.error(`[okx-poller] deliver failed for ${task.jobId}: ${res.error}`);
     return;
   }
-  engagement.deliveredAt = now();
-  saveEngagement(engagement);
+  if (!res.ok) {
+    console.error(`[okx-poller] ${task.jobId}: submitted without a retrievable payload — will keep repairing: ${res.error}`);
+    return; // the SUBMITTED branch retries the repair every tick
+  }
+
   console.log(`[okx-poller] delivered ${task.jobId} — ${result.matches.length} matches from ${result.found} postings`);
-  await notify(deps, engagement, `🏁 Delivered your OKX task "${task.title}" — ${result.matches.length} ranked matches submitted for acceptance.`);
+  await notify(
+    deps,
+    engagement,
+    res.repaired
+      ? `📤 Delivered your OKX task "${task.title}" — ${result.matches.length} ranked matches (payload re-sent after a partial submit).`
+      : `🏁 Delivered your OKX task "${task.title}" — ${result.matches.length} ranked matches submitted for acceptance.`,
+  );
+}
+
+/**
+ * The exact bytes the buyer is owed: the shortlist plus the thread that turns
+ * it into applications. Rebuilt rather than stored so a repair re-sends the
+ * same payload the original delivery carried.
+ */
+function composeDeliverable(engagement: Engagement, shortlist: string): string {
+  const deepLink = `https://t.me/${config.telegram.username}?start=${engagement.taskCode}`;
+  return (
+    `${shortlist}\n\n` +
+    `— Continue in your private thread to refine criteria, get tailored drafts, and approve applications: ${deepLink}`
+  );
 }
 
 /**

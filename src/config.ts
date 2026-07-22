@@ -89,4 +89,7 @@ export const config = {
     },
   },
   dbPath: env('DATABASE_PATH', 'legwork.db'),
+  // Durable working directory. Deliverable artifacts live here rather than in
+  // the OS temp dir — they are dispute evidence and must outlive a reboot.
+  dataDir: env('DATA_DIR', '.'),
 };

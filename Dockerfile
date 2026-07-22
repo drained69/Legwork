@@ -61,7 +61,10 @@ ENV DATABASE_PATH=/data/legwork.db
 # Per-user OKX wallet sessions live on the persistent volume so sign-ins
 # survive redeploys.
 ENV WALLET_HOME_ROOT=/data/wallets
-RUN mkdir -p /data/wallets
+# Delivered payloads are dispute evidence: a buyer can contest long after a
+# redeploy would have cleared an ephemeral filesystem.
+ENV DATA_DIR=/data
+RUN mkdir -p /data/wallets /data/deliverables
 EXPOSE 8402
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

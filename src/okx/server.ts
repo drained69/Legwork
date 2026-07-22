@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { PAYMENT_HEADERS, buildChallenge, findService, serviceCatalog, verifyAndSettle, type PricedService } from './x402.js';
-import { deliverTask } from './marketplace.js';
+import { repairDeliverable, submitDeliverable } from './delivery.js';
 import { criteriaToProfile, runAdhocHunt, type HuntCriteria } from '../skills/jobHunt.js';
 import { scorePosting } from '../skills/matchScorer.js';
 import { tailorApplication } from '../skills/applicationTailor.js';
@@ -222,7 +222,14 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
   return { ok: true, note: 'event ignored' };
 }
 
-/** Build the deliverable payload for an engagement (pure — no I/O). */
+/**
+ * Build the deliverable payload for an engagement (pure — no I/O).
+ *
+ * Building is not delivering: this only assembles the bytes. The audit trail
+ * records that distinction, because an audit line saying DELIVERED for a
+ * payload that was never transmitted is precisely what makes an empty
+ * submission impossible to diagnose after the fact.
+ */
 export function deliverEngagement(engagement: Engagement): string {
   engagement.status = 'delivering';
   saveEngagement(engagement);
@@ -232,26 +239,29 @@ export function deliverEngagement(engagement: Engagement): string {
     engagement.listing.startsWith('job-hunt') && engagement.shortlist
       ? engagement.shortlist
       : buildDigest(engagement) + '\n\n' + buildEvidenceBundle(engagement);
-  audit('okx-endpoint', 'DELIVERED', `job=${engagement.okxJobId}`);
+  audit('okx-endpoint', 'DELIVERABLE_BUILT', `job=${engagement.okxJobId}`);
   return deliverable;
 }
 
 /**
- * Build the deliverable AND submit it on-chain.
+ * Build the deliverable AND get it to the buyer.
  *
  * `deliverEngagement` alone only ever produced a string — nothing transmitted
  * it, so an engagement that "completed" locally still hit the marketplace's
- * submit timeout and auto-refunded the buyer. Delivery is only legal while
- * the task is `accepted`; outside that window the CLI rejects it, which is
- * reported rather than swallowed.
+ * submit timeout and auto-refunded the buyer.
+ *
+ * `ok` means the buyer can retrieve the payload, not merely that a tx landed
+ * (see okx/delivery.ts). Re-entrant by design: an engagement whose submit
+ * already went on-chain cannot be delivered again, so it takes the repair path
+ * instead of re-submitting into a CLI that would reject it.
  */
 export async function deliverEngagementOnChain(engagement: Engagement): Promise<{ ok: boolean; deliverable: string; error?: string }> {
   const deliverable = deliverEngagement(engagement);
-  const res = await deliverTask(engagement.okxJobId, deliverable);
-  if (res.ok) {
-    engagement.deliveredAt = now();
-    saveEngagement(engagement);
-  }
+
+  const res = engagement.deliveredAt
+    ? await repairDeliverable(engagement, deliverable)
+    : await submitDeliverable(engagement, deliverable, 'Legwork engagement deliverable — full report attached.');
+
   return { ok: res.ok, deliverable, error: res.error };
 }
 
