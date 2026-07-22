@@ -64,6 +64,10 @@ ENV WALLET_HOME_ROOT=/data/wallets
 # Delivered payloads are dispute evidence: a buyer can contest long after a
 # redeploy would have cleared an ephemeral filesystem.
 ENV DATA_DIR=/data
+# Railway/Fly/Render terminate TLS in front of the container, so the last
+# X-Forwarded-For hop is written by their proxy and can be trusted as the
+# rate-limit identity. Never set this when the process is directly exposed.
+ENV TRUST_PROXY=true
 RUN mkdir -p /data/wallets /data/deliverables
 EXPOSE 8402
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

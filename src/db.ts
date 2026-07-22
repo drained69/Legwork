@@ -309,10 +309,28 @@ export function countUsage(engagementId: string): number {
   return row.n;
 }
 
-/** Replay protection: returns true the FIRST time a nonce is seen, false after. */
+/**
+ * Replay protection: returns true the FIRST time a nonce is seen, false after.
+ *
+ * This is a RESERVATION, taken before settlement so two concurrent requests
+ * carrying one authorization cannot both spend it. A caller that does not go
+ * on to settle must `releaseNonce` — see x402.ts step 4.
+ */
 export function consumeNonce(nonce: string): boolean {
   const res = db.prepare('INSERT OR IGNORE INTO x402_nonces (nonce, at) VALUES (?, ?)').run(nonce, now());
   return res.changes > 0;
+}
+
+/**
+ * Undo a reservation that never became a payment.
+ *
+ * Without this, a transient facilitator outage would permanently brick a valid
+ * payment authorization: the buyer's retry hits "replay rejected" and they can
+ * never pay for that call. Only safe because it is called exclusively on paths
+ * where no settlement occurred.
+ */
+export function releaseNonce(nonce: string): void {
+  db.prepare('DELETE FROM x402_nonces WHERE nonce = ?').run(nonce);
 }
 
 // ── scan runs ──────────────────────────────────────────────────────────────

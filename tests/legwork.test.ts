@@ -494,6 +494,23 @@ test('hunt: chunkMessage keeps every chunk under the Telegram limit', async () =
   assert.equal(chunks.join('\n'), long, 'no content lost in chunking');
 });
 
+test('hunt: chunkMessage hard-splits a single line longer than the limit', async () => {
+  const { chunkMessage } = await import('../src/skills/jobHunt.js');
+  // Line-boundary splitting alone leaves this as one oversized chunk, which
+  // the send would then reject.
+  const chunks = chunkMessage('x'.repeat(9000), 3500);
+  assert.ok(chunks.length >= 3);
+  for (const c of chunks) assert.ok(c.length <= 3500, `chunk of ${c.length} exceeds the limit`);
+  assert.equal(chunks.join(''), 'x'.repeat(9000), 'no content lost');
+});
+
+test('hunt: heuristic criteria keep a stated location instead of forcing remote', async () => {
+  const { heuristicCriteria } = await import('../src/skills/jobHunt.js');
+  assert.deepEqual(heuristicCriteria('Backend engineer in Austin, onsite').locations, ['austin']);
+  // Nothing stated → remote is the honest default, not a guess.
+  assert.deepEqual(heuristicCriteria('Backend engineer').locations, ['remote']);
+});
+
 // ── evidence bundle ────────────────────────────────────────────────────────
 
 test('evidence bundle lists every application with approval + receipt fields', async () => {

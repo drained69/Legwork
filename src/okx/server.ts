@@ -300,7 +300,7 @@ const previewHits = new Map<string, number[]>();
 function previewAllowed(ip: string): { ok: boolean; remaining: number; retryAfterSec: number } {
   const cutoff = Date.now() - PREVIEW_WINDOW_MS;
   const hits = (previewHits.get(ip) ?? []).filter((t) => t > cutoff);
-  if (previewHits.size > 10_000) previewHits.clear(); // crude memory bound
+  if (previewHits.size > 10_000) evictExpired(cutoff);
   if (hits.length >= PREVIEW_LIMIT) {
     return { ok: false, remaining: 0, retryAfterSec: Math.ceil((hits[0] + PREVIEW_WINDOW_MS - Date.now()) / 1000) };
   }
@@ -309,10 +309,40 @@ function previewAllowed(ip: string): { ok: boolean; remaining: number; retryAfte
   return { ok: true, remaining: PREVIEW_LIMIT - hits.length, retryAfterSec: 0 };
 }
 
+/**
+ * Bound the map by dropping only entries whose window has fully elapsed.
+ *
+ * The previous version called `previewHits.clear()`, which reset EVERY
+ * client's counter — so anyone able to grow the map past the bound (trivial,
+ * since keys came from a client-settable header) also wiped their own limit.
+ */
+function evictExpired(cutoff: number): void {
+  for (const [key, times] of previewHits) {
+    if (!times.some((t) => t > cutoff)) previewHits.delete(key);
+  }
+}
+
+/**
+ * The client's real address, as far as we can actually trust it.
+ *
+ * X-Forwarded-For is append-only: each proxy adds the peer it heard from, so
+ * the RIGHTMOST entry is the one our own proxy observed and the leftmost is
+ * whatever the client typed. Reading the leftmost — as this did — let any
+ * caller mint a fresh identity per request with a made-up header and farm the
+ * free tier without limit. Trust the socket peer, and only step one hop left
+ * of it when a trusted proxy is actually in front of us.
+ */
 function clientIp(req: IncomingMessage): string {
+  const socketIp = req.socket.remoteAddress ?? 'unknown';
+  if (!config.okx.trustProxy) return socketIp;
   const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
-  return req.socket.remoteAddress ?? 'unknown';
+  const chain = (Array.isArray(fwd) ? fwd.join(',') : fwd ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // Rightmost = added by the proxy adjacent to us; anything further left is
+  // client-controlled and must never be used as a rate-limit key.
+  return chain.length ? chain[chain.length - 1] : socketIp;
 }
 
 /**
@@ -482,7 +512,20 @@ async function handlePaidRoute(service: PricedService, req: IncomingMessage, res
     return;
   }
 
-  // Payment attached → verify + settle BEFORE doing any work.
+  // Read and parse the request BEFORE settling. Parsing is not "the work" —
+  // and charging for a request we are about to reject as malformed takes the
+  // buyer's money for nothing. Note the ordering: an unpaid caller still gets
+  // the 402 challenge above without us reading a byte of their body.
+  const raw = await readBody(req, res);
+  if (raw === null) return; // readBody already answered (413)
+  let body: Record<string, unknown>;
+  try {
+    body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  } catch (err) {
+    return json(res, 400, { ok: false, error: `request body is not valid JSON: ${String(err)}`, charged: false });
+  }
+
+  // Input is well-formed → verify + settle BEFORE doing any work.
   const verdict = await verifyAndSettle(paymentHeader, service, resource);
   if (!verdict.ok) {
     const challenge = buildChallenge(service, resource);
@@ -490,10 +533,7 @@ async function handlePaidRoute(service: PricedService, req: IncomingMessage, res
     return;
   }
 
-  const raw = await readBody(req, res);
-  if (raw === null) return;
   try {
-    const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     const result = await runPaidService(service, body);
     json(res, 200, { ok: true, service: service.id, result }, { 'PAYMENT-RESPONSE': verdict.responseHeader! });
   } catch (err) {

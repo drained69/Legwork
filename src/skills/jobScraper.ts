@@ -1,6 +1,14 @@
 import { config } from '../config.js';
 import { markSeen, now, postingHash, recordScanRun, savePosting } from '../db.js';
+import { fetchWithTimeout } from '../http.js';
 import type { Posting, Profile } from '../types.js';
+
+/**
+ * A job board is a third-party dependency inside the poller's single-flight
+ * tick. It gets one deadline; missing it degrades the scan to the other
+ * sources instead of wedging the marketplace loop.
+ */
+const SOURCE_TIMEOUT_MS = 15_000;
 
 // ── source: Adzuna (free tier, real-time — primary live source) ───────────
 async function fetchAdzuna(profile: Profile): Promise<Posting[]> {
@@ -10,7 +18,7 @@ async function fetchAdzuna(profile: Profile): Promise<Posting[]> {
   const url =
     `https://api.adzuna.com/v1/api/jobs/${country}/search/1?app_id=${appId}&app_key=${appKey}` +
     `&results_per_page=20&what=${what}${where}&salary_min=${profile.compFloor}&content-type=application/json`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, SOURCE_TIMEOUT_MS);
   if (!res.ok) throw new Error(`Adzuna ${res.status}`);
   const data = (await res.json()) as {
     results: Array<{
@@ -33,13 +41,17 @@ async function fetchUsaJobs(profile: Profile): Promise<Posting[]> {
   const url =
     `https://data.usajobs.gov/api/search?Keyword=${encodeURIComponent(profile.targetRoles.join(' '))}` +
     `&ResultsPerPage=20`;
-  const res = await fetch(url, {
-    headers: {
-      'Authorization-Key': config.usajobs.apiKey,
-      'User-Agent': config.usajobs.userAgent,
-      Host: 'data.usajobs.gov',
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        'Authorization-Key': config.usajobs.apiKey,
+        'User-Agent': config.usajobs.userAgent,
+        Host: 'data.usajobs.gov',
+      },
     },
-  });
+    SOURCE_TIMEOUT_MS,
+  );
   if (!res.ok) throw new Error(`USAJOBS ${res.status}`);
   const data = (await res.json()) as {
     SearchResult: {

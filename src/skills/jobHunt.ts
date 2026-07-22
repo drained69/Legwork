@@ -146,7 +146,12 @@ export function heuristicCriteria(brief: string): HuntCriteria {
   // "$150k" / "$150,000" / "150k+"
   const comp = /\$?\s*(\d{2,3})\s*k\b/.exec(text) ?? /\$\s*([\d,]{5,9})/.exec(text);
   const compFloor = comp ? (comp[0].includes('k') ? Number(comp[1]) * 1000 : Number(comp[1].replace(/,/g, ''))) : 0;
-  const locations = /\bremote\b/.test(text) ? ['remote'] : ['remote'];
+  // Named locations the brief actually states, else remote. (This used to be a
+  // ternary with the same value in both branches, so a stated location was
+  // silently dropped and every keyless hunt searched remote-only.)
+  const named = ['remote', 'san francisco', 'new york', 'seattle', 'austin', 'boston', 'chicago', 'denver', 'los angeles', 'london', 'berlin', 'toronto']
+    .filter((city) => text.includes(city));
+  const locations = named.length ? named : ['remote'];
   // The role is the most useful signal we can extract without a model: keep
   // the meaningful words of the brief and let the scorer do the rest.
   const roles = brief
@@ -213,18 +218,32 @@ export function formatCriteriaSummary(profile: Profile): string {
   );
 }
 
-/** Split long shortlists into Telegram-safe chunks (<4096 chars). */
+/**
+ * Split long shortlists into Telegram-safe chunks (<4096 chars).
+ *
+ * Splitting on line boundaries alone is not enough: a single line longer than
+ * the limit (a pasted resume, a run-on job description) would be emitted as an
+ * oversized chunk and rejected on send. Such a line is hard-split instead.
+ */
 export function chunkMessage(text: string, limit = 3500): string[] {
   if (text.length <= limit) return [text];
   const chunks: string[] = [];
   let current = '';
+
+  const flush = (): void => {
+    if (current) chunks.push(current);
+    current = '';
+  };
+
   for (const line of text.split('\n')) {
-    if (current.length + line.length + 1 > limit) {
-      chunks.push(current);
-      current = '';
+    if (line.length > limit) {
+      flush();
+      for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+      continue;
     }
+    if (current.length + line.length + 1 > limit) flush();
     current += (current ? '\n' : '') + line;
   }
-  if (current) chunks.push(current);
+  flush();
   return chunks;
 }

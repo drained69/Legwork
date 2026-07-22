@@ -16,6 +16,10 @@ process.env.ADZUNA_APP_KEY = '';
 process.env.USAJOBS_API_KEY = '';
 process.env.ANTHROPIC_API_KEY = '';
 process.env.X402_FACILITATOR_URL = '';
+// Mirrors production (Railway fronts the container), and lets tests address
+// the limiter as distinct clients. The untrusted case is covered by the
+// spoofing test below, which flips this off at runtime.
+process.env.TRUST_PROXY = 'true';
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -380,4 +384,69 @@ test('usage ledger records wallet attribution for every call', async () => {
   assert.equal(after.length, 1);
   assert.equal(after[0].wallet, '0x4e9bb70743a3a33bc47514389167903f70f69a07');
   assert.equal(after[0].paid, false);
+});
+
+// ── nonce reservation is not a spend ───────────────────────────────────────
+
+test('x402: a nonce is released when settlement never happens', async () => {
+  // A payment authorization is single-use, so the nonce is reserved BEFORE
+  // settlement to stop two concurrent requests spending it. But a reservation
+  // that never settles must be given back: otherwise one transient facilitator
+  // error permanently bricks a valid authorization and the buyer can never pay.
+  const { consumeNonce, releaseNonce } = await import('../src/db.js');
+  const nonce = 'eip155:196:0xdeadbeef';
+
+  assert.equal(consumeNonce(nonce), true, 'first use reserves');
+  assert.equal(consumeNonce(nonce), false, 'concurrent duplicate is blocked while reserved');
+
+  releaseNonce(nonce);
+  assert.equal(consumeNonce(nonce), true, 'a released authorization can be retried');
+});
+
+test('x402: an unconfigured facilitator does not consume the buyer authorization', async () => {
+  // X402_FACILITATOR_URL is empty in this suite; with dev-accept off, the call
+  // is refused. The buyer must be able to retry the SAME authorization once the
+  // agent is configured, so the nonce must not have been burned.
+  const { verifyAndSettle, PRICED_SERVICES } = await import('../src/okx/x402.js');
+  const { config } = await import('../src/config.js');
+  const service = PRICED_SERVICES.find((s) => s.id === 'job-hunt')!;
+  const nonce = '0x' + 'c0ffee'.padEnd(64, '0');
+
+  config.x402.devAcceptUnverified = false;
+  try {
+    const first = await verifyAndSettle(makePayment({}, { nonce }), service, '/api/hunt');
+    assert.equal(first.ok, false);
+    assert.match(first.error ?? '', /facilitator/);
+
+    // The retry must fail for the SAME reason — not "replay rejected".
+    const retry = await verifyAndSettle(makePayment({}, { nonce }), service, '/api/hunt');
+    assert.equal(retry.ok, false);
+    assert.doesNotMatch(retry.error ?? '', /replay/, 'the unsettled authorization was wrongly burned');
+  } finally {
+    config.x402.devAcceptUnverified = true;
+  }
+});
+
+// ── free-tier rate limiting cannot be forged ───────────────────────────────
+
+test('preview: with no trusted proxy, a forged X-Forwarded-For cannot mint free-tier quota', async () => {
+  // Directly exposed deployment: the limiter must key on the socket peer.
+  // Reading the client-supplied leftmost hop, as this once did, let any caller
+  // reset their own limit on every single request.
+  const { config } = await import('../src/config.js');
+  config.okx.trustProxy = false;
+  try {
+    const seen: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const res = await fetch(`${base}/api/hunt/preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': `10.9.9.${i}` },
+        body: JSON.stringify({ roles: ['engineer'], skills: ['typescript'] }),
+      });
+      seen.push(res.status);
+    }
+    assert.ok(seen.includes(429), `forged headers bypassed the limit entirely: ${seen.join(',')}`);
+  } finally {
+    config.okx.trustProxy = true;
+  }
 });

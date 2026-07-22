@@ -1,5 +1,6 @@
-import { audit, consumeNonce, now, savePayment, uid } from '../db.js';
+import { audit, consumeNonce, releaseNonce, now, savePayment, uid } from '../db.js';
 import { config } from '../config.js';
+import { fetchWithTimeout } from '../http.js';
 
 /**
  * x402 seller-side implementation (OKX Agent Payments Protocol).
@@ -265,28 +266,45 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
     return { ok: false, status: 402, error: 'payment authorization not yet valid' };
   }
 
-  // 3. Replay protection — a signed authorization is single-use.
+  // 3. Replay protection — a signed authorization is single-use. Reserved
+  //    before settlement so concurrent duplicates cannot both spend it; see
+  //    step 4 for why an unsettled reservation must be released again.
   const nonce = auth.nonce ?? '';
   if (!nonce) return { ok: false, status: 402, error: 'missing payment nonce' };
-  if (!consumeNonce(`${config.x402.network}:${nonce}`)) {
+  const nonceKey = `${config.x402.network}:${nonce}`;
+  if (!consumeNonce(nonceKey)) {
     audit('x402', 'REPLAY_REJECTED', `service=${service.id} nonce=${nonce}`);
     return { ok: false, status: 402, error: 'payment authorization already used (replay rejected)' };
   }
 
   // 4. Cryptographic verification + on-chain settlement via facilitator.
+  //
+  // The nonce is reserved above BEFORE this runs, so two concurrent requests
+  // carrying the same authorization can never both reach settlement. But a
+  // reservation is not a spend: if we never actually settle, holding the nonce
+  // would permanently brick a perfectly valid authorization — the buyer's
+  // retry would come back "replay rejected" and they could not pay us at all.
+  // So every path that ends without a settled payment releases it.
   let transaction = '';
   if (config.x402.facilitatorUrl) {
     const requirements = acceptsV2(service, resource);
     const verified = await facilitator('/verify', { x402Version: payment.x402Version, paymentHeader, paymentRequirements: requirements });
-    if (!verified.ok) return { ok: false, status: 402, error: `facilitator rejected payment: ${verified.error}` };
+    if (!verified.ok) {
+      releaseNonce(nonceKey);
+      return { ok: false, status: 402, error: `facilitator rejected payment: ${verified.error}` };
+    }
     const settled = await facilitator('/settle', { x402Version: payment.x402Version, paymentHeader, paymentRequirements: requirements });
-    if (!settled.ok) return { ok: false, status: 402, error: `settlement failed: ${settled.error}` };
+    if (!settled.ok) {
+      releaseNonce(nonceKey);
+      return { ok: false, status: 402, error: `settlement failed: ${settled.error}` };
+    }
     transaction = settled.transaction ?? '';
   } else if (config.x402.devAcceptUnverified) {
     // Explicit dev/test mode: structural checks only, no chain settlement.
     transaction = `dev-unsettled-${uid().slice(0, 8)}`;
     audit('x402', 'DEV_ACCEPT_UNVERIFIED', `service=${service.id} payer=${auth.from}`);
   } else {
+    releaseNonce(nonceKey);
     return {
       ok: false, status: 402,
       error: 'payment verification unavailable: agent has no facilitator configured (X402_FACILITATOR_URL)',
@@ -318,16 +336,23 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
   return { ok: true, status: 200, payer: auth.from, transaction, responseHeader };
 }
 
+/** Settlement can involve an on-chain write, so it gets a longer leash than a scan. */
+const FACILITATOR_TIMEOUT_MS = 30_000;
+
 async function facilitator(
   endpoint: '/verify' | '/settle',
   body: Record<string, unknown>,
 ): Promise<{ ok: boolean; error?: string; transaction?: string }> {
   try {
-    const res = await fetch(config.x402.facilitatorUrl.replace(/\/$/, '') + endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const res = await fetchWithTimeout(
+      config.x402.facilitatorUrl.replace(/\/$/, '') + endpoint,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      FACILITATOR_TIMEOUT_MS,
+    );
     const data = (await res.json()) as { isValid?: boolean; success?: boolean; invalidReason?: string; errorReason?: string; transaction?: string; txHash?: string };
     if (endpoint === '/verify') {
       return data.isValid ? { ok: true } : { ok: false, error: data.invalidReason ?? 'invalid' };

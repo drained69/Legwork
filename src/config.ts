@@ -39,6 +39,11 @@ export const config = {
     dryRun: env('OKX_POLL_DRY_RUN') === 'true',
     // X Layer. Used for the online-status heartbeat.
     chainIndex: Number(env('OKX_CHAIN_INDEX', '196')),
+    // Is a proxy we control terminating connections in front of this process?
+    // Only then may X-Forwarded-For contribute to the rate-limit identity —
+    // otherwise any caller can set the header and mint unlimited free calls.
+    // Railway/Fly/Render all front the container, so this defaults on there.
+    trustProxy: env('TRUST_PROXY', 'false') === 'true',
   },
   adzuna: {
     appId: env('ADZUNA_APP_ID'),

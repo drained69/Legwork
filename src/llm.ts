@@ -1,4 +1,5 @@
 import { config } from './config.js';
+import { fetchWithTimeout } from './http.js';
 
 /**
  * Thin Anthropic Messages API client. Returns null when no key is configured
@@ -7,23 +8,33 @@ import { config } from './config.js';
  * SECURITY: posting text is untrusted data. Callers must wrap it in the
  * <posting> tags provided by `untrusted()` and never let it steer behavior.
  */
+/** Generous enough for a long completion, short enough not to stall a poll tick. */
+const LLM_TIMEOUT_MS = 45_000;
+
 export async function llm(system: string, user: string, maxTokens = 1500): Promise<string | null> {
   if (!config.llm.enabled) return null;
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': config.llm.apiKey,
-        'anthropic-version': '2023-06-01',
+    // Scoring calls this once per posting inside the poller's single-flight
+    // tick, so a stalled API must fail fast and fall back to the heuristic
+    // scorer rather than hold the whole marketplace loop.
+    const res = await fetchWithTimeout(
+      'https://api.anthropic.com/v1/messages',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': config.llm.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: config.llm.model,
+          max_tokens: maxTokens,
+          system,
+          messages: [{ role: 'user', content: user }],
+        }),
       },
-      body: JSON.stringify({
-        model: config.llm.model,
-        max_tokens: maxTokens,
-        system,
-        messages: [{ role: 'user', content: user }],
-      }),
-    });
+      LLM_TIMEOUT_MS,
+    );
     if (!res.ok) {
       console.error(`[llm] API error ${res.status}: ${await res.text()}`);
       return null;
