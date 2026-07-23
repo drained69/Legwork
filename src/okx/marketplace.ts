@@ -435,6 +435,59 @@ export async function ensureSession(jobId: string, toAgentId: string): Promise<{
   return { ok: created.ok, error: created.error };
 }
 
+/** One decoded chat message from the task's XMTP group. */
+export interface BuyerChatMessage {
+  id: string;
+  fromAgentId: string;
+  content: string;
+  sentAt: string;
+}
+
+/**
+ * Read the task's XMTP chat history from the daemon's session store.
+ *
+ * This is how the buyer's words actually reach us. Inbound XMTP chat is
+ * consumed by the DAEMON, which tries to hand it to a local AI CLI
+ * (`ai-dispatch … failed: No supported AI CLI found`) — it never reaches our
+ * HTTP endpoint, whose brief capture only ever sees what OKX's backend pushes.
+ * A live buyer restated their criteria twice, adding "in case they didn't
+ * reach your scanner" — they hadn't. The history entries wrap each message's
+ * envelope as a JSON string in `content`; the text lives at `.content` inside
+ * it and the author at `.sender.agentId`.
+ */
+export async function chatHistory(jobId: string, toAgentId: string): Promise<{ ok: boolean; messages: BuyerChatMessage[]; error?: string }> {
+  const res = await a2a(['session', 'history', '--job-id', jobId, '--toAgentId', toAgentId, '--limit', '50', '--json'], 30_000);
+  if (!res.ok) return { ok: false, messages: [], error: res.error };
+  try {
+    const parsed = JSON.parse(res.raw.slice(res.raw.indexOf('[') === 0 ? 0 : res.raw.indexOf('{'))) as
+      | Array<Record<string, unknown>>
+      | { messages?: Array<Record<string, unknown>>; history?: Array<Record<string, unknown>>; list?: Array<Record<string, unknown>> };
+    const rows = Array.isArray(parsed) ? parsed : parsed.messages ?? parsed.history ?? parsed.list ?? [];
+    const messages: BuyerChatMessage[] = [];
+    for (const row of rows) {
+      try {
+        const envelope = JSON.parse(String(row.content ?? '{}')) as {
+          content?: string;
+          sender?: { agentId?: string };
+        };
+        if (!envelope.content) continue;
+        messages.push({
+          id: String(row.id ?? ''),
+          fromAgentId: String(envelope.sender?.agentId ?? ''),
+          content: envelope.content,
+          sentAt: String(row.sentAt ?? ''),
+        });
+      } catch {
+        // Non-JSON content (plain text row) — keep it, attributed to unknown.
+        if (row.content) messages.push({ id: String(row.id ?? ''), fromAgentId: '', content: String(row.content), sentAt: String(row.sentAt ?? '') });
+      }
+    }
+    return { ok: true, messages };
+  } catch (err) {
+    return { ok: false, messages: [], error: `history parse failed: ${String(err)}` };
+  }
+}
+
 /**
  * Send a plain chat message to the buyer's agent in the task's XMTP group.
  *

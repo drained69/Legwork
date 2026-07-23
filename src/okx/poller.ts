@@ -13,11 +13,13 @@ import {
 import { criteriaToProfile } from '../skills/jobHunt.js';
 import type { Engagement } from '../types.js';
 import { payloadChannelReady, repairDeliverable, submitDeliverable } from './delivery.js';
+import { appendBrief } from './server.js';
 import {
   TERMINAL_STATUSES,
   TaskStatus,
   a2aDaemonUp,
   activeTasks,
+  chatHistory,
   applyForTask,
   chatToBuyer,
   cliAvailable,
@@ -198,6 +200,15 @@ async function handleTask(task: MarketplaceTask, deps: PollerDeps): Promise<void
         `budget=${task.tokenAmount ?? '?'} ${task.tokenSymbol ?? ''} → would ${plannedAction(task, engagement)}`,
     );
     return;
+  }
+
+  // Pull the buyer's chat BEFORE deciding anything. Their words arrive over
+  // XMTP into the daemon's session store — not at our HTTP endpoint — and the
+  // criteria for the hunt, corrections to a provisional shortlist, and
+  // negotiation all live there. Skipping this is how a live buyer ended up
+  // restating their criteria twice while we were still asking for criteria.
+  if (!TERMINAL_STATUSES.includes(task.statusCode)) {
+    await ingestBuyerChat(task, engagement);
   }
 
   switch (task.statusCode) {
@@ -474,6 +485,36 @@ export function briefIsUsable(brief: string): boolean {
   const hasRole = /\bengineer|developer|designer|manager|analyst|scientist|architect|writer|marketer\b/.test(text);
   // Two independent signals: one alone is as likely to be a stray word.
   return [hasComp, hasSkill, hasPlace, hasRole].filter(Boolean).length >= 2;
+}
+
+/**
+ * Ingest new buyer messages from the task's XMTP session into the brief.
+ *
+ * Cursor is the last ingested message's sentAt, so a 30s tick re-reads only
+ * what is new; appendBrief dedupes exact repeats (buyers re-send criteria
+ * "in case they didn't reach your scanner" — they did, twice, and both copies
+ * must not double the brief).
+ */
+async function ingestBuyerChat(task: MarketplaceTask, engagement: Engagement): Promise<void> {
+  if (!engagement.okxBuyerAgentId) return;
+  const hist = await chatHistory(task.jobId, engagement.okxBuyerAgentId);
+  if (!hist.ok) return;
+
+  const cursor = engagement.chatIngestedThrough ? Date.parse(engagement.chatIngestedThrough) : 0;
+  const fresh = hist.messages
+    .filter((m) => m.fromAgentId === engagement.okxBuyerAgentId)
+    .filter((m) => Date.parse(m.sentAt) > cursor)
+    .sort((a, b) => Date.parse(a.sentAt) - Date.parse(b.sentAt));
+  if (!fresh.length) return;
+
+  for (const m of fresh) {
+    engagement.brief = appendBrief(engagement.brief, m.content.trim());
+  }
+  engagement.briefUpdatedAt = now();
+  engagement.chatIngestedThrough = fresh[fresh.length - 1].sentAt;
+  saveEngagement(engagement);
+  audit('okx-poller', 'BRIEF_INGESTED_XMTP', `job=${task.jobId} messages=${fresh.length}`);
+  console.log(`[okx-poller] ${task.jobId}: ingested ${fresh.length} buyer message(s) from XMTP chat into the brief.`);
 }
 
 /**

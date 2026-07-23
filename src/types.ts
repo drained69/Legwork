@@ -190,6 +190,8 @@ export interface Engagement {
   briefUpdatedAt?: string;
   /** A refreshed shortlist was chatted after a post-delivery brief reply. Once only. */
   refreshSentAt?: string;
+  /** sentAt of the newest XMTP chat message already merged into the brief. */
+  chatIngestedThrough?: string;
 }
 
 export interface OkxEnvelope {

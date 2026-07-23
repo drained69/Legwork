@@ -269,3 +269,42 @@ test('lifecycle: a buyer correction after provisional delivery gets a refreshed 
   await pollOnce({ bot: null });
   assert.equal(read().sentMessages.filter((m) => /corrected shortlist/i.test(m)).length, 1, 'refresh sent once, not per tick');
 });
+
+test('lifecycle: buyer criteria arriving over XMTP chat are ingested and hunted, not re-asked', async () => {
+  // The live failure this pins: inbound XMTP chat is consumed by the daemon
+  // (whose AI dispatch fails — no local AI CLI) and never reaches the HTTP
+  // endpoint. The buyer restated their criteria twice, "in case they didn't
+  // reach your scanner". The poller now reads the session history itself.
+  reset(1);
+  const e = db.getEngagementByJob(JOB)!;
+  e.brief = undefined;
+  e.briefUpdatedAt = undefined;
+  e.deliveredAt = undefined;
+  e.deliverableSentAt = undefined;
+  e.shortlist = undefined;
+  e.criteriaRequestedAt = undefined;
+  e.criteriaNudgeAt = undefined;
+  e.acceptedSeenAt = undefined;
+  e.chatIngestedThrough = undefined;
+  e.noMatchNoticeAt = undefined;
+  db.saveEngagement(e);
+
+  // Buyer's criteria are in the XMTP session store — and only there.
+  const st = read() as State & { chatHistory?: unknown[] };
+  st.chatHistory = [
+    { fromAgentId: '1908', content: BUYER_BRIEF, sentAt: new Date().toISOString() },
+    { fromAgentId: '6658', content: 'our own opener must not be ingested', sentAt: new Date().toISOString() },
+  ];
+  writeFileSync(statePath, JSON.stringify(st, null, 2));
+
+  await pollOnce({ bot: null });
+
+  const s = read();
+  const after = db.getEngagementByJob(JOB)!;
+  assert.ok(after.brief?.includes('Postgres'), 'buyer chat merged into the brief');
+  assert.ok(!after.brief?.includes('our own opener'), 'our own messages are not the buyer brief');
+  assert.ok(!s.sentMessages.some((m) => /criteria/i.test(m) && /reply with/i.test(m)), 'no redundant ask');
+  assert.ok(s.calls.some((c) => c.includes('agent deliver')), 'hunted and delivered against the real criteria');
+  const payload = readFileSync(s.deliveredFile!, 'utf8');
+  assert.doesNotMatch(payload, /PROVISIONAL/, 'real criteria means a real, unlabelled shortlist');
+});
