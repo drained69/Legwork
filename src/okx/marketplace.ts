@@ -353,6 +353,29 @@ export async function resendDeliverable(
   return res;
 }
 
+/**
+ * Send a plain chat message to the buyer's agent in the task's XMTP group.
+ *
+ * Unlike `resendDeliverable` this carries no `[intent:deliver]` envelope — it
+ * is ordinary negotiation traffic, used to ask for missing requirements rather
+ * than to hand over work.
+ */
+export async function chatToBuyer(
+  jobId: string,
+  toAgentId: string,
+  message: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await a2a([
+    'xmtp-send',
+    '--job-id', jobId,
+    '--to-agent-id', toAgentId,
+    '--message', message,
+    '--json',
+  ]);
+  audit('okx-marketplace', res.ok ? 'BUYER_CHAT_SENT' : 'BUYER_CHAT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return res;
+}
+
 /** Decline a designated task we cannot serve (off-chain, no signing). */
 export async function rejectTask(jobId: string): Promise<{ ok: boolean; error?: string }> {
   if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };

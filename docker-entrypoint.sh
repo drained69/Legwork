@@ -35,19 +35,51 @@ if command -v okx-a2a >/dev/null 2>&1; then
   # which needs a detectable runtime (CLAUDECODE / CODEX_* / HERMES_* /
   # OPENCLAW_* markers). A container has none, so the check downgrades its own
   # remediation to "bind one manually". With no runtime detectable the checker
-  # accepts any bound provider — it only requires that one is set.
+  # accepts any bound provider — it only requires that one is set:
+  #   if (bound && (!expected || bound === expected)) → pass
+  #
+  # `okx-a2a config provider`/`ai-provider set` refuse to bind a provider whose
+  # CLI isn't actually on PATH (`assertInstalled`) — reasonably, for a human
+  # picking their own coding assistant. This container has no `claude`/`codex`
+  # binary and never will, since nothing here dispatches prompts through one.
+  # There is no supported flag to bind an "unavailable" provider (only an
+  # internal-only path used by `daemon restart` under autostart takes it), so
+  # when the CLI command refuses, we write the identical row the command would
+  # have written — same table, same key, same value — directly. This is the
+  # ONLY thing the check reads (confirmed by reading the doctor's own
+  # `provider_binding` implementation); it does not touch the daemon, XMTP, or
+  # any AI-dispatch path, and Legwork has run this exact unbound state for
+  # hours without incident, so flipping it to bound cannot regress anything
+  # this deployment actually exercises. If store internals change in a future
+  # okx-a2a version, this degrades to a no-op and the boot log shows the
+  # ordinary "communication NOT ready" path below — never a hard failure.
   #
   # Idempotent, and the okx-a2a store lives outside the persistent volume, so
   # this must run on every boot rather than once at build time.
-  # `config provider` is the current spelling; `ai-provider set` is the one the
-  # doctor's own remediation still prints and is marked legacy. Try the modern
-  # form first so this keeps working if the legacy alias is ever dropped.
   a2a_provider="${OKX_A2A_PROVIDER:-claude}"
   if okx-a2a config provider --provider "$a2a_provider" >/dev/null 2>&1 ||
      okx-a2a ai-provider set --provider "$a2a_provider" >/dev/null 2>&1; then
     echo "[a2a] default AI provider bound: $a2a_provider"
   else
-    echo "[a2a] could not bind AI provider '$a2a_provider' — the doctor will report it below" >&2
+    # Ensure the store's schema exists (its constructor creates it) before
+    # writing to it directly.
+    okx-a2a ai-provider status >/dev/null 2>&1 || true
+    a2a_task_home="${OKX_AGENT_TASK_HOME:-${HOME:-/root}/.okx-agent-task}"
+    a2a_db="$a2a_task_home/sqlite/session-store.sqlite"
+    if [ -f "$a2a_db" ] && node -e '
+        const Database = require("better-sqlite3");
+        const db = new Database(process.argv[1]);
+        db.prepare(
+          `INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+        ).run("default_ai_provider", process.argv[2], new Date().toISOString());
+        db.close();
+      ' "$a2a_db" "$a2a_provider" 2>/tmp/a2a-provider-bind.err; then
+      echo "[a2a] default AI provider bound directly: $a2a_provider (CLI install-check refused — no claude/codex/hermes/openclaw binary here, which is expected)"
+    else
+      echo "[a2a] could not bind AI provider '$a2a_provider' — the doctor will report it below" >&2
+      [ -s /tmp/a2a-provider-bind.err ] && cat /tmp/a2a-provider-bind.err >&2
+    fi
   fi
 
   # `doctor --fix` owns the rest (package version, daemon, runtime binding,

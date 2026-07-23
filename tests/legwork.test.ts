@@ -630,3 +630,87 @@ test('wallet: a cyclic payload cannot hang the extractor', async () => {
   (cyclic.data as Record<string, unknown>).parent = cyclic;
   assert.equal(extractEvmAddress(cyclic), undefined);
 });
+
+// ── buyer criteria parsing (the "empty shortlist" incident) ────────────────
+//
+// A live task was rejected because the ASP delivered "top 0 of 0 postings" and
+// had parsed a $140k Python/Go brief as "mid, remote, $0+ floor". The
+// marketplace never supplies a description — `active-tasks` and `agent status`
+// return a title and a budget only — so the brief arrives over A2A chat, and
+// production runs with llm=false, meaning the heuristic path is the ONLY path.
+
+test('criteria: the brief from the rejected task parses completely', async () => {
+  const { heuristicCriteria } = await import('../src/skills/jobHunt.js');
+  const c = heuristicCriteria(
+    'Looking for senior backend engineer roles.\nMust have: Python, Go, Postgres, AWS.\n' +
+      'Salary: $140k+ base.\nLocations: remote-US, Austin, or Denver.',
+  );
+  assert.equal(c.compFloor, 140000, 'salary floor was dropped as $0');
+  assert.equal(c.seniority, 'senior');
+  for (const skill of ['python', 'go', 'postgres', 'aws']) {
+    assert.ok(c.skills?.includes(skill), `skill "${skill}" dropped — skills are 40 of 100 rubric points`);
+  }
+  for (const loc of ['austin', 'denver']) assert.ok(c.locations?.includes(loc), `location "${loc}" dropped`);
+  assert.deepEqual(c.roles, ['senior backend engineer'], 'roles become the job-board query');
+});
+
+test('criteria: "go" matches as a word, not as a substring', async () => {
+  const { mentionsSkill } = await import('../src/skills/jobHunt.js');
+  assert.equal(mentionsSkill('python, go, postgres', 'go'), true);
+  assert.equal(mentionsSkill('golang microservices', 'go'), true);
+  assert.equal(mentionsSkill('django rest framework', 'go'), false, '"django" contains go');
+  assert.equal(mentionsSkill('strong algorithms background', 'go'), false, '"algorithms" contains go');
+});
+
+test('criteria: the salary floor is the lowest figure, never the highest', async () => {
+  const { extractCompFloor } = await import('../src/skills/jobHunt.js');
+  // Overshooting is passed to the board as salary_min and filters out every
+  // valid posting — reproducing the empty shortlist this change prevents.
+  assert.equal(extractCompFloor('$140k+ base, up to $180k'), 140000);
+  assert.equal(extractCompFloor('up to $180k, floor 140k'), 140000);
+  assert.equal(extractCompFloor('5 years exp, $140,000 base'), 140000, 'years must not be read as salary');
+  assert.equal(extractCompFloor('3 years experience'), 0);
+});
+
+test('criteria: roles are occupations, not sentence fragments', async () => {
+  const { extractRoles } = await import('../src/skills/jobHunt.js');
+  // These strings go straight into the job-board query. Fragments like
+  // "Looking for someone to help" match nothing and return an empty board.
+  assert.deepEqual(extractRoles('Looking for senior backend engineer roles, remote-US, $140k+ base'), ['senior backend engineer']);
+  assert.deepEqual(extractRoles('Find me a job'), [], 'no occupation named → no query');
+  assert.ok(extractRoles('I need a product designer and a data analyst').length === 2);
+});
+
+test('criteria: a bare title is not a usable brief', async () => {
+  const { briefIsUsable } = await import('../src/okx/poller.js');
+  // This is what production actually had: the task title alone. Hunting on it
+  // yields nothing, so the agent must ask rather than deliver an empty result.
+  assert.equal(briefIsUsable('Job hunt shortlist help'), false);
+  assert.equal(briefIsUsable('Find Software Developer Jobs'), false);
+  assert.equal(
+    briefIsUsable('Senior backend engineer, Python and Go, $140k+ base, remote-US or Austin'),
+    true,
+  );
+});
+
+test('criteria: the buyer is told exactly what was searched', async () => {
+  const { describeCriteria } = await import('../src/okx/poller.js');
+  const echo = describeCriteria({
+    roles: ['senior backend engineer'], seniority: 'senior',
+    locations: ['remote', 'austin'], compFloor: 140000, skills: ['python', 'go'],
+  });
+  assert.match(echo, /\$140,000\+ base/);
+  assert.match(echo, /python, go/);
+  assert.match(echo, /austin/);
+});
+
+test('criteria: a chat brief accumulates across messages without duplicating', async () => {
+  const { appendBrief } = await import('../src/okx/server.js');
+  // Requirements arrive in several messages; a later one must not erase the
+  // earlier, and a resent message must not double-weight its terms.
+  const first = appendBrief(undefined, 'Senior backend engineer, Python and Go');
+  const second = appendBrief(first, '$140k+ base, remote-US or Austin');
+  assert.ok(second.includes('Python and Go') && second.includes('$140k+'));
+  assert.equal(appendBrief(second, '$140k+ base, remote-US or Austin'), second, 'duplicate ignored');
+  assert.ok(appendBrief('x'.repeat(9000), 'tail').length <= 8000, 'bounded');
+});

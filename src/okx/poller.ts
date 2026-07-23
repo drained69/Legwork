@@ -2,7 +2,14 @@ import { randomBytes } from 'node:crypto';
 import type { Bot } from 'grammy';
 import { config } from '../config.js';
 import { audit, getEngagementByJob, now, saveEngagement, savePayment, uid } from '../db.js';
-import { criteriaFromBrief, formatShortlist, runAdhocHunt } from '../skills/jobHunt.js';
+import {
+  EXTRACTABLE_SKILLS,
+  KNOWN_CITIES,
+  criteriaFromBrief,
+  formatShortlist,
+  runAdhocHunt,
+  type HuntCriteria,
+} from '../skills/jobHunt.js';
 import { criteriaToProfile } from '../skills/jobHunt.js';
 import type { Engagement } from '../types.js';
 import { payloadChannelReady, repairDeliverable, submitDeliverable } from './delivery.js';
@@ -12,6 +19,7 @@ import {
   a2aDaemonUp,
   activeTasks,
   applyForTask,
+  chatToBuyer,
   cliAvailable,
   contactUser,
   gateCheck,
@@ -349,9 +357,32 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
   // the submit — that one is authoritative, this one just avoids the waste.
   if (!(await payloadChannelReady(task.jobId))) return;
 
-  const brief = engagement.brief ?? task.description ?? '';
+  // `||` not `??`: an empty-string brief is as useless as a missing one, and
+  // `engagement.brief ?? task.description` would have kept `''`.
+  const brief = (engagement.brief || task.description || '').trim();
+
+  // Refuse to guess. The marketplace gives us a title and a budget — there is
+  // no description field on `active-tasks` or `agent status` — so without the
+  // buyer's chat brief we have no salary floor, no skills and no locations,
+  // and the hunt degenerates into a title-keyword search that returns nothing.
+  // Delivering that burns the task: `submitted` is one-way, and an unusable
+  // shortlist is rejected with the escrow unfunded. Asking costs one message.
+  if (!briefIsUsable(brief)) {
+    await requestCriteria(task, engagement);
+    return;
+  }
+
   const criteria = await criteriaFromBrief(task.title, brief);
   const result = await runAdhocHunt(criteria);
+
+  // Never submit an empty shortlist. "top 0 of 0 postings" is not a
+  // deliverable — it is a rejection with extra steps. Hold the task in
+  // `accepted` (still deliverable) and retry on the next tick, telling the
+  // buyer what we searched so they can correct it.
+  if (!result.matches.length) {
+    await handleNoMatches(task, engagement, criteria, result.found, deps);
+    return;
+  }
 
   const shortlist = formatShortlist(
     criteriaToProfile(criteria, engagement.id),
@@ -393,15 +424,123 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
 }
 
 /**
+ * Is there enough here to hunt against?
+ *
+ * A title alone is not a brief. "Job hunt shortlist help" yields no salary
+ * floor, no skills and no locations, and searching a job board for that phrase
+ * returns nothing — which is how an empty shortlist gets built and shipped.
+ * Require at least one concrete signal a buyer would recognise as their ask.
+ */
+export function briefIsUsable(brief: string): boolean {
+  const text = brief.toLowerCase();
+  if (text.length < 25) return false;
+  const hasComp = /\$\s*\d|\d{2,3}\s*k\b|\d{5,7}/.test(text);
+  const hasSkill = EXTRACTABLE_SKILLS.some((s) => text.includes(s));
+  const hasPlace = /\bremote\b|\bhybrid\b|\bonsite\b/.test(text) || KNOWN_CITIES.some((c) => text.includes(c));
+  const hasRole = /\bengineer|developer|designer|manager|analyst|scientist|architect|writer|marketer\b/.test(text);
+  // Two independent signals: one alone is as likely to be a stray word.
+  return [hasComp, hasSkill, hasPlace, hasRole].filter(Boolean).length >= 2;
+}
+
+/**
+ * Ask the buyer for the requirements the marketplace never gave us.
+ *
+ * Sent at most once per engagement — a bot that repeats itself every 30s is
+ * worse than one that waits. The task stays `accepted` and deliverable, so a
+ * reply on any later tick resumes the hunt with real criteria.
+ */
+async function requestCriteria(task: MarketplaceTask, engagement: Engagement): Promise<void> {
+  if (engagement.criteriaRequestedAt) return;
+  if (!engagement.okxBuyerAgentId) {
+    console.error(`[okx-poller] ${task.jobId}: brief is unusable and no buyer agent id to ask — holding.`);
+    return;
+  }
+  const res = await chatToBuyer(
+    task.jobId,
+    engagement.okxBuyerAgentId,
+    'Before I run the hunt I need your criteria, so the shortlist is scored against what you actually want ' +
+      'rather than guessed from the task title. Please reply with:\n' +
+      '• Target roles (e.g. senior backend engineer)\n' +
+      '• Must-have skills (e.g. Python, Go, Postgres, AWS)\n' +
+      '• Minimum base salary (e.g. $140k)\n' +
+      '• Locations, including whether remote works (e.g. remote-US, Austin, Denver)\n\n' +
+      'I will start as soon as that arrives and deliver the ranked shortlist to this task.',
+  );
+  if (!res.ok) {
+    console.error(`[okx-poller] ${task.jobId}: could not ask the buyer for criteria: ${res.error}`);
+    return;
+  }
+  engagement.criteriaRequestedAt = now();
+  saveEngagement(engagement);
+  audit('okx-poller', 'CRITERIA_REQUESTED', `job=${task.jobId}`);
+  console.log(`[okx-poller] ${task.jobId}: brief unusable — asked the buyer for criteria, holding the task.`);
+}
+
+/**
+ * The hunt ran but matched nothing.
+ *
+ * Do NOT submit. An empty shortlist reads as no work done, and submitting is
+ * irreversible. Tell the buyer what was searched — the criteria are the thing
+ * they can correct — and leave the task deliverable for the next tick.
+ */
+async function handleNoMatches(
+  task: MarketplaceTask,
+  engagement: Engagement,
+  criteria: HuntCriteria,
+  scanned: number,
+  deps: PollerDeps,
+): Promise<void> {
+  console.warn(`[okx-poller] ${task.jobId}: 0 matches from ${scanned} postings — withholding delivery.`);
+  audit('okx-poller', 'EMPTY_HUNT_WITHHELD', `job=${task.jobId} scanned=${scanned}`);
+
+  if (engagement.okxBuyerAgentId && !engagement.noMatchNoticeAt) {
+    await chatToBuyer(
+      task.jobId,
+      engagement.okxBuyerAgentId,
+      `No postings matched yet, so I am holding the shortlist rather than delivering an empty one.\n\n` +
+        `Searched for: ${describeCriteria(criteria)}\n` +
+        `Scanned this pass: ${scanned} postings.\n\n` +
+        'I keep scanning as new listings appear. If any of the above is wrong — especially the salary floor or ' +
+        'the locations — reply with a correction and I will re-run immediately.',
+    );
+    engagement.noMatchNoticeAt = now();
+    saveEngagement(engagement);
+  }
+
+  await notify(
+    deps,
+    engagement,
+    `⏸ "${task.title}" — 0 of ${scanned} postings matched. Holding delivery rather than submitting an empty shortlist.`,
+  );
+}
+
+/** Human-readable echo of what we actually searched for. */
+export function describeCriteria(c: HuntCriteria): string {
+  const parts = [
+    (c.roles ?? []).length ? (c.roles ?? []).join(' / ') : 'any role',
+    c.seniority ?? 'any level',
+    (c.locations ?? []).length ? (c.locations ?? []).join(', ') : 'any location',
+    c.compFloor ? `$${Number(c.compFloor).toLocaleString()}+ base` : 'no salary floor',
+  ];
+  if ((c.skills ?? []).length) parts.push(`skills: ${(c.skills ?? []).join(', ')}`);
+  return parts.join(' · ');
+}
+
+/**
  * The exact bytes the buyer is owed: the shortlist plus the thread that turns
  * it into applications. Rebuilt rather than stored so a repair re-sends the
  * same payload the original delivery carried.
  */
 function composeDeliverable(engagement: Engagement, shortlist: string): string {
   const deepLink = `https://t.me/${config.telegram.username}?start=${engagement.taskCode}`;
+  // The Telegram link is an OPTIONAL footer, not the deliverable. A buyer who
+  // paid for a shortlist and received a redirect to an external bot reasonably
+  // reads that as no work delivered, so the listings lead and the link is
+  // clearly marked as extra.
   return (
     `${shortlist}\n\n` +
-    `— Continue in your private thread to refine criteria, get tailored drafts, and approve applications: ${deepLink}`
+    `— Optional: continue in a private thread to refine criteria, get tailored drafts and approve applications: ${deepLink}\n` +
+    '  (Not required — the ranked shortlist above is the complete deliverable.)'
   );
 }
 

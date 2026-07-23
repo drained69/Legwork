@@ -137,29 +137,139 @@ function normalizeCriteria(c: HuntCriteria): HuntCriteria {
   };
 }
 
+/**
+ * Cities the heuristic can recognise by name. Shared with the poller's
+ * brief-usability gate so both agree on what counts as a stated location.
+ */
+export const KNOWN_CITIES = [
+  'remote', 'san francisco', 'new york', 'seattle', 'austin', 'boston', 'chicago', 'denver',
+  'los angeles', 'atlanta', 'portland', 'miami', 'toronto', 'vancouver', 'london', 'berlin',
+  'amsterdam', 'dublin', 'paris', 'madrid', 'lisbon', 'bangalore', 'singapore', 'sydney',
+];
+
+/**
+ * Skill vocabulary for the keyless path.
+ *
+ * This exists because production runs WITHOUT an Anthropic key (`llm=false`),
+ * so `criteriaFromBrief` always falls through to the heuristic — which used to
+ * hardcode `skills: []` and therefore dropped every stated skill. Skills carry
+ * 40 of the 100 rubric points, so an empty list does not merely lose detail:
+ * it removes the largest scoring axis from every match.
+ */
+export const EXTRACTABLE_SKILLS = [
+  'typescript', 'javascript', 'python', 'go', 'rust', 'java', 'kotlin', 'swift',
+  'ruby', 'php', 'scala', 'elixir', 'c++', 'c#', '.net', 'node', 'deno', 'bun',
+  'react', 'vue', 'angular', 'svelte', 'next.js', 'django', 'flask', 'fastapi',
+  'rails', 'spring', 'graphql', 'grpc', 'rest',
+  'postgres', 'mysql', 'sqlite', 'mongodb', 'redis', 'elasticsearch',
+  'kafka', 'rabbitmq', 'clickhouse', 'snowflake', 'dynamodb', 'cassandra',
+  'aws', 'gcp', 'azure', 'kubernetes', 'docker', 'terraform', 'ansible', 'linux',
+  'ci/cd', 'jenkins', 'github actions', 'observability', 'prometheus', 'grafana',
+  'machine learning', 'pytorch', 'tensorflow', 'pandas', 'numpy', 'llm', 'nlp',
+  'figma', 'sketch', 'solidity', 'ethereum', 'web3',
+];
+
+/** Spellings that should register as an entry above. */
+const SKILL_ALIASES: Record<string, string[]> = {
+  go: ['go', 'golang'],
+  postgres: ['postgres', 'postgresql'],
+  'next.js': ['next.js', 'nextjs'],
+  '.net': ['.net', 'dotnet'],
+  javascript: ['javascript', ' js '],
+  typescript: ['typescript'],
+  kubernetes: ['kubernetes', 'k8s'],
+  'machine learning': ['machine learning', 'ml engineering'],
+};
+
+/**
+ * Does `text` mention this skill as a WORD?
+ *
+ * Substring matching is unusable for a vocabulary this short: "go" appears
+ * inside "django", "golang" and "algorithm", while a padded " go " misses the
+ * far more common "Python, Go, Postgres" — which is precisely how the skill
+ * the buyer named most prominently went missing. Custom boundaries handle the
+ * punctuation-bearing entries (c++, c#, .net, ci/cd) that `\b` gets wrong.
+ */
+export function mentionsSkill(text: string, skill: string): boolean {
+  const forms = SKILL_ALIASES[skill] ?? [skill];
+  return forms.some((form) => {
+    const body = form.trim();
+    const esc = body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const lead = /^[a-z0-9]/.test(body) ? '(?<![a-z0-9])' : '(?<![a-z0-9.])';
+    const tail = /[a-z0-9]$/.test(body) ? '(?![a-z0-9])' : '';
+    return new RegExp(`${lead}${esc}${tail}`, 'i').test(text);
+  });
+}
+
 /** Keyless fallback: pull what a regex can honestly see, guess nothing else. */
 export function heuristicCriteria(brief: string): HuntCriteria {
   const text = brief.toLowerCase();
   const seniority =
     ['principal', 'staff', 'senior', 'junior'].find((s) => text.includes(s)) ??
     (/\bentry|graduate|intern\b/.test(text) ? 'junior' : 'mid');
-  // "$150k" / "$150,000" / "150k+"
-  const comp = /\$?\s*(\d{2,3})\s*k\b/.exec(text) ?? /\$\s*([\d,]{5,9})/.exec(text);
-  const compFloor = comp ? (comp[0].includes('k') ? Number(comp[1]) * 1000 : Number(comp[1].replace(/,/g, ''))) : 0;
-  // Named locations the brief actually states, else remote. (This used to be a
-  // ternary with the same value in both branches, so a stated location was
-  // silently dropped and every keyless hunt searched remote-only.)
-  const named = ['remote', 'san francisco', 'new york', 'seattle', 'austin', 'boston', 'chicago', 'denver', 'los angeles', 'london', 'berlin', 'toronto']
-    .filter((city) => text.includes(city));
+
+  // "$150k" / "150k+" / "$150,000" / "150000". Scan every candidate and take
+  // the LARGEST: a brief often mentions several numbers ("5 years", "$140k
+  // base, up to $180k"), and first-match previously picked whichever appeared
+  // first — frequently the years-of-experience figure.
+  const compFloor = extractCompFloor(text);
+
+  const named = KNOWN_CITIES.filter((city) => text.includes(city));
   const locations = named.length ? named : ['remote'];
-  // The role is the most useful signal we can extract without a model: keep
-  // the meaningful words of the brief and let the scorer do the rest.
-  const roles = brief
-    .split(/[,.\n;]/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 2 && s.length < 60 && /[a-z]/i.test(s))
-    .slice(0, 3);
-  return { roles, seniority, locations, compFloor, skills: [], factors: [] };
+
+  const skills = EXTRACTABLE_SKILLS.filter((s) => mentionsSkill(text, s));
+
+  return { roles: extractRoles(brief), seniority, locations, compFloor, skills, factors: [] };
+}
+
+/**
+ * The buyer's salary FLOOR, normalised to whole dollars.
+ *
+ * Deliberately the LOWEST plausible figure, not the highest. This value is
+ * passed to the job board as `salary_min`, so overshooting filters out valid
+ * postings and returns an empty board — the same "0 of 0" outcome this whole
+ * change exists to prevent. "$140k+ base, up to $180k" means the floor is
+ * 140k; picking 180k would silently discard everything the buyer wanted.
+ * Undershooting is recoverable, because the scorer still ranks on comp.
+ *
+ * Years-of-experience numbers are excluded by the 20k plausibility bound.
+ */
+export function extractCompFloor(text: string): number {
+  const candidates: number[] = [];
+  for (const m of text.matchAll(/\$?\s*(\d{2,3})\s*k\b/g)) candidates.push(Number(m[1]) * 1000);
+  for (const m of text.matchAll(/\$\s*([\d,]{5,9})/g)) candidates.push(Number(m[1].replace(/,/g, '')));
+  // A bare 6-figure number ("salary 140000") — only when clearly not a year.
+  for (const m of text.matchAll(/\b(\d{6})\b/g)) candidates.push(Number(m[1]));
+  const plausible = candidates.filter((n) => n >= 20_000 && n <= 2_000_000);
+  return plausible.length ? Math.min(...plausible) : 0;
+}
+
+/**
+ * Role phrases, not sentence fragments.
+ *
+ * These become the job-board query string, so precision matters more than
+ * recall: splitting the whole brief on punctuation produced entries like
+ * "Looking for someone to help me find" and "$140k+ base", which as a search
+ * term match nothing and return an empty board — the "0 of 0" outcome.
+ */
+export function extractRoles(brief: string): string[] {
+  const ROLE_NOUNS =
+    /(engineer|developer|designer|manager|analyst|scientist|architect|administrator|consultant|writer|marketer|recruiter|accountant|nurse|teacher)s?\b/i;
+  const roles: string[] = [];
+
+  for (const fragment of brief.split(/[,.\n;•|]|\band\b/i)) {
+    const cleaned = fragment
+      .replace(/^\s*(looking for|seeking|find me|find|i want|i need|need|hiring for|open to|interested in|roles? in|jobs? in|help with)\s+/i, '')
+      .replace(/\b(roles?|jobs?|positions?|openings?)\b/gi, '')
+      .replace(/[^a-z0-9+#./\s-]/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleaned || cleaned.length > 45) continue;
+    if (!ROLE_NOUNS.test(cleaned)) continue; // must name an actual occupation
+    if (!roles.includes(cleaned)) roles.push(cleaned);
+    if (roles.length === 3) break;
+  }
+  return roles;
 }
 
 /**

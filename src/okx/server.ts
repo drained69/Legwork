@@ -111,6 +111,20 @@ const EVENTS = {
   closed: ['job_expired', 'job_closed', 'job_refunded', 'job_auto_refunded'],
 } as const;
 
+/**
+ * Accumulate the buyer's brief across messages, newest last.
+ *
+ * Bounded so a chatty counterparty cannot grow the row without limit, and
+ * de-duplicated so a resent message does not double-weight its terms.
+ */
+export function appendBrief(existing: string | undefined, addition: string): string {
+  const prior = (existing ?? '').trim();
+  if (!addition) return prior;
+  if (prior.includes(addition)) return prior;
+  const merged = prior ? `${prior}\n${addition}` : addition;
+  return merged.length > 8000 ? merged.slice(merged.length - 8000) : merged;
+}
+
 export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Record<string, unknown> {
   const jobId = env.jobId ?? env.message?.jobId;
   const event = env.message?.source === 'system' ? env.message.event : undefined;
@@ -208,14 +222,36 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
   if (env.msgType === 'a2a-agent-chat' && jobId) {
     const engagement = getEngagementByJob(jobId);
     if (!engagement) return { ok: false, error: 'unknown job' };
-    const text = env.parts?.find((p) => p.kind === 'text')?.text?.toLowerCase() ?? '';
+    const raw = env.parts?.find((p) => p.kind === 'text')?.text ?? '';
+    const text = raw.toLowerCase();
     if (text.includes('status') || text.includes('digest')) {
       return { ok: true, reply: buildDigest(engagement) };
     }
-    const deepLink = `https://t.me/${config.telegram.username}?start=${engagement.taskCode}`;
+
+    // THIS is where the buyer's requirements arrive.
+    //
+    // `active-tasks` and `agent status` return a title and a budget — no
+    // description field exists on either — so the marketplace never hands us
+    // the brief. The buyer's User Agent sends it here instead, in the chat
+    // opened by `contact-user`. This handler used to lowercase the text, test
+    // it for "status", and discard it, so the salary floor, the required
+    // skills and the target locations were thrown away and the hunt ran on the
+    // task TITLE alone — which is exactly how a $140k Python/Go brief became
+    // "mid, remote, $0+ floor" with no skills.
+    //
+    // Appended rather than replaced: requirements often arrive across several
+    // messages, and a later "also, remote only" must not erase the first.
+    if (raw.trim()) {
+      engagement.brief = appendBrief(engagement.brief, raw.trim());
+      saveEngagement(engagement);
+      audit('okx-endpoint', 'BRIEF_CAPTURED', `job=${jobId} chars=${raw.trim().length}`);
+    }
+
     return {
       ok: true,
-      reply: `This engagement runs in your Telegram thread: ${deepLink}. Send "status" here anytime for a digest.`,
+      reply:
+        'Got it — those requirements are recorded and the hunt runs against them. ' +
+        'The ranked shortlist is delivered to this task. Send "status" here any time for progress.',
     };
   }
 

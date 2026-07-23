@@ -169,6 +169,14 @@ export interface Engagement {
    */
   deliverableSentAt?: string;
   deliverableFile?: string; // local .md artifact submitted as the deliverable
+  /**
+   * We asked the buyer for criteria the marketplace never supplied. Recorded so
+   * the ask happens once — the task list is polled every 30s, and repeating the
+   * question on every tick would read as a malfunctioning bot.
+   */
+  criteriaRequestedAt?: string;
+  /** We told the buyer a hunt matched nothing. Same once-only reasoning. */
+  noMatchNoticeAt?: string;
 }
 
 export interface OkxEnvelope {
