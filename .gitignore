@@ -1,9 +1,22 @@
+# Dependencies & build
 node_modules/
 dist/
+
+# Secrets & local env (keep .env.example tracked)
 .env
+.env.*
+!.env.example
+
+# SQLite / local data
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
 *.log
+
+# Runtime artifacts (OKX sessions, deliverables, local agent tooling)
+wallets/
 deliverables/
+.claude/
+.onchainos/
+data/

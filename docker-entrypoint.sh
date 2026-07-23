@@ -20,7 +20,33 @@ fi
 
 if command -v okx-a2a >/dev/null 2>&1; then
   echo "[a2a] bootstrapping communication runtime…"
-  # `doctor --fix` owns everything (package version, daemon, runtime binding,
+
+  # Bind a default AI provider BEFORE the doctor runs.
+  #
+  # The doctor treats an unbound provider as a BLOCKING failure, so `ready`
+  # comes back false, `onchainos agent gate-check` reports communication as not
+  # ready, and the poller starts degraded — skipping buyer greetings and
+  # cold-start discovery — over a check about a local AI CLI this deployment
+  # never uses. Inbound A2A arrives at our own /okx/a2a endpoint and the poller
+  # drives the task lifecycle; nothing here dispatches to an AI adapter, so the
+  # binding is metadata the gate wants rather than a runtime we invoke.
+  #
+  # `doctor --fix` cannot repair it: its auto-fix performs a runtime SWITCH,
+  # which needs a detectable runtime (CLAUDECODE / CODEX_* / HERMES_* /
+  # OPENCLAW_* markers). A container has none, so the check downgrades its own
+  # remediation to "bind one manually". With no runtime detectable the checker
+  # accepts any bound provider — it only requires that one is set.
+  #
+  # Idempotent, and the okx-a2a store lives outside the persistent volume, so
+  # this must run on every boot rather than once at build time.
+  a2a_provider="${OKX_A2A_PROVIDER:-claude}"
+  if okx-a2a ai-provider set --provider "$a2a_provider" >/dev/null 2>&1; then
+    echo "[a2a] default AI provider bound: $a2a_provider"
+  else
+    echo "[a2a] could not bind AI provider '$a2a_provider' — the doctor will report it below" >&2
+  fi
+
+  # `doctor --fix` owns the rest (package version, daemon, runtime binding,
   # agent refresh). Trust its `ready` field, not its exit code: it can exit 0
   # while still reporting ready:false with an action the operator must take.
   a2a_out="$(okx-a2a doctor --fix --json 2>&1)"

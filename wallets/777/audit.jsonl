@@ -1,3 +1,0 @@
-{"type":"device","os":"macos","arch":"aarch64","version":"4.3.0"}
-{"ts":"2026-07-23 +1.0 04:29:12.312","source":"cli","command":"wallet status","ok":true,"duration_ms":0,"args":["onchainos","wallet","status"]}
-{"ts":"2026-07-23 +1.0 04:29:31.727","source":"cli","command":"wallet status","ok":true,"duration_ms":0,"args":["onchainos","wallet","status"]}
