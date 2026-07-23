@@ -177,3 +177,95 @@ test('lifecycle: a hunt that matches nothing is withheld, not submitted empty', 
     config.adzuna.appKey = '';
   }
 });
+
+// ── the third incident: funded task held silently until the buyer aborted ──
+
+test('lifecycle: mid-wait nudge is sent once, with the fallback deadline stated', async () => {
+  reset(1);
+  const e = db.getEngagementByJob(JOB)!;
+  const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
+  e.brief = undefined;
+  e.deliveredAt = undefined;
+  e.deliverableSentAt = undefined;
+  e.acceptedSeenAt = threeMinAgo;       // 60% through the 5-minute budget
+  e.criteriaRequestedAt = threeMinAgo;  // ask already went out
+  e.criteriaNudgeAt = undefined;
+  e.noMatchNoticeAt = undefined;
+  db.saveEngagement(e);
+
+  await pollOnce({ bot: null });
+  let s = read();
+  assert.ok(!s.calls.some((c) => c.includes('agent deliver')), 'still inside the wait — no delivery yet');
+  assert.equal(s.sentMessages.length, 1, 'exactly one nudge');
+  assert.match(s.sentMessages[0], /best-effort/i, 'the nudge states the fallback plan');
+
+  await pollOnce({ bot: null });
+  assert.equal(read().sentMessages.length, 1, 'the nudge never repeats');
+});
+
+test('lifecycle: expired wait delivers a labelled provisional shortlist instead of holding forever', async () => {
+  // The incident shape: escrow funded, buyer silent, chat possibly invisible.
+  // 13 minutes of nothing ended in an abort with the escrow locked. Now the
+  // wait is bounded: real listings go on-chain, labelled with every assumption.
+  reset(1);
+  const e = db.getEngagementByJob(JOB)!;
+  const sixMinAgo = new Date(Date.now() - 6 * 60_000).toISOString();
+  e.brief = undefined;
+  e.deliveredAt = undefined;
+  e.deliverableSentAt = undefined;
+  e.shortlist = undefined;
+  e.acceptedSeenAt = sixMinAgo;        // past the 5-minute budget
+  e.criteriaRequestedAt = sixMinAgo;
+  e.noMatchNoticeAt = undefined;
+  db.saveEngagement(e);
+
+  await pollOnce({ bot: null });
+
+  const s = read();
+  const after = db.getEngagementByJob(JOB)!;
+  assert.ok(s.calls.some((c) => c.includes('agent deliver')), 'the funded task was actually delivered');
+  assert.ok(after.deliverableSentAt, 'and the payload is retrievable by the buyer');
+
+  const payload = readFileSync(s.deliveredFile!, 'utf8');
+  assert.match(payload, /PROVISIONAL/, 'the shortlist says what it is');
+  assert.match(payload, /derived from the task title/, 'and where its criteria came from');
+  assert.ok((payload.match(/^\d+\.\s\[\d+\/100\]/gm) ?? []).length > 0, 'with real ranked listings, not apologies');
+  assert.doesNotMatch(payload, /top 0 of 0/);
+
+  const deliverCall = s.calls.find((c) => c.includes('agent deliver'))!;
+  assert.match(deliverCall, /Provisional/, 'the on-chain summary is labelled too');
+});
+
+test('lifecycle: a buyer correction after provisional delivery gets a refreshed shortlist over chat', async () => {
+  reset(2); // SUBMITTED — deliver is one-way, so the correction rides the chat thread
+  const e = db.getEngagementByJob(JOB)!;
+  const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+  e.deliveredAt = tenMinAgo;
+  e.deliverableSentAt = tenMinAgo;
+  e.shortlist = 'provisional shortlist body';
+  e.brief = undefined;
+  e.briefUpdatedAt = undefined;
+  e.refreshSentAt = undefined;
+  db.saveEngagement(e);
+
+  // The reply arrives through the real endpoint, which must acknowledge it as
+  // a correction — not promise a delivery that already happened.
+  const reply = handleEnvelope({
+    msgType: 'a2a-agent-chat', jobId: JOB,
+    sender: { role: 'user', agentId: '1908' },
+    parts: [{ kind: 'text', text: BUYER_BRIEF }],
+  } as never) as { reply?: string };
+  assert.match(String(reply.reply), /refreshed/i);
+
+  await pollOnce({ bot: null });
+
+  const s = read();
+  assert.ok(!s.calls.some((c) => c.includes('agent deliver')), 'no second on-chain submit — deliver is one-way');
+  const refresh = s.sentMessages.find((m) => /corrected shortlist/i.test(m));
+  assert.ok(refresh, `refresh chat missing: ${JSON.stringify(s.sentMessages.map((m) => m.slice(0, 40)))}`);
+  assert.ok((refresh!.match(/^\d+\.\s\[\d+\/100\]/gm) ?? []).length > 0, 'refresh carries ranked listings');
+  assert.ok(db.getEngagementByJob(JOB)?.refreshSentAt, 'refresh recorded');
+
+  await pollOnce({ bot: null });
+  assert.equal(read().sentMessages.filter((m) => /corrected shortlist/i.test(m)).length, 1, 'refresh sent once, not per tick');
+});

@@ -37,6 +37,11 @@ export const config = {
     // Log what the poller WOULD claim without touching the chain. Use this to
     // verify wiring on a live account before letting it act.
     dryRun: env('OKX_POLL_DRY_RUN') === 'true',
+    // How long a funded (accepted) task waits for the buyer's criteria before
+    // a best-effort provisional shortlist is delivered instead. Buyers'
+    // pollers abort near their own deadline (~13 min observed), so the wait
+    // must expire well inside that. 0 disables waiting entirely.
+    criteriaWaitMs: Number(env('OKX_CRITERIA_WAIT_MS', '300000')),
     // X Layer. Used for the online-status heartbeat.
     chainIndex: Number(env('OKX_CHAIN_INDEX', '196')),
     // Is a proxy we control terminating connections in front of this process?

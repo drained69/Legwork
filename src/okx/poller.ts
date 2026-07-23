@@ -212,6 +212,13 @@ async function handleTask(task: MarketplaceTask, deps: PollerDeps): Promise<void
         engagement.status = 'active';
         saveEngagement(engagement);
       }
+      // Anchor the criteria watchdog to the moment funding was first seen, not
+      // to when an ask happened to succeed — the clock must run even if the
+      // chat channel is down, because the buyer's abort clock certainly does.
+      if (!engagement.acceptedSeenAt) {
+        engagement.acceptedSeenAt = now();
+        saveEngagement(engagement);
+      }
       if (config.okx.autoDeliver && !engagement.deliveredAt) await fulfil(task, engagement, deps);
       return;
 
@@ -228,7 +235,12 @@ async function handleTask(task: MarketplaceTask, deps: PollerDeps): Promise<void
         if (repair.ok) {
           await notify(deps, engagement, `📤 Re-sent the deliverable for "${task.title}" — the first submission reached the chain without its payload.`);
         }
+        return;
       }
+      // Delivered and retrievable. If the buyer replied with real criteria
+      // AFTER a provisional delivery, honour the invitation printed on it:
+      // re-run the hunt and chat the corrected shortlist.
+      await maybeRefreshAfterReply(task, engagement);
       return;
 
     case TaskStatus.COMPLETED:
@@ -373,18 +385,24 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
   // `engagement.brief ?? task.description` would have kept `''`.
   const brief = (engagement.brief || task.description || '').trim();
 
-  // Refuse to guess. The marketplace gives us a title and a budget — there is
-  // no description field on `active-tasks` or `agent status` — so without the
-  // buyer's chat brief we have no salary floor, no skills and no locations,
-  // and the hunt degenerates into a title-keyword search that returns nothing.
-  // Delivering that burns the task: `submitted` is one-way, and an unusable
-  // shortlist is rejected with the escrow unfunded. Asking costs one message.
-  if (!briefIsUsable(brief)) {
-    await requestCriteria(task, engagement);
-    return;
-  }
+  // The marketplace gives us a title and a budget — there is no description
+  // field on `active-tasks` or `agent status` — so without the buyer's chat
+  // brief we have no salary floor, no skills and no locations. Ask first: a
+  // shortlist scored against real criteria beats one scored against guesses.
+  //
+  // But the wait is BOUNDED. The wire protocol has exactly two intents the
+  // buyer's agent is guaranteed to parse — [intent:deliver] and
+  // [intent:attachment] — so a chat question can go unseen, and a funded task
+  // held on it reads as pure silence: the buyer's poller aborts near its own
+  // deadline with the escrow locked. When the budget expires, deliver a
+  // best-effort shortlist of REAL listings, labelled provisional with every
+  // assumption stated, and refresh it the moment a correction arrives.
+  const provisional = !briefIsUsable(brief);
+  if (provisional && !(await criteriaWaitExpired(task, engagement))) return;
 
-  const criteria = await criteriaFromBrief(task.title, brief);
+  const criteria = provisional
+    ? provisionalCriteria(task.title, brief)
+    : await criteriaFromBrief(task.title, brief);
   const result = await runAdhocHunt(criteria);
 
   // Never submit an empty shortlist. "top 0 of 0 postings" is not a
@@ -396,12 +414,15 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
     return;
   }
 
-  const shortlist = formatShortlist(
+  const ranked = formatShortlist(
     criteriaToProfile(criteria, engagement.id),
     result.matches,
     result.found,
     true,
   );
+  // The provisional label lives INSIDE the persisted shortlist, so the repair
+  // path and any later re-send carry the same honesty as the original.
+  const shortlist = provisional ? `${provisionalHeader(criteria)}\n\n${ranked}` : ranked;
   // Persist the work before attempting delivery: if the submit is held or the
   // process dies, the shortlist survives and the repair path can re-send it
   // rather than re-running the whole hunt.
@@ -409,8 +430,9 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
   saveEngagement(engagement);
 
   const summary =
-    `Legwork shortlist — ${result.matches.length} ranked matches from ${result.found} postings, ` +
-    'each with a full score breakdown. Full report attached.';
+    `${provisional ? 'Provisional ' : ''}Legwork shortlist — ${result.matches.length} ranked matches from ${result.found} postings, ` +
+    'each with a full score breakdown. Full report attached.' +
+    (provisional ? ' Reply in this task chat with your criteria for a corrected shortlist.' : '');
 
   const res = await submitDeliverable(engagement, composeDeliverable(engagement, shortlist), summary);
 
@@ -455,16 +477,59 @@ export function briefIsUsable(brief: string): boolean {
 }
 
 /**
+ * The bounded wait for buyer criteria. Returns true once the budget is spent
+ * and the caller should proceed with a provisional hunt.
+ *
+ * Tick-driven state machine, one message per state so a 30s poll never spams:
+ *   t=0        ask for criteria (also states the fallback plan and deadline)
+ *   t=budget/2 one nudge
+ *   t=budget   expired — deliver provisional
+ *
+ * The clock anchors on `acceptedSeenAt`, not on the ask succeeding: if the
+ * chat channel is down the buyer cannot hear us EITHER WAY, and the only move
+ * that beats their abort clock is delivering real work.
+ */
+async function criteriaWaitExpired(task: MarketplaceTask, engagement: Engagement): Promise<boolean> {
+  const waitMs = config.okx.criteriaWaitMs;
+  if (waitMs <= 0) return true;
+
+  if (!engagement.criteriaRequestedAt) await requestCriteria(task, engagement, waitMs);
+
+  const anchor = engagement.acceptedSeenAt ?? engagement.criteriaRequestedAt;
+  if (!anchor) return false; // not funded yet and the ask failed — retry next tick
+  const elapsed = Date.now() - Date.parse(anchor);
+  if (elapsed >= waitMs) {
+    audit('okx-poller', 'CRITERIA_WAIT_EXPIRED', `job=${task.jobId} waitedMs=${elapsed}`);
+    console.warn(`[okx-poller] ${task.jobId}: no criteria after ${Math.round(elapsed / 1000)}s — delivering a provisional shortlist.`);
+    return true;
+  }
+
+  if (elapsed >= waitMs / 2 && !engagement.criteriaNudgeAt && engagement.okxBuyerAgentId) {
+    const minutesLeft = Math.max(1, Math.ceil((waitMs - elapsed) / 60_000));
+    const res = await chatToBuyer(
+      task.jobId,
+      engagement.okxBuyerAgentId,
+      `Still waiting on your criteria for "${task.title}". If nothing arrives in the next ~${minutesLeft} minute${minutesLeft > 1 ? 's' : ''} ` +
+        'I will deliver a best-effort shortlist derived from the task title — reply here any time and I will correct it.',
+    );
+    if (res.ok) {
+      engagement.criteriaNudgeAt = now();
+      saveEngagement(engagement);
+    }
+  }
+  return false;
+}
+
+/**
  * Ask the buyer for the requirements the marketplace never gave us.
  *
  * Sent at most once per engagement — a bot that repeats itself every 30s is
- * worse than one that waits. The task stays `accepted` and deliverable, so a
- * reply on any later tick resumes the hunt with real criteria.
+ * worse than one that waits. States the fallback plan, so the later
+ * provisional delivery is a kept promise rather than a surprise.
  */
-async function requestCriteria(task: MarketplaceTask, engagement: Engagement): Promise<void> {
-  if (engagement.criteriaRequestedAt) return;
+async function requestCriteria(task: MarketplaceTask, engagement: Engagement, waitMs: number): Promise<void> {
   if (!engagement.okxBuyerAgentId) {
-    console.error(`[okx-poller] ${task.jobId}: brief is unusable and no buyer agent id to ask — holding.`);
+    console.error(`[okx-poller] ${task.jobId}: brief is unusable and no buyer agent id to ask — provisional delivery when the wait expires.`);
     return;
   }
   const res = await chatToBuyer(
@@ -476,7 +541,8 @@ async function requestCriteria(task: MarketplaceTask, engagement: Engagement): P
       '• Must-have skills (e.g. Python, Go, Postgres, AWS)\n' +
       '• Minimum base salary (e.g. $140k)\n' +
       '• Locations, including whether remote works (e.g. remote-US, Austin, Denver)\n\n' +
-      'I will start as soon as that arrives and deliver the ranked shortlist to this task.',
+      `I will start the moment that arrives. If I hear nothing within ~${Math.max(1, Math.round(waitMs / 60_000))} minutes ` +
+      'I will deliver a best-effort shortlist based on the task title, which you can refine by replying here.',
   );
   if (!res.ok) {
     console.error(`[okx-poller] ${task.jobId}: could not ask the buyer for criteria: ${res.error}`);
@@ -485,7 +551,95 @@ async function requestCriteria(task: MarketplaceTask, engagement: Engagement): P
   engagement.criteriaRequestedAt = now();
   saveEngagement(engagement);
   audit('okx-poller', 'CRITERIA_REQUESTED', `job=${task.jobId}`);
-  console.log(`[okx-poller] ${task.jobId}: brief unusable — asked the buyer for criteria, holding the task.`);
+  console.log(`[okx-poller] ${task.jobId}: brief unusable — asked the buyer for criteria, waiting bounded.`);
+}
+
+/** Words in task titles that describe the TASK, not the job being sought. */
+const TITLE_NOISE = new Set([
+  'job', 'jobs', 'hunt', 'search', 'find', 'help', 'shortlist', 'daily', 'alert', 'alerts',
+  'setup', 'needed', 'need', 'application', 'applications', 'package', 'top', 'tech',
+  'matches', 'match', 'for', 'me', 'my', 'a', 'an', 'the', 'with', 'role', 'roles',
+  'resume', 'cv', 'best', 'good', 'great', 'new', 'please',
+]);
+
+const ROLE_NOUNS = ['engineer', 'developer', 'designer', 'manager', 'analyst', 'scientist', 'architect', 'writer', 'marketer'];
+const ROLE_QUALIFIERS = [
+  'software', 'backend', 'frontend', 'full-stack', 'full stack', 'data', 'product', 'marketing',
+  'ux', 'ui', 'devops', 'mobile', 'web', 'cloud', 'security', 'machine learning', 'ml', 'ai', 'qa',
+];
+
+/**
+ * Best-effort criteria when the buyer never sent any.
+ *
+ * Deliberately permissive — no salary floor, remote — because a provisional
+ * shortlist's job is to show real, plausibly-relevant listings the buyer can
+ * correct, not to guess constraints that silently filter everything out. The
+ * title is scrubbed of task-words first: querying a job board for the literal
+ * phrase "Job Hunt Shortlist" is how a previous task shipped "top 0 of 0".
+ */
+export function provisionalCriteria(title: string, partialBrief: string): HuntCriteria {
+  const text = `${title} ${partialBrief}`.toLowerCase();
+
+  const qualifier = ROLE_QUALIFIERS.find((q) => new RegExp(`\\b${q.replace(/[- ]/g, '[- ]')}\\b`).exec(text));
+  const noun = ROLE_NOUNS.find((n) => text.includes(n));
+
+  let role: string;
+  if (noun) role = qualifier && qualifier !== noun ? `${qualifier} ${noun}` : noun;
+  else if (qualifier === 'ux' || qualifier === 'ui') role = `${qualifier} designer`;
+  else if (qualifier === 'marketing') role = 'marketing';
+  else if (qualifier) role = `${qualifier} engineer`;
+  else {
+    // Nothing usable even after scrubbing — fall back to the leftover
+    // meaningful words, else the single most generic tech query.
+    const leftovers = text.split(/[^a-z0-9+#]+/).filter((w) => w.length > 2 && !TITLE_NOISE.has(w));
+    role = leftovers.slice(0, 3).join(' ') || 'software engineer';
+  }
+
+  const seniority = ['principal', 'staff', 'senior', 'junior'].find((s) => text.includes(s)) ?? 'mid';
+  return { roles: [role], seniority, locations: ['remote'], compFloor: 0, skills: [], factors: [] };
+}
+
+/** The label a provisional deliverable leads with — every assumption stated. */
+export function provisionalHeader(criteria: HuntCriteria): string {
+  return (
+    '⚠️ PROVISIONAL SHORTLIST — no criteria were received in this task’s chat, so this hunt ran on assumptions:\n' +
+    `• Role searched: ${criteria.roles?.join(', ') || 'software engineer'} (derived from the task title)\n` +
+    '• Salary floor: none applied\n' +
+    `• Location: ${criteria.locations?.join(', ') || 'remote'}\n\n` +
+    'Reply in this task chat with your target roles, must-have skills, minimum base salary and locations, ' +
+    'and a corrected shortlist will follow immediately.'
+  );
+}
+
+/**
+ * The buyer replied with real criteria after a provisional delivery.
+ *
+ * `deliver` is one-way, so the correction goes over chat — the same thread
+ * the provisional deliverable told them to reply in. Once per engagement:
+ * this is a correction loop, not a subscription.
+ */
+async function maybeRefreshAfterReply(task: MarketplaceTask, engagement: Engagement): Promise<void> {
+  if (engagement.refreshSentAt || !engagement.okxBuyerAgentId) return;
+  if (!engagement.briefUpdatedAt || !engagement.deliveredAt) return;
+  if (Date.parse(engagement.briefUpdatedAt) <= Date.parse(engagement.deliveredAt)) return;
+  const brief = (engagement.brief ?? '').trim();
+  if (!briefIsUsable(brief)) return;
+
+  const criteria = await criteriaFromBrief(task.title, brief);
+  const result = await runAdhocHunt(criteria);
+  const body = result.matches.length
+    ? 'Corrected shortlist, scored against the criteria you sent:\n\n' +
+      formatShortlist(criteriaToProfile(criteria, engagement.id), result.matches, result.found, true)
+    : `I re-ran the hunt against your criteria (${describeCriteria(criteria)}) but nothing currently listed clears them. ` +
+      'I will keep scanning — anything that appears gets sent here.';
+
+  const res = await chatToBuyer(task.jobId, engagement.okxBuyerAgentId, body);
+  if (res.ok) {
+    engagement.refreshSentAt = now();
+    saveEngagement(engagement);
+    audit('okx-poller', 'SHORTLIST_REFRESHED', `job=${task.jobId} matches=${result.matches.length}`);
+    console.log(`[okx-poller] ${task.jobId}: refreshed shortlist sent after buyer reply (${result.matches.length} matches).`);
+  }
 }
 
 /**

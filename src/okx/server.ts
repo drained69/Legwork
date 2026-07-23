@@ -243,15 +243,20 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
     // messages, and a later "also, remote only" must not erase the first.
     if (raw.trim()) {
       engagement.brief = appendBrief(engagement.brief, raw.trim());
+      engagement.briefUpdatedAt = now();
       saveEngagement(engagement);
       audit('okx-endpoint', 'BRIEF_CAPTURED', `job=${jobId} chars=${raw.trim().length}`);
     }
 
+    // A reply that lands AFTER delivery is a correction to a provisional
+    // shortlist — the poller picks it up and chats a refreshed one. Say so,
+    // rather than promising a delivery that already happened.
     return {
       ok: true,
-      reply:
-        'Got it — those requirements are recorded and the hunt runs against them. ' +
-        'The ranked shortlist is delivered to this task. Send "status" here any time for progress.',
+      reply: engagement.deliveredAt
+        ? 'Got it — I am re-running the hunt against those requirements and will send the refreshed shortlist here shortly.'
+        : 'Got it — those requirements are recorded and the hunt runs against them. ' +
+          'The ranked shortlist is delivered to this task. Send "status" here any time for progress.',
     };
   }
 

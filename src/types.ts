@@ -177,6 +177,19 @@ export interface Engagement {
   criteriaRequestedAt?: string;
   /** We told the buyer a hunt matched nothing. Same once-only reasoning. */
   noMatchNoticeAt?: string;
+  /**
+   * First tick on which the task was seen escrow-funded (`accepted`). Anchors
+   * the criteria-wait watchdog: a funded task must never idle unbounded on a
+   * question the buyer's agent may not surface — the buyer's poller aborts
+   * near its deadline and the escrow comes back locked, rated as silence.
+   */
+  acceptedSeenAt?: string;
+  /** Mid-wait reminder sent (once) before falling back to provisional delivery. */
+  criteriaNudgeAt?: string;
+  /** Last time the buyer's chat added to the brief — drives post-delivery refresh. */
+  briefUpdatedAt?: string;
+  /** A refreshed shortlist was chatted after a post-delivery brief reply. Once only. */
+  refreshSentAt?: string;
 }
 
 export interface OkxEnvelope {
