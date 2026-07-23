@@ -58,19 +58,40 @@ if command -v okx-a2a >/dev/null 2>&1; then
   # never be able to stop the app from starting, whatever a future check decides
   # to do. If it trips, we boot anyway and the poller's own heartbeat re-checks
   # the channel within five minutes.
+  # Run it in the BACKGROUND and wait on the daemon, not on the process.
+  #
+  # The doctor does all of its real work in about six seconds — starts the
+  # daemon, refreshes agents — and then simply never exits. Waiting on the
+  # process therefore burned the entire timeout (~94 wasted seconds) on every
+  # single boot, for work that had already finished, and consumed most of the
+  # platform's two-minute healthcheck window while doing nothing.
+  #
+  # Killing the doctor is safe: the daemon it starts is a separate process that
+  # outlives it (confirmed in production — the poller found the daemon up after
+  # the doctor was stopped). The outer timeout is a backstop so the orphan
+  # cannot linger indefinitely.
+  doctor_log=/tmp/a2a-doctor.log
   if command -v timeout >/dev/null 2>&1; then
-    a2a_out="$(timeout 100 okx-a2a doctor --fix --non-interactive --json 2>&1)" || \
-      a2a_out="${a2a_out}
-[a2a] doctor exceeded its 100s budget and was stopped so the app could start."
+    timeout 170 okx-a2a doctor --fix --non-interactive --json >"$doctor_log" 2>&1 &
   else
-    a2a_out="$(okx-a2a doctor --fix --non-interactive --json 2>&1)"
+    okx-a2a doctor --fix --non-interactive --json >"$doctor_log" 2>&1 &
   fi
-  if echo "$a2a_out" | grep -q '"ready"[[:space:]]*:[[:space:]]*true'; then
-    echo "[a2a] communication ready"
-  else
-    echo "[a2a] communication NOT ready — marketplace polling will stay disabled; everything else works" >&2
-    # Surface the CLI's own diagnosis so the reason is visible in deploy logs.
-    echo "$a2a_out" | tail -20 >&2
+
+  # Block only until the thing we actually need is up: the XMTP daemon that
+  # carries deliverables. Typically ready in well under ten seconds.
+  waited=0
+  while [ "$waited" -lt 60 ]; do
+    if okx-a2a status 2>/dev/null | grep -qi running; then
+      echo "[a2a] XMTP daemon ready after ${waited}s"
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  if [ "$waited" -ge 60 ]; then
+    echo "[a2a] XMTP daemon did not come up within 60s — starting anyway; the poller re-checks it every 5 minutes and restarts it before any delivery." >&2
+    tail -20 "$doctor_log" >&2 2>/dev/null || true
   fi
 else
   echo "[a2a] okx-a2a not installed — marketplace polling will stay disabled; everything else works" >&2
