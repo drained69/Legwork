@@ -235,3 +235,32 @@ test('delivery: the deliver intent matches the format the buyer agent parses', (
   const msg = textDeliverIntent('0xabc', 'the goods');
   assert.equal(msg, ['[intent:deliver]', 'jobId: 0xabc', 'deliverableType: text', '- - -', 'the goods', '- - -'].join('\n'));
 });
+
+// ── CLI contract: the shape the live tool actually returns ────────────────
+
+test('delivery: retrievability is read from BOTH array shapes the CLI returns', async () => {
+  // Verified against the live CLI: a single-job query (`--job-id`, which is
+  // always what we send) returns `deliverables`, while the all-jobs listing
+  // returns `results`. Reading only `results` made deliverableRetrievable()
+  // return false UNCONDITIONALLY in production — so the retrievability check
+  // the empty-submission fix depends on never verified anything, and every
+  // delivery silently fell through to the XMTP repair path.
+  const { countDeliverables } = await import('../src/okx/marketplace.js');
+  assert.equal(countDeliverables({ deliverables: [{}] }), 1, 'single-job shape');
+  assert.equal(countDeliverables({ results: [{}, {}] }), 2, 'all-jobs shape');
+  assert.equal(countDeliverables({ deliverables: [] }), 0);
+  assert.equal(countDeliverables(undefined), 0);
+});
+
+test('delivery: a verified payload does NOT trigger a redundant XMTP re-send', async () => {
+  // The direct consequence of the key bug: because verification always failed,
+  // every successful delivery also re-sent the payload over XMTP.
+  setState({ retrievable: true });
+  const engagement = newEngagement('0xjob-noresend');
+
+  const res = await submitDeliverable(engagement, PAYLOAD, 'summary');
+
+  assert.equal(res.ok, true);
+  assert.notEqual(res.repaired, true, 'repair path must not run when the payload is verifiably there');
+  assert.equal(readState().sentMessages.length, 0, 'no duplicate delivery message');
+});

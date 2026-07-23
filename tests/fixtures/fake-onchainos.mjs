@@ -26,8 +26,9 @@ if (args[0] === '--version') {
   }
   console.log(JSON.stringify({ ok: true, data: { txHash: '0xdeadbeef' } }));
 } else if (cmd === 'task-deliverable-list') {
-  const results = state.retrievable ? [{ jobId: args[3], deliverableType: 'file' }] : [];
-  console.log(JSON.stringify({ ok: true, data: { results } }));
+  // Real CLI shape: a --job-id query returns `deliverables`, not `results`.
+  const deliverables = state.retrievable ? [{ jobId: args[3], deliverableType: 'file' }] : [];
+  console.log(JSON.stringify({ ok: true, data: { deliverables } }));
 } else {
   console.log(JSON.stringify({ ok: true, data: {} }));
 }

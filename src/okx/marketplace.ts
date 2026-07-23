@@ -314,8 +314,23 @@ export async function deliverTask(
  * the precise state that looks delivered on-chain and empty to the buyer.
  */
 export async function deliverableRetrievable(jobId: string): Promise<boolean> {
-  const res = await cli<{ results?: unknown[] }>(['task-deliverable-list', '--job-id', jobId, '--role', 'asp']);
-  return res.ok && (res.data?.results?.length ?? 0) > 0;
+  const res = await cli<{ deliverables?: unknown[]; results?: unknown[] }>([
+    'task-deliverable-list', '--job-id', jobId, '--role', 'asp',
+  ]);
+  if (!res.ok) return false;
+  // The CLI names this array differently depending on the mode: a single-job
+  // query (`--job-id`, which is always what we send) returns `deliverables`,
+  // while the all-jobs listing returns `results`. Reading only `results` meant
+  // this returned false unconditionally — so the retrievability check that the
+  // empty-submission fix depends on never actually verified anything, and every
+  // delivery fell through to the XMTP repair path. Verified against the live
+  // CLI: `--job-id` → {"data":{"deliverables":[]}}, no job id → {"results":[]}.
+  return countDeliverables(res.data) > 0;
+}
+
+/** Length of whichever array shape this CLI version returned. */
+export function countDeliverables(data: { deliverables?: unknown[]; results?: unknown[] } | undefined): number {
+  return (data?.deliverables?.length ?? 0) || (data?.results?.length ?? 0);
 }
 
 /**
