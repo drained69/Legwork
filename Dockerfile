@@ -64,11 +64,18 @@ ENV WALLET_HOME_ROOT=/data/wallets
 # Delivered payloads are dispute evidence: a buyer can contest long after a
 # redeploy would have cleared an ephemeral filesystem.
 ENV DATA_DIR=/data
+# The okx-a2a daemon's store — XMTP identity keys, per-job sessions, and the
+# BUYER'S CHAT HISTORY — defaults to $HOME/.okx-agent-task on the ephemeral
+# rootfs, so every redeploy silently discarded all three. That cost the buyer's
+# messages (their criteria live only here; inbound chat never reaches our HTTP
+# endpoint) and minted a fresh XMTP installation each deploy, which accumulates
+# against the per-inbox installation limit. Pin it to the volume.
+ENV OKX_AGENT_TASK_HOME=/data/okx-agent-task
 # Railway/Fly/Render terminate TLS in front of the container, so the last
 # X-Forwarded-For hop is written by their proxy and can be trusted as the
 # rate-limit identity. Never set this when the process is directly exposed.
 ENV TRUST_PROXY=true
-RUN mkdir -p /data/wallets /data/deliverables
+RUN mkdir -p /data/wallets /data/deliverables /data/okx-agent-task
 EXPOSE 8402
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
