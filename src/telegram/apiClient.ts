@@ -1,7 +1,17 @@
 import { config } from '../config.js';
 import { now, recordUsage, uid } from '../db.js';
+import { fetchWithTimeout } from '../http.js';
 import { engagementToken } from '../okx/server.js';
 import type { Engagement, Posting, Profile, ScoreBreakdown } from '../types.js';
+
+/**
+ * Deadlines. A user is watching a chat window, so "no reply ever" is the worst
+ * outcome: every call must end in either an answer or an explainable failure.
+ * A hunt scans several boards and scores each posting, so it gets the longest.
+ */
+const HUNT_TIMEOUT_MS = 90_000;
+const CALL_TIMEOUT_MS = 60_000;
+const PROBE_TIMEOUT_MS = 8_000;
 
 /**
  * Live API client used by the Telegram bot.
@@ -32,7 +42,7 @@ export interface ApiResult<T> {
 async function call<T>(
   path: string,
   body: unknown,
-  ctx: { profile?: Profile; engagement?: Engagement; service: string; priceUsd: string },
+  ctx: { profile?: Profile; engagement?: Engagement; service: string; priceUsd: string; timeoutMs?: number },
 ): Promise<ApiResult<T>> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
 
@@ -54,7 +64,11 @@ async function call<T>(
   let billing: string | undefined;
 
   try {
-    const res = await fetch(`${baseUrl()}${path}`, { method: 'POST', headers, body: JSON.stringify(body ?? {}) });
+    const res = await fetchWithTimeout(
+      `${baseUrl()}${path}`,
+      { method: 'POST', headers, body: JSON.stringify(body ?? {}) },
+      ctx.timeoutMs ?? CALL_TIMEOUT_MS,
+    );
     status = res.status;
     const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.ok && payload.ok !== false) {
@@ -115,6 +129,7 @@ export function huntViaApi(profile: Profile, engagement?: Engagement): Promise<A
     engagement,
     service: 'job-hunt',
     priceUsd: '0.05',
+    timeoutMs: HUNT_TIMEOUT_MS,
   });
 }
 
@@ -132,14 +147,22 @@ export function previewViaApi(profile: Profile): Promise<ApiResult<PreviewApiRes
 
 async function callFlat<T>(path: string, body: unknown, profile: Profile): Promise<ApiResult<T>> {
   try {
-    const res = await fetch(`${baseUrl()}${path}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(profile.wallet ? { 'x-user-wallet': profile.wallet } : {}),
+    const res = await fetchWithTimeout(
+      `${baseUrl()}${path}`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          // The free tier is rate-limited per client. This call originates
+          // from the bot over loopback, so without a per-user key every
+          // Telegram user would share a single 3/hour bucket.
+          'x-internal-client': `telegram:${profile.userId}`,
+          ...(profile.wallet ? { 'x-user-wallet': profile.wallet } : {}),
+        },
+        body: JSON.stringify(body ?? {}),
       },
-      body: JSON.stringify(body ?? {}),
-    });
+      HUNT_TIMEOUT_MS, // a preview runs the same scan, only trimmed on return
+    );
     const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     recordUsage({
       id: uid(), userId: profile.userId, wallet: profile.wallet, service: 'preview',
@@ -200,7 +223,7 @@ export async function fetchCatalog(): Promise<{
   payment?: { network: string; assetSymbol: string };
 } | null> {
   try {
-    const res = await fetch(`${baseUrl()}/api/services`);
+    const res = await fetchWithTimeout(`${baseUrl()}/api/services`, {}, PROBE_TIMEOUT_MS);
     if (!res.ok) return null;
     return (await res.json()) as never;
   } catch {
@@ -210,7 +233,7 @@ export async function fetchCatalog(): Promise<{
 
 export async function serviceHealthy(): Promise<boolean> {
   try {
-    const res = await fetch(`${baseUrl()}/health`);
+    const res = await fetchWithTimeout(`${baseUrl()}/health`, {}, PROBE_TIMEOUT_MS);
     return res.ok;
   } catch {
     return false;

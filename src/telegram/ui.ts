@@ -13,7 +13,35 @@ export const RULE = '━━━━━━━━━━━━━━━━━━━�
 
 /** Escape user/posting text before it enters an HTML-parsed message. */
 export function esc(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * A posting URL, safe to place inside href="…".
+ *
+ * `esc` covers text nodes but leaves `"` intact, so a scraped URL containing a
+ * quote would close the attribute and inject markup into the message — which
+ * Telegram then rejects outright, losing the whole card. Job-board URLs are
+ * untrusted input, so the scheme is checked too: only http(s) becomes a link,
+ * and anything else (javascript:, data:) is rendered as plain text.
+ */
+export function safeLink(url: string, label: string): string {
+  const raw = String(url ?? '').trim();
+  if (!/^https?:\/\//i.test(raw)) return esc(label);
+  const href = esc(raw).replace(/"/g, '&quot;');
+  return `<a href="${href}">${esc(label)}</a>`;
+}
+
+/**
+ * Cap a free-text field.
+ *
+ * Profile fields are rendered in full on one screen, so an unbounded paste
+ * makes `renderProfile` exceed Telegram's 4096-char limit — and since the
+ * value is stored, the profile view stays broken on every future open.
+ */
+export function capText(text: string, max: number): string {
+  const t = String(text ?? '').trim();
+  return t.length <= max ? t : t.slice(0, max);
 }
 
 export function title(text: string, subtitle?: string): string {
@@ -138,7 +166,10 @@ export function renderProfile(p: Profile): string {
   for (const section of PROFILE_SECTIONS) {
     const rows = section.fields
       .map((f) => {
-        const v = fieldValue(p, f);
+        // Truncate on display as well as on write: profiles saved before the
+        // write-side cap existed would otherwise still blow the message limit.
+        const raw = fieldValue(p, f);
+        const v = raw.length > 160 ? `${raw.slice(0, 160)}…` : raw;
         const display = f === 'wallet' && v ? `<code>${esc(v)}</code>` : esc(v || '—');
         return `<b>${PROFILE_FIELDS[f]}</b> · ${display}`;
       })
@@ -307,7 +338,7 @@ export function renderMatchCard(posting: Posting, b: ScoreBreakdown, index?: num
     axis('Level', b.seniority.score, b.seniority.max, b.seniority.reason),
     axis('Priorities', b.culture.score, b.culture.max, b.culture.reason),
     '',
-    `<a href="${esc(posting.url)}">View original posting</a>`,
+    safeLink(posting.url, 'View original posting'),
   ];
   return lines.join('\n');
 }

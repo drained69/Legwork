@@ -450,3 +450,20 @@ test('preview: with no trusted proxy, a forged X-Forwarded-For cannot mint free-
     config.okx.trustProxy = true;
   }
 });
+
+test('preview: loopback callers are keyed per user, not lumped together', async () => {
+  // The Telegram bot calls this API over loopback, so without a per-user key
+  // EVERY Telegram user shared one 3/hour bucket and the free preview died for
+  // everyone after three uses. A loopback caller is our own process, so its
+  // declared key is trustworthy in a way a remote caller's headers are not.
+  const call = (user: string) =>
+    fetch(`${base}/api/hunt/preview`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-internal-client': `telegram:${user}` },
+      body: JSON.stringify({ roles: ['engineer'], skills: ['typescript'] }),
+    });
+
+  for (let i = 0; i < 3; i++) assert.equal((await call('alice')).status, 200, `alice call ${i + 1}`);
+  assert.equal((await call('alice')).status, 429, 'alice exhausts her own quota');
+  assert.equal((await call('bob')).status, 200, 'bob must not inherit alice’s exhausted quota');
+});

@@ -332,8 +332,24 @@ function evictExpired(cutoff: number): void {
  * free tier without limit. Trust the socket peer, and only step one hop left
  * of it when a trusted proxy is actually in front of us.
  */
+/** Loopback callers are this process talking to itself (the Telegram bot). */
+function isLoopback(address: string): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
 function clientIp(req: IncomingMessage): string {
   const socketIp = req.socket.remoteAddress ?? 'unknown';
+
+  // The Telegram bot calls this API over loopback, so EVERY Telegram user
+  // arrived as 127.0.0.1 and they all shared one 3/hour bucket — the free
+  // preview stopped working for everyone after three uses in an hour. A
+  // loopback caller is our own process, so its declared per-user key is
+  // trustworthy in a way a remote caller's headers never are.
+  if (isLoopback(socketIp)) {
+    const key = req.headers['x-internal-client'];
+    if (typeof key === 'string' && key.length) return `internal:${key.slice(0, 100)}`;
+  }
+
   if (!config.okx.trustProxy) return socketIp;
   const fwd = req.headers['x-forwarded-for'];
   const chain = (Array.isArray(fwd) ? fwd.join(',') : fwd ?? '')

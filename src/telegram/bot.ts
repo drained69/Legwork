@@ -19,18 +19,18 @@ import {
   updateApplication,
 } from '../db.js';
 import { buildDigest } from '../digest.js';
-import { runScanCycle, type MatchCard } from '../pipeline.js';
+import { type MatchCard } from '../pipeline.js';
 import { resolveSubmissionTarget, submitApplication } from '../skills/applyExecutor.js';
 import { tailorApplication } from '../skills/applicationTailor.js';
-import { chunkMessage, formatShortlist, runHunt } from '../skills/jobHunt.js';
+import { send } from './send.js';
 import {
   PROFILE_FIELDS,
   PROFILE_SECTIONS,
   RULE,
   fieldValue,
   atsLabel,
+  capText,
   esc,
-  isEvmAddress,
   listingLabel,
   meter,
   money,
@@ -65,6 +65,20 @@ import type { Engagement, Profile } from '../types.js';
  */
 
 const HTML = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } };
+
+/**
+ * The sender's id, or null when the update carries no user.
+ *
+ * `ctx.from` is optional in the Telegram API — channel posts and anonymous
+ * group admins have none. `String(ctx.from?.id)` yielded the literal string
+ * "undefined", so every such update read and wrote ONE shared profile under
+ * that key: one anonymous user could see another's résumé and wallet. Handlers
+ * must bail when this returns null.
+ */
+function senderId(ctx: { from?: { id: number } }): string | null {
+  const id = ctx.from?.id;
+  return typeof id === 'number' ? String(id) : null;
+}
 
 // ── setup conversation ─────────────────────────────────────────────────────
 
@@ -154,6 +168,18 @@ function backHome(): InlineKeyboard {
 export function createBot(): Bot {
   const bot = new Bot(config.telegram.token);
 
+  /**
+   * Identity gate. Everything downstream keys storage on `ctx.from.id`, and an
+   * update without a sender (channel post, anonymous group admin) would key it
+   * on the string "undefined" — a single shared profile holding one user's
+   * résumé, wallet and engagement, readable by the next anonymous sender.
+   * Dropping those updates here means no handler can reintroduce the bug.
+   */
+  bot.use(async (ctx, next) => {
+    if (!senderId(ctx)) return;
+    await next();
+  });
+
   // Command list shown in Telegram's UI menu.
   void bot.api
     .setMyCommands([
@@ -184,21 +210,21 @@ export function createBot(): Bot {
     if (code) {
       const bound = getEngagementByCode(code);
       if (!bound) {
-        await ctx.reply(
+        await send(ctx.reply.bind(ctx),
           `${title('Link not recognised')}\n\nThat code is not valid or has expired. Open the link from your OKX task chat, or start a new engagement on the marketplace.`,
           HTML,
         );
         return;
       }
       if (['settled', 'disputed'].includes(bound.status) || (bound.endsAt && new Date(bound.endsAt) < new Date())) {
-        await ctx.reply(
+        await send(ctx.reply.bind(ctx),
           `${title('Engagement closed')}\n\nThis engagement has ended. Hire Legwork again on the OKX marketplace to start a new one.`,
           HTML,
         );
         return;
       }
       if (bound.userId && bound.userId !== userId) {
-        await ctx.reply(`${title('Already linked')}\n\nThis engagement is bound to a different Telegram account.`, HTML);
+        await send(ctx.reply.bind(ctx),`${title('Already linked')}\n\nThis engagement is bound to a different Telegram account.`, HTML);
         return;
       }
       bound.userId = userId;
@@ -210,7 +236,7 @@ export function createBot(): Bot {
     }
 
     const profile = getProfile(userId);
-    await ctx.reply(
+    await send(ctx.reply.bind(ctx),
       renderWelcome({
         firstName: ctx.from?.first_name ?? 'there',
         profile,
@@ -231,24 +257,24 @@ export function createBot(): Bot {
     const userId = String(ctx.from?.id);
     const p = getProfile(userId);
     const e = getEngagementByUser(userId);
-    await ctx.reply(menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) });
+    await send(ctx.reply.bind(ctx),menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) });
   });
 
   bot.command('usage', async (ctx) => showUsage(ctx, String(ctx.from?.id), getEngagementByUser(String(ctx.from?.id))));
   bot.command('services', async (ctx) => showCatalog(ctx));
 
-  bot.command('help', (ctx) => ctx.reply(helpText(), { ...HTML, reply_markup: backHome() }));
+  bot.command('help', (ctx) => send(ctx.reply.bind(ctx), helpText(), { ...HTML, reply_markup: backHome() }));
 
   bot.command('profile', async (ctx) => {
     const p = getProfile(String(ctx.from?.id));
     if (!p) return void (await promptSetup(ctx));
-    await ctx.reply(renderProfile(p), { ...HTML, reply_markup: new InlineKeyboard().text('Edit profile', 'profile:edit').text('‹ Back', 'nav:home') });
+    await send(ctx.reply.bind(ctx),renderProfile(p), { ...HTML, reply_markup: new InlineKeyboard().text('Edit profile', 'profile:edit').text('‹ Back', 'nav:home') });
   });
 
   bot.command('edit', async (ctx) => {
     const p = getProfile(String(ctx.from?.id));
     if (!p) return void (await promptSetup(ctx));
-    await ctx.reply(`${title('Edit profile', 'Choose a section')}`, { ...HTML, reply_markup: editSectionKeyboard() });
+    await send(ctx.reply.bind(ctx),`${title('Edit profile', 'Choose a section')}`, { ...HTML, reply_markup: editSectionKeyboard() });
   });
 
   bot.command('wallet', async (ctx) => showWallet(ctx, String(ctx.from?.id)));
@@ -258,7 +284,7 @@ export function createBot(): Bot {
     const e = getEngagementByUser(userId);
     const p = getProfile(userId);
     if (!e) {
-      return void (await ctx.reply(
+      return void (await send(ctx.reply.bind(ctx),
         `${title('No active engagement')}\n\nHire Legwork on the OKX marketplace to start one — your profile stays saved either way.`,
         { ...HTML, reply_markup: backHome() },
       ));
@@ -274,21 +300,21 @@ export function createBot(): Bot {
       '',
       esc(buildDigest(e)),
     ].filter(Boolean);
-    await ctx.reply(lines.join('\n'), { ...HTML, reply_markup: backHome() });
+    await send(ctx.reply.bind(ctx),lines.join('\n'), { ...HTML, reply_markup: backHome() });
   });
 
   bot.command('digest', async (ctx) => {
     const e = getEngagementByUser(String(ctx.from?.id));
-    if (!e) return void (await ctx.reply(`${title('No active engagement')}\n\nNothing to summarise yet.`, HTML));
-    await ctx.reply(`${title('Digest')}\n\n${esc(buildDigest(e))}`, { ...HTML, reply_markup: backHome() });
+    if (!e) return void (await send(ctx.reply.bind(ctx),`${title('No active engagement')}\n\nNothing to summarise yet.`, HTML));
+    await send(ctx.reply.bind(ctx),`${title('Digest')}\n\n${esc(buildDigest(e))}`, { ...HTML, reply_markup: backHome() });
   });
 
   bot.command('pause', async (ctx) => {
     const e = getEngagementByUser(String(ctx.from?.id));
-    if (!e) return void (await ctx.reply(`${title('No active engagement')}`, HTML));
+    if (!e) return void (await send(ctx.reply.bind(ctx),`${title('No active engagement')}`, HTML));
     e.status = 'paused';
     saveEngagement(e);
-    await ctx.reply(`${title('Paused')}\n\nScanning is on hold. Your profile and history are untouched — use /resume when ready.`, {
+    await send(ctx.reply.bind(ctx),`${title('Paused')}\n\nScanning is on hold. Your profile and history are untouched — use /resume when ready.`, {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Resume', 'nav:resume'),
     });
@@ -296,10 +322,10 @@ export function createBot(): Bot {
 
   bot.command('resume', async (ctx) => {
     const e = getEngagementByUser(String(ctx.from?.id));
-    if (!e) return void (await ctx.reply(`${title('No active engagement')}`, HTML));
+    if (!e) return void (await send(ctx.reply.bind(ctx),`${title('No active engagement')}`, HTML));
     e.status = 'active';
     saveEngagement(e);
-    await ctx.reply(`${title('Resumed')}\n\nScanning is live again.`, { ...HTML, reply_markup: mainMenu(getProfile(String(ctx.from?.id)), e) });
+    await send(ctx.reply.bind(ctx),`${title('Resumed')}\n\nScanning is live again.`, { ...HTML, reply_markup: mainMenu(getProfile(String(ctx.from?.id)), e) });
   });
 
   bot.command('hunt', async (ctx) => runHuntFlow(ctx, String(ctx.from?.id)));
@@ -316,7 +342,7 @@ export function createBot(): Bot {
       await ctx.answerCallbackQuery();
       const p = getProfile(userId);
       const e = getEngagementByUser(userId);
-      return void (await ctx.reply(menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) }));
+      return void (await send(ctx.reply.bind(ctx),menuText(p, e), { ...HTML, reply_markup: activityMenu(p, e) }));
     }
 
     // ── live API-backed activities ─────────────────────────────────────────
@@ -331,7 +357,7 @@ export function createBot(): Bot {
 
       switch (action) {
         case 'hunt_locked':
-          return void (await ctx.reply(
+          return void (await send(ctx.reply.bind(ctx),
             `${title('Hunt requires an active engagement')}\n\nHire Legwork on the OKX marketplace to unlock full ranked hunts, or run a free preview now.`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Free preview', 'act:preview').text('‹ Menu', 'menu:open') },
           ));
@@ -341,20 +367,20 @@ export function createBot(): Bot {
           return void (await runPreviewFlow(ctx, p!));
         case 'score': {
           setOnboarding(userId, 'act:score', {});
-          return void (await ctx.reply(
+          return void (await send(ctx.reply.bind(ctx),
             `${title('Score a posting', 'Live call · $0.01')}\n\nPaste the job posting — title, company and description. I will score it against your profile on the 100-point rubric.`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
           ));
         }
         case 'tailor': {
           if (!p!.resumeText) {
-            return void (await ctx.reply(
+            return void (await send(ctx.reply.bind(ctx),
               `${title('Résumé needed')}\n\nTailoring writes from your real experience only. Add your résumé first — it is stored and reused.`,
               { ...HTML, reply_markup: new InlineKeyboard().text('Add résumé', 'edit:resume').text('‹ Menu', 'menu:open') },
             ));
           }
           setOnboarding(userId, 'act:tailor', {});
-          return void (await ctx.reply(
+          return void (await send(ctx.reply.bind(ctx),
             `${title('Tailor an application', 'Live call · $0.10')}\n\nPaste the job posting — title, company and description. I will draft a tailored résumé, cover letter and application email.`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
           ));
@@ -376,7 +402,7 @@ export function createBot(): Bot {
       const p = getProfile(userId);
       if (!p) return void (await promptSetup(ctx));
       const rows = section.fields.map((f) => `<b>${PROFILE_FIELDS[f]}</b> · ${esc(fieldValue(p, f) || '—')}`).join('\n');
-      return void (await ctx.reply(`${title(section.label, 'Choose a field to update')}\n\n${rows}`, {
+      return void (await send(ctx.reply.bind(ctx),`${title(section.label, 'Choose a field to update')}\n\n${rows}`, {
         ...HTML,
         reply_markup: editFieldKeyboard(idx),
       }));
@@ -388,20 +414,20 @@ export function createBot(): Bot {
       const p = getProfile(userId);
       const e = getEngagementByUser(userId);
       if (action === 'home') {
-        return void (await ctx.reply(
+        return void (await send(ctx.reply.bind(ctx),
           renderWelcome({ firstName: ctx.from.first_name ?? 'there', profile: p, engagement: e, agentId: config.okx.agentId, returning: true }),
           { ...HTML, reply_markup: mainMenu(p, e) },
         ));
       }
-      if (action === 'help') return void (await ctx.reply(helpText(), { ...HTML, reply_markup: backHome() }));
+      if (action === 'help') return void (await send(ctx.reply.bind(ctx),helpText(), { ...HTML, reply_markup: backHome() }));
       if (action === 'status') {
-        if (!e) return void (await ctx.reply(`${title('No active engagement')}`, HTML));
-        return void (await ctx.reply(`${title('Engagement status')}\n\n${esc(buildDigest(e))}`, { ...HTML, reply_markup: backHome() }));
+        if (!e) return void (await send(ctx.reply.bind(ctx),`${title('No active engagement')}`, HTML));
+        return void (await send(ctx.reply.bind(ctx),`${title('Engagement status')}\n\n${esc(buildDigest(e))}`, { ...HTML, reply_markup: backHome() }));
       }
       if (action === 'resume' && e) {
         e.status = 'active';
         saveEngagement(e);
-        return void (await ctx.reply(`${title('Resumed')}\n\nScanning is live again.`, { ...HTML, reply_markup: mainMenu(p, e) }));
+        return void (await send(ctx.reply.bind(ctx),`${title('Resumed')}\n\nScanning is live again.`, { ...HTML, reply_markup: mainMenu(p, e) }));
       }
       return;
     }
@@ -409,7 +435,7 @@ export function createBot(): Bot {
     if (ns === 'setup') {
       await ctx.answerCallbackQuery();
       setOnboarding(userId, 'roles', {});
-      return void (await ctx.reply(askSetup('roles'), HTML));
+      return void (await send(ctx.reply.bind(ctx),askSetup('roles'), HTML));
     }
 
     if (ns === 'profile') {
@@ -417,13 +443,13 @@ export function createBot(): Bot {
       const p = getProfile(userId);
       if (!p) return void (await promptSetup(ctx));
       if (action === 'view') {
-        return void (await ctx.reply(renderProfile(p), {
+        return void (await send(ctx.reply.bind(ctx),renderProfile(p), {
           ...HTML,
           reply_markup: new InlineKeyboard().text('Edit profile', 'profile:edit').text('‹ Back', 'nav:home'),
         }));
       }
       if (action === 'edit') {
-        return void (await ctx.reply(title('Edit profile', 'Choose a section'), { ...HTML, reply_markup: editSectionKeyboard() }));
+        return void (await send(ctx.reply.bind(ctx),title('Edit profile', 'Choose a section'), { ...HTML, reply_markup: editSectionKeyboard() }));
       }
       return;
     }
@@ -432,14 +458,14 @@ export function createBot(): Bot {
       await ctx.answerCallbackQuery();
       if (action === 'cancel') {
         clearOnboarding(userId);
-        return void (await ctx.reply(`${title('Cancelled')}\n\nNothing was changed.`, { ...HTML, reply_markup: backHome() }));
+        return void (await send(ctx.reply.bind(ctx),`${title('Cancelled')}\n\nNothing was changed.`, { ...HTML, reply_markup: backHome() }));
       }
       const field = action as ProfileField;
       if (!(field in PROFILE_FIELDS)) return;
       setOnboarding(userId, `edit:${field}`, {});
       const p = getProfile(userId);
       const current = p ? fieldValue(p, field) || '—' : '—';
-      return void (await ctx.reply(
+      return void (await send(ctx.reply.bind(ctx),
         `${title(`Update ${PROFILE_FIELDS[field].toLowerCase()}`)}\n\n<b>Current</b>\n${esc(current)}\n\nSend the new value.${
           field === 'wallet' ? '\n<i>Your X Layer address, starting 0x.</i>' : ''
         }`,
@@ -452,7 +478,7 @@ export function createBot(): Bot {
       await ctx.answerCallbackQuery();
       const state = getOnboarding(userId);
       if (state?.step !== 'walletadopt') {
-        return void (await ctx.reply(`${title('Expired')}\n\nThat choice is no longer pending. Open /wallet to link again.`, { ...HTML, reply_markup: backHome() }));
+        return void (await send(ctx.reply.bind(ctx),`${title('Expired')}\n\nThat choice is no longer pending. Open /wallet to link again.`, { ...HTML, reply_markup: backHome() }));
       }
       const wallet = String(state.partial.wallet ?? '');
       const fromUserId = String(state.partial.fromUserId ?? '');
@@ -466,7 +492,7 @@ export function createBot(): Bot {
         loaded.walletEmail = walletEmail;
         saveProfile(loaded);
         audit('telegram', 'WALLET_PROFILE_ADOPTED', `wallet=${wallet} -> user=${userId}`);
-        return void (await ctx.reply(
+        return void (await send(ctx.reply.bind(ctx),
           `${title('Profile loaded', 'Restored from your wallet')}\n\n${renderProfile(loaded)}`,
           { ...HTML, reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
         ));
@@ -486,7 +512,7 @@ export function createBot(): Bot {
         saveProfile(current);
       }
       audit('telegram', 'WALLET_REBOUND', `wallet=${wallet} kept current profile of user=${userId}`);
-      return void (await ctx.reply(
+      return void (await send(ctx.reply.bind(ctx),
         `${title('Wallet linked')}\n\n<code>${esc(wallet)}</code> is now attached to your current profile. The wallet's previous profile was detached.`,
         { ...HTML, reply_markup: backHome() },
       ));
@@ -501,18 +527,18 @@ export function createBot(): Bot {
         // No live session (bot restarted, or the user never started one).
         if (state?.step !== 'wallet:pending' || !sessionId) return void (await beginWalletLogin(ctx, userId));
 
-        await ctx.reply(`${title('Checking with OKX')}`, HTML);
+        await send(ctx.reply.bind(ctx),`${title('Checking with OKX')}`, HTML);
         const res = await pollLogin(userId, sessionId);
 
         if (res.pending) {
-          return void (await ctx.reply(
+          return void (await send(ctx.reply.bind(ctx),
             `${title('Not signed in yet')}\n\nFinish signing in on the OKX page, then tap <b>I’ve signed in</b> again.`,
             { ...HTML, reply_markup: walletPendingKeyboard(String(state.partial.loginUrl ?? '')) },
           ));
         }
         if (!res.ok || !res.address) {
           clearOnboarding(userId);
-          return void (await ctx.reply(
+          return void (await send(ctx.reply.bind(ctx),
             `${title('Sign-in failed')}\n\n${esc(res.error ?? 'OKX could not confirm that sign-in.')}`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Start again', 'wallet:link').text('‹ Menu', 'nav:home') },
           ));
@@ -529,7 +555,7 @@ export function createBot(): Bot {
           p.updatedAt = now();
           saveProfile(p);
         }
-        return void (await ctx.reply(
+        return void (await send(ctx.reply.bind(ctx),
           `${title('Wallet disconnected')}\n\nYour OKX session on this bot has ended. Your wallet and funds are untouched — sign in again any time.`,
           { ...HTML, reply_markup: backHome() },
         ));
@@ -575,7 +601,7 @@ export function createBot(): Bot {
           const target = resolveSubmissionTarget(posting);
           const destination =
             target.method === 'email' ? `<b>To</b> · ${esc(target.to)}` : `<b>Via</b> · ${esc(atsLabel(posting.atsHint))} — ${esc(target.url)}`;
-          await ctx.reply(
+          await send(ctx.reply.bind(ctx),
             `${title('Final review', 'This is exactly what will be sent')}\n\n${destination}\n<b>Subject</b> · ${esc(draft.emailSubject)}\n\n${esc(
               draft.emailBody.slice(0, 2200),
             )}`,
@@ -595,7 +621,7 @@ export function createBot(): Bot {
           if (app.status !== 'approved') return void (await ctx.answerCallbackQuery({ text: `Cannot send (${app.status}).` }));
           await ctx.answerCallbackQuery({ text: 'Sending…' });
           const result = await submitApplication(app, profile, posting);
-          await ctx.reply(
+          await send(ctx.reply.bind(ctx),
             result.ok
               ? `${title('Application sent')}\n\n<b>${esc(posting.title)}</b>\n${esc(posting.company)}\n\n${esc(result.receipt ?? '')}`
               : `${title('Submission failed')}\n\n${esc(result.error ?? 'Unknown error')}`,
@@ -616,22 +642,22 @@ export function createBot(): Bot {
           const draft = app.draftId ? getDraft(app.draftId) : undefined;
           if (!draft) return void (await ctx.answerCallbackQuery({ text: 'Draft missing.' }));
           await ctx.answerCallbackQuery();
-          await ctx.reply(`${title('Tailored résumé', `Version ${draft.version}`)}\n\n${esc(draft.resumeText.slice(0, 3000))}`, HTML);
-          await ctx.reply(`${title('Cover letter')}\n\n${esc(draft.coverLetter.slice(0, 3000))}`, HTML);
+          await send(ctx.reply.bind(ctx),`${title('Tailored résumé', `Version ${draft.version}`)}\n\n${esc(draft.resumeText.slice(0, 3000))}`, HTML);
+          await send(ctx.reply.bind(ctx),`${title('Cover letter')}\n\n${esc(draft.coverLetter.slice(0, 3000))}`, HTML);
           break;
         }
         case 'revise': {
           if (app.status !== 'pending_approval') return void (await ctx.answerCallbackQuery({ text: `Locked (${app.status}).` }));
           await ctx.answerCallbackQuery();
           setOnboarding(app.userId, `feedback:${app.id}`, {});
-          await ctx.reply(`${title('Request changes')}\n\nTell me what to change and I will redraft it.`, HTML);
+          await send(ctx.reply.bind(ctx),`${title('Request changes')}\n\nTell me what to change and I will redraft it.`, HTML);
           break;
         }
         case 'skip': {
           if (app.status !== 'pending_approval') return void (await ctx.answerCallbackQuery({ text: `Already ${app.status}.` }));
           if (!extra) return;
           await ctx.answerCallbackQuery();
-          await ctx.reply(`${title('Skip this role')}\n\nWhy? This tunes future scoring.`, {
+          await send(ctx.reply.bind(ctx),`${title('Skip this role')}\n\nWhy? This tunes future scoring.`, {
             ...HTML,
             reply_markup: new InlineKeyboard()
               .text('Salary', `skip:reason:${app.id}|comp`)
@@ -657,7 +683,7 @@ export function createBot(): Bot {
       updateApplication(app);
       audit('telegram', 'SKIPPED', `app=${app.id} reason=${reason}`);
       await ctx.answerCallbackQuery({ text: 'Skipped' });
-      await ctx.reply(`${title('Skipped')}\n\nNoted — I will weight <i>${esc(reason)}</i> more heavily going forward.`, HTML);
+      await send(ctx.reply.bind(ctx),`${title('Skipped')}\n\nNoted — I will weight <i>${esc(reason)}</i> more heavily going forward.`, HTML);
       return;
     }
 
@@ -669,8 +695,23 @@ export function createBot(): Bot {
   bot.on('message:text', async (ctx) => {
     const userId = String(ctx.from.id);
     const state = getOnboarding(userId);
-    if (!state) return;
     const text = ctx.message.text.trim();
+
+    // Nothing pending: the bot used to return silently, so a user who typed
+    // "hi" — or pasted a posting without tapping a button first — got no
+    // response at all and had no way to tell a dead bot from a quiet one.
+    if (!state) {
+      if (looksLikeSecret(text)) return void (await send(ctx.reply.bind(ctx), secretWarning(), { ...HTML, reply_markup: backHome() }));
+      const p = getProfile(userId);
+      const e = getEngagementByUser(userId);
+      return void (await send(
+        ctx.reply.bind(ctx),
+        p
+          ? `${title('Not sure what to do with that')}\n\nI act on the buttons below rather than free text. Pick an action, or send /menu any time.`
+          : `${title('Let’s start with your profile')}\n\nOnce it is set up I can hunt, score and draft against it.`,
+        { ...HTML, reply_markup: p ? activityMenu(p, e) : new InlineKeyboard().text('Set up profile', 'setup:start') },
+      ));
+    }
 
     // Draft revision
     if (state.step.startsWith('feedback:')) {
@@ -679,9 +720,9 @@ export function createBot(): Bot {
       const app = getApplication(appId);
       const posting = app && getPosting(app.postingId);
       const profile = getProfile(userId);
-      if (!app || !posting || !profile) return void (await ctx.reply('That application is no longer available.'));
-      if (app.status !== 'pending_approval') return void (await ctx.reply(`This draft is locked — the application is ${app.status}.`));
-      await ctx.reply(`${title('Redrafting')}\n\nApplying your notes…`, HTML);
+      if (!app || !posting || !profile) return void (await send(ctx.reply.bind(ctx),'That application is no longer available.'));
+      if (app.status !== 'pending_approval') return void (await send(ctx.reply.bind(ctx),`This draft is locked — the application is ${app.status}.`));
+      await send(ctx.reply.bind(ctx),`${title('Redrafting')}\n\nApplying your notes…`, HTML);
       const draft = await tailorApplication(profile, posting, text);
       app.draftId = draft.id;
       updateApplication(app);
@@ -698,7 +739,7 @@ export function createBot(): Bot {
       }
       const posting = parsePosting(text);
       if (!posting) {
-        return void (await ctx.reply(
+        return void (await send(ctx.reply.bind(ctx),
           `${title('Could not read that posting')}\n\nInclude at least a job title, a company name and the description. Paste the posting text directly.`,
           { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
         ));
@@ -707,16 +748,16 @@ export function createBot(): Bot {
       const engagement = getEngagementByUser(userId);
 
       if (state.step === 'act:score') {
-        await ctx.reply(`${title('Scoring', 'Calling the live service')}`, HTML);
+        await send(ctx.reply.bind(ctx),`${title('Scoring', 'Calling the live service')}`, HTML);
         const res = await scoreViaApi(profile, posting, engagement);
         if (!res.ok) {
-          return void (await ctx.reply(`${title('Scoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+          return void (await send(ctx.reply.bind(ctx),`${title('Scoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
             ...HTML,
             reply_markup: backHome(),
           }));
         }
         const b = res.data!.breakdown;
-        return void (await ctx.reply(
+        return void (await send(ctx.reply.bind(ctx),
           `${title(posting.title, posting.company)}\n\n<b>${meter(b.total)}/100</b> — ${scoreVerdict(b.total)}\n\n` +
             `<b>Skills ${b.skills.score}/${b.skills.max}</b> — ${esc(b.skills.reason)}\n` +
             `<b>Salary ${b.comp.score}/${b.comp.max}</b> — ${esc(b.comp.reason)}\n` +
@@ -728,18 +769,18 @@ export function createBot(): Bot {
         ));
       }
 
-      await ctx.reply(`${title('Drafting', 'Calling the live service')}`, HTML);
+      await send(ctx.reply.bind(ctx),`${title('Drafting', 'Calling the live service')}`, HTML);
       const res = await tailorViaApi(profile, posting, engagement);
       if (!res.ok) {
-        return void (await ctx.reply(`${title('Tailoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+        return void (await send(ctx.reply.bind(ctx),`${title('Tailoring failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
           ...HTML,
           reply_markup: backHome(),
         }));
       }
       const d = res.data!;
-      await ctx.reply(`${title('Tailored résumé', posting.title)}\n\n${esc(d.resume.slice(0, 3000))}`, HTML);
-      await ctx.reply(`${title('Cover letter')}\n\n${esc(d.coverLetter.slice(0, 3000))}`, HTML);
-      return void (await ctx.reply(
+      await send(ctx.reply.bind(ctx),`${title('Tailored résumé', posting.title)}\n\n${esc(d.resume.slice(0, 3000))}`, HTML);
+      await send(ctx.reply.bind(ctx),`${title('Cover letter')}\n\n${esc(d.coverLetter.slice(0, 3000))}`, HTML);
+      return void (await send(ctx.reply.bind(ctx),
         `${title('Application email')}\n\n<b>Subject</b> · ${esc(d.emailSubject)}\n\n${esc(d.emailBody.slice(0, 2500))}\n\n${RULE}\n` +
           `<b>Billing</b> · ${res.billing === 'engagement' ? 'covered by your engagement' : '$0.10 per call'}\n` +
           `<i>Nothing has been sent — these drafts are yours to use.</i>`,
@@ -751,7 +792,7 @@ export function createBot(): Bot {
     // Nothing typed here can advance it, so nudge back to the button. The
     // secret-shaped guard stays: a user mid-sign-in may paste the wrong thing.
     if (state.step.startsWith('wallet:')) {
-      if (looksLikeSecret(text)) return void (await ctx.reply(secretWarning(), { ...HTML, reply_markup: backHome() }));
+      if (looksLikeSecret(text)) return void (await send(ctx.reply.bind(ctx),secretWarning(), { ...HTML, reply_markup: backHome() }));
       // Steps other than `pending` are from the retired email/OTP flow: a user
       // mid-sign-in across a deploy. Restart them rather than stranding them —
       // without this they fall through to a silent return and a dead chat.
@@ -759,7 +800,7 @@ export function createBot(): Bot {
         clearOnboarding(userId);
         return void (await beginWalletLogin(ctx, userId));
       }
-      return void (await ctx.reply(
+      return void (await send(ctx.reply.bind(ctx),
         `${title('Finish on the OKX page')}\n\nSigning in happens on OKX’s site — there is nothing to type here. ` +
           'Open the link, sign in, then tap <b>I’ve signed in</b>.',
         { ...HTML, reply_markup: walletPendingKeyboard(String(state.partial.loginUrl ?? '')) },
@@ -780,12 +821,12 @@ export function createBot(): Bot {
         return void (await promptSetup(ctx));
       }
       const applied = applyField(profile, field, text);
-      if (!applied.ok) return void (await ctx.reply(`${title('Invalid value')}\n\n${applied.error}`, HTML));
+      if (!applied.ok) return void (await send(ctx.reply.bind(ctx),`${title('Invalid value')}\n\n${applied.error}`, HTML));
       profile.updatedAt = now();
       saveProfile(profile);
       clearOnboarding(userId);
       audit('telegram', 'PROFILE_UPDATED', `user=${userId} field=${field}`);
-      await ctx.reply(
+      await send(ctx.reply.bind(ctx),
         `${title('Updated')}\n\n<b>${PROFILE_FIELDS[field]}</b>\n${esc(fieldValue(profile, field) || '—')}`,
         { ...HTML, reply_markup: new InlineKeyboard().text('Edit another', 'profile:edit').text('‹ Menu', 'nav:home') },
       );
@@ -797,13 +838,13 @@ export function createBot(): Bot {
     if (!SETUP_STEPS.includes(step)) return;
     const partial = state.partial;
     const validated = validateSetup(step, text);
-    if (!validated.ok) return void (await ctx.reply(`${title('Let me try that again')}\n\n${validated.error}`, HTML));
+    if (!validated.ok) return void (await send(ctx.reply.bind(ctx),`${title('Let me try that again')}\n\n${validated.error}`, HTML));
     Object.assign(partial, validated.patch);
 
     const next = SETUP_STEPS[SETUP_STEPS.indexOf(step) + 1];
     if (next) {
       setOnboarding(userId, next, partial);
-      return void (await ctx.reply(askSetup(next), HTML));
+      return void (await send(ctx.reply.bind(ctx),askSetup(next), HTML));
     }
 
     // Complete — persist and offer wallet linking.
@@ -835,7 +876,7 @@ export function createBot(): Bot {
     }
     audit('telegram', 'PROFILE_SAVED', `user=${userId}`);
 
-    await ctx.reply(
+    await send(ctx.reply.bind(ctx),
       `${renderProfile(profile)}\n\n${RULE}\nSaved. You will not be asked for this again — use <b>Edit profile</b> any time.`,
       {
         ...HTML,
@@ -846,7 +887,24 @@ export function createBot(): Bot {
     );
   });
 
-  bot.catch((err) => console.error('[telegram] error:', err));
+  /**
+   * Last line of defence. A handler that throws used to log and leave the user
+   * facing silence — indistinguishable from a dead bot, and with an inline
+   * keyboard still spinning if the callback was never answered. Close both.
+   */
+  bot.catch(async ({ error, ctx }) => {
+    console.error('[telegram] handler error:', error);
+    try {
+      // Clears the button's loading state; harmless if already answered.
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+      await ctx.reply(
+        `${title('Something went wrong')}\n\nThat action did not complete. Nothing was sent or charged — try again, or send /menu.`,
+        { ...HTML, reply_markup: backHome() },
+      );
+    } catch (replyErr) {
+      console.error('[telegram] could not deliver the error notice:', replyErr);
+    }
+  });
   return bot;
 }
 
@@ -855,7 +913,7 @@ export function createBot(): Bot {
 type Ctx = { reply: (text: string, other?: Record<string, unknown>) => Promise<unknown> };
 
 async function promptSetup(ctx: Ctx): Promise<void> {
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('No profile yet')}\n\nSet up your profile and I will start matching roles against it.`,
     { ...HTML, reply_markup: new InlineKeyboard().text('Set up profile', 'setup:start') },
   );
@@ -906,25 +964,25 @@ function walletPendingKeyboard(loginUrl: string): InlineKeyboard {
  */
 async function beginWalletLogin(ctx: Ctx, userId: string): Promise<void> {
   if (!(await walletCliAvailable())) {
-    return void (await ctx.reply(
+    return void (await send(ctx.reply.bind(ctx),
       `${title('Wallet sign-in unavailable')}\n\nThe OKX wallet service is not reachable from this deployment right now. ` +
         'Everything else — profile, hunts, scoring and drafts — works normally.',
       { ...HTML, reply_markup: backHome() },
     ));
   }
 
-  await ctx.reply(`${title('Contacting OKX', 'Preparing your sign-in link')}`, HTML);
+  await send(ctx.reply.bind(ctx),`${title('Contacting OKX', 'Preparing your sign-in link')}`, HTML);
   const session = await startLogin(userId);
   if (!session.ok || !session.loginUrl || !session.sessionId) {
     clearOnboarding(userId);
-    return void (await ctx.reply(
+    return void (await send(ctx.reply.bind(ctx),
       `${title('Could not start sign-in')}\n\n${esc(session.error ?? 'Unknown error')}`,
       { ...HTML, reply_markup: new InlineKeyboard().text('Try again', 'wallet:link').text('‹ Menu', 'nav:home') },
     ));
   }
 
   setOnboarding(userId, 'wallet:pending', { sessionId: session.sessionId, loginUrl: session.loginUrl });
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('Sign in at OKX', 'Then come back here')}\n\n` +
       '1. Open the OKX sign-in page below\n' +
       '2. Sign in with Google, Apple or email\n' +
@@ -960,7 +1018,8 @@ async function completeWalletConnection(
   const via = email || loginTypeLabel(loginType);
 
   const connected = (extra: string, kb: InlineKeyboard) =>
-    ctx.reply(
+    send(
+      ctx.reply.bind(ctx),
       `${title(isNew ? 'Wallet created' : 'Wallet connected', esc(via))}\n\n` +
         `<b>X Layer address</b>\n<code>${esc(address)}</code>\n\n${extra}`,
       { ...HTML, reply_markup: kb },
@@ -979,7 +1038,7 @@ async function completeWalletConnection(
   if (owner) {
     if (current) {
       setOnboarding(userId, 'walletadopt', { wallet: address, fromUserId: owner.userId, email });
-      return void (await ctx.reply(
+      return void (await send(ctx.reply.bind(ctx),
         `${title('This wallet already has a profile', esc(owner.name || 'Saved profile'))}\n\n` +
           `<code>${esc(address)}</code> carries an existing Legwork profile ` +
           `(${esc(owner.targetRoles.join(', ') || 'no roles set')}).\n\n` +
@@ -999,7 +1058,7 @@ async function completeWalletConnection(
     saveProfile(loaded);
     audit('telegram', 'WALLET_PROFILE_LOADED', `user=${userId}`);
     await connected('Your saved profile, history and engagements have been restored.', new InlineKeyboard());
-    return void (await ctx.reply(renderProfile(loaded), {
+    return void (await send(ctx.reply.bind(ctx),renderProfile(loaded), {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Run job hunt', 'act:hunt').text('‹ Menu', 'menu:open'),
     }));
@@ -1028,7 +1087,7 @@ async function completeWalletConnection(
   setOnboarding(userId, 'roles', {});
   audit('telegram', 'WALLET_LINKED_NEW', `user=${userId}`);
   await connected('Now let\u2019s set up the profile this wallet will carry.', new InlineKeyboard());
-  await ctx.reply(askSetup('roles'), HTML);
+  await send(ctx.reply.bind(ctx),askSetup('roles'), HTML);
 }
 
 async function showWallet(ctx: Ctx & { from?: { id: number } }, userId: string): Promise<void> {
@@ -1036,13 +1095,13 @@ async function showWallet(ctx: Ctx & { from?: { id: number } }, userId: string):
   const status = await walletStatus(userId);
 
   if (!status.loggedIn || !p?.wallet) {
-    return void (await ctx.reply(walletPrompt(), {
+    return void (await send(ctx.reply.bind(ctx),walletPrompt(), {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Get sign-in link', 'wallet:link').text('\u2039 Back', 'nav:home'),
     }));
   }
 
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('OKX Agentic Wallet', 'Connected')}\n\n` +
       `<b>Signed in as</b> · ${esc(status.email ?? p.walletEmail ?? loginTypeLabel(status.loginType))}\n` +
       `<b>X Layer address</b>\n<code>${esc(p.wallet)}</code>\n\n` +
@@ -1062,13 +1121,13 @@ async function runHuntFlow(ctx: Ctx, userId: string): Promise<void> {
   if (!profile) return void (await promptSetup(ctx));
   const engagement = getEngagementByUser(userId);
   if (!engagement) {
-    return void (await ctx.reply(
+    return void (await send(ctx.reply.bind(ctx),
       `${title('No active engagement')}\n\nA full ranked hunt needs an engagement from the OKX marketplace. You can run a free preview right now instead.`,
       { ...HTML, reply_markup: new InlineKeyboard().text('Free preview', 'act:preview').text('‹ Menu', 'menu:open') },
     ));
   }
   if (engagement.status === 'paused') {
-    return void (await ctx.reply(`${title('Engagement paused')}\n\nUse /resume to continue scanning.`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Engagement paused')}\n\nUse /resume to continue scanning.`, {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Resume', 'nav:resume'),
     }));
@@ -1076,40 +1135,40 @@ async function runHuntFlow(ctx: Ctx, userId: string): Promise<void> {
 
   const c = profileCompleteness(profile);
   if (c.missing.length) {
-    return void (await ctx.reply(`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Complete profile', 'profile:edit'),
     }));
   }
 
-  await ctx.reply(`${title('Hunting', 'Calling the live scoring service')}`, HTML);
+  await send(ctx.reply.bind(ctx),`${title('Hunting', 'Calling the live scoring service')}`, HTML);
 
   // LIVE call to Legwork's own public API — same endpoint external agents pay for.
   const res = await huntViaApi(profile, engagement);
   if (!res.ok) {
-    return void (await ctx.reply(`${title('Hunt failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Hunt failed')}\n\n${esc(res.error ?? 'Unknown error')}`, {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Try again', 'act:hunt').text('‹ Menu', 'menu:open'),
     }));
   }
   const data = res.data!;
   if (data.sourceErrors?.length) {
-    await ctx.reply(`${title('Partial results')}\n\nSome sources were unavailable: ${esc(data.sourceErrors.join('; '))}`, HTML);
+    await send(ctx.reply.bind(ctx),`${title('Partial results')}\n\nSome sources were unavailable: ${esc(data.sourceErrors.join('; '))}`, HTML);
   }
   if (!data.matches.length) {
-    return void (await ctx.reply(
+    return void (await send(ctx.reply.bind(ctx),
       `${title('No new matches')}\n\nEverything currently listed has already been shown to you. I keep scanning and will message you when something new appears.`,
       { ...HTML, reply_markup: backHome() },
     ));
   }
 
   for (const [i, m] of data.matches.entries()) {
-    await ctx.reply(renderMatchCard(m.posting, m.breakdown, i + 1, data.matches.length), {
+    await send(ctx.reply.bind(ctx),renderMatchCard(m.posting, m.breakdown, i + 1, data.matches.length), {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
     });
   }
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('Hunt complete')}\n\n<b>${data.matches.length}</b> matches from <b>${data.found}</b> postings scanned.\n` +
       `<b>Billing</b> · ${res.billing === 'engagement' ? 'covered by your engagement' : 'per-call'}` +
       (profile.wallet ? `\n<b>Wallet</b> · <code>${esc(shortAddress(profile.wallet))}</code>` : ''),
@@ -1120,22 +1179,22 @@ async function runHuntFlow(ctx: Ctx, userId: string): Promise<void> {
 async function runPreviewFlow(ctx: Ctx, profile: Profile): Promise<void> {
   const c = profileCompleteness(profile);
   if (c.missing.length) {
-    return void (await ctx.reply(`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Profile incomplete')}\n\nStill needed: <b>${esc(c.missing.join(', '))}</b>`, {
       ...HTML,
       reply_markup: new InlineKeyboard().text('Complete profile', 'profile:edit'),
     }));
   }
-  await ctx.reply(`${title('Free preview', 'Top 3 matches — no charge')}`, HTML);
+  await send(ctx.reply.bind(ctx),`${title('Free preview', 'Top 3 matches — no charge')}`, HTML);
   const res = await previewViaApi(profile);
   if (!res.ok) {
-    return void (await ctx.reply(`${title('Preview unavailable')}\n\n${esc(res.error ?? 'Unknown error')}`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Preview unavailable')}\n\n${esc(res.error ?? 'Unknown error')}`, {
       ...HTML,
       reply_markup: backHome(),
     }));
   }
   const d = res.data!;
   if (!d.matches?.length) {
-    return void (await ctx.reply(`${title('No matches right now')}\n\nNothing new matched your criteria this pass.`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('No matches right now')}\n\nNothing new matched your criteria this pass.`, {
       ...HTML,
       reply_markup: backHome(),
     }));
@@ -1146,7 +1205,7 @@ async function runPreviewFlow(ctx: Ctx, profile: Profile): Promise<void> {
       m.why.map((w) => `· ${esc(w)}`).join('\n') +
       `\n<a href="${esc(m.url)}">View posting</a>`,
   );
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('Preview results', `Showing ${d.shown} of ${d.totalMatches}`)}\n\n${lines.join('\n\n')}\n\n${RULE}\n` +
       `Previews left this hour · ${d.previewsRemainingThisHour}`,
     { ...HTML, reply_markup: new InlineKeyboard().text('Full ranked hunt', 'act:hunt').text('‹ Menu', 'menu:open') },
@@ -1157,14 +1216,14 @@ async function showUsage(ctx: Ctx, userId: string, engagement?: Engagement): Pro
   const records = listUsage(userId, 20);
   const profile = getProfile(userId);
   if (!records.length) {
-    return void (await ctx.reply(`${title('Usage & billing')}\n\nNo service calls yet.`, { ...HTML, reply_markup: backHome() }));
+    return void (await send(ctx.reply.bind(ctx),`${title('Usage & billing')}\n\nNo service calls yet.`, { ...HTML, reply_markup: backHome() }));
   }
   const covered = records.filter((r) => !r.paid).length;
   const rows = records
     .slice(0, 10)
     .map((r) => `${r.at.slice(0, 16).replace('T', ' ')} · ${esc(r.service)} · ${r.paid ? `$${r.priceUsd}` : 'engagement'} · ${r.status}`)
     .join('\n');
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('Usage & billing', `${records.length} recent calls`)}\n\n` +
       (profile?.wallet ? `<b>Wallet</b> · <code>${esc(profile.wallet)}</code>\n` : '') +
       (engagement ? `<b>Engagement</b> · ${esc(listingLabel(engagement.listing))}\n` : '') +
@@ -1176,7 +1235,7 @@ async function showUsage(ctx: Ctx, userId: string, engagement?: Engagement): Pro
 async function showCatalog(ctx: Ctx): Promise<void> {
   const [catalog, healthy] = await Promise.all([fetchCatalog(), serviceHealthy()]);
   if (!catalog) {
-    return void (await ctx.reply(`${title('Services unavailable')}\n\nCould not reach the service catalog.`, {
+    return void (await send(ctx.reply.bind(ctx),`${title('Services unavailable')}\n\nCould not reach the service catalog.`, {
       ...HTML,
       reply_markup: backHome(),
     }));
@@ -1184,7 +1243,7 @@ async function showCatalog(ctx: Ctx): Promise<void> {
   const rows = catalog.services
     .map((s) => `<b>${esc(s.id)}</b> · $${esc(s.priceUsd)} per call\n<code>${esc(s.endpoint)}</code>\n${esc(s.description)}`)
     .join('\n\n');
-  await ctx.reply(
+  await send(ctx.reply.bind(ctx),
     `${title('Services & pricing', healthy ? 'Live' : 'Service unreachable')}\n\n${rows}` +
       (catalog.freeTier ? `\n\n<b>Free tier</b> · ${esc(catalog.freeTier.endpoint)} — ${catalog.freeTier.limitPerHour}/hour` : '') +
       (catalog.payment ? `\n\n<b>Settlement</b> · ${esc(catalog.payment.assetSymbol)} on ${esc(catalog.payment.network)}` : ''),
@@ -1224,7 +1283,7 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
 
   switch (field) {
     // Identity & contact
-    case 'name': p.name = text; return { ok: true };
+    case 'name': p.name = capText(text, 100); return { ok: true };
     case 'email': {
       if (!/^[\w.+-]+@[\w-]+\.[\w.]+$/.test(text)) return { ok: false, error: 'That does not look like an email address.' };
       p.email = text.trim();
@@ -1235,13 +1294,13 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
       p.phone = text.trim();
       return { ok: true };
     }
-    case 'currentLocation': p.currentLocation = text.trim(); return { ok: true };
+    case 'currentLocation': p.currentLocation = capText(text, 120); return { ok: true };
     case 'wallet':
       // Wallet is never set from free text — it is proven via OKX sign-in.
       return { ok: false, error: 'Use <b>/wallet</b> to sign in with OKX — wallets cannot be typed in by hand.' };
 
     // Professional
-    case 'currentTitle': p.currentTitle = text.trim(); return { ok: true };
+    case 'currentTitle': p.currentTitle = capText(text, 120); return { ok: true };
     case 'yearsExperience': {
       const n = num();
       if (!Number.isFinite(n) || n < 0 || n > 60) return { ok: false, error: 'Send a number of years — for example <i>7</i>.' };
@@ -1263,10 +1322,12 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
     }
     case 'resume': {
       if (text.trim().length < 50) return { ok: false, error: 'Send your résumé text — at least a few sentences of real experience.' };
-      p.resumeText = text;
+      // Bounded because it is shipped to the tailoring API on every call; the
+      // scorer only reads the first 2000 characters anyway.
+      p.resumeText = capText(text, 20_000);
       return { ok: true };
     }
-    case 'education': p.education = text.trim(); return { ok: true };
+    case 'education': p.education = capText(text, 400); return { ok: true };
     case 'certifications': p.certifications = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
     case 'languages': p.languages = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
 
@@ -1309,7 +1370,7 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
     case 'dealbreakers': p.dealbreakers = text.toLowerCase() === 'none' ? [] : list(); return { ok: true };
 
     // Eligibility & availability
-    case 'workAuthorization': p.workAuthorization = text.trim(); return { ok: true };
+    case 'workAuthorization': p.workAuthorization = capText(text, 120); return { ok: true };
     case 'needsSponsorship': {
       const v = yesNo();
       if (v === undefined) return { ok: false, error: 'Reply <i>yes</i> or <i>no</i>.' };
@@ -1322,8 +1383,8 @@ function applyField(p: Profile, field: ProfileField, text: string): { ok: true }
       p.willingToRelocate = v;
       return { ok: true };
     }
-    case 'noticePeriod': p.noticePeriod = text.trim(); return { ok: true };
-    case 'availableFrom': p.availableFrom = text.trim(); return { ok: true };
+    case 'noticePeriod': p.noticePeriod = capText(text, 80); return { ok: true };
+    case 'availableFrom': p.availableFrom = capText(text, 80); return { ok: true };
   }
 }
 
@@ -1334,7 +1395,18 @@ function validateSetup(step: SetupStep, text: string): { ok: true; patch: Record
       if (!roles.length) return { ok: false, error: 'Send at least one role — for example <i>backend engineer</i>.' };
       return { ok: true, patch: { targetRoles: roles } };
     }
-    case 'seniority': return { ok: true, patch: { seniority: text.toLowerCase() } };
+    case 'seniority': {
+      // Validated to the same list the edit path enforces. Accepting free text
+      // here stored values the scorer cannot read (`SENIORITY_ORDER.indexOf`
+      // returns -1), so the level axis silently fell back to "mid" for the
+      // rest of the engagement — with the profile still displaying the word
+      // the user typed, so nothing looked wrong.
+      const t = text.trim().toLowerCase();
+      const allowed = ['intern', 'junior', 'mid', 'senior', 'staff', 'principal'];
+      const match = allowed.find((a) => a === t) ?? allowed.find((a) => t.includes(a));
+      if (!match) return { ok: false, error: `Choose one of: <i>${allowed.join(' · ')}</i>` };
+      return { ok: true, patch: { seniority: match } };
+    }
     case 'locations': {
       const locations = splitList(text);
       if (!locations.length) return { ok: false, error: 'Send at least one location, or <i>remote</i>.' };
@@ -1409,16 +1481,23 @@ function helpText(): string {
 
 export async function sendMatchCard(bot: Bot, chatId: number, card: MatchCard): Promise<void> {
   const { posting, breakdown, application } = card;
-  await bot.api.sendMessage(chatId, renderMatchCard(posting, breakdown), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: new InlineKeyboard()
-      .text('Approve & apply', `app:approve:${application.id}`)
-      .text('View draft', `app:draft:${application.id}`)
-      .row()
-      .text('Request changes', `app:revise:${application.id}`)
-      .text('Skip', `app:skip:${application.id}`),
-  });
+  // Routed through `send` like every other message: the scheduler pushes these
+  // unprompted, so a flood-control 429 or an unescapable posting title would
+  // otherwise drop a match the user never knew existed.
+  await send(
+    (text, other) => bot.api.sendMessage(chatId, text, other as never),
+    renderMatchCard(posting, breakdown),
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('Approve & apply', `app:approve:${application.id}`)
+        .text('View draft', `app:draft:${application.id}`)
+        .row()
+        .text('Request changes', `app:revise:${application.id}`)
+        .text('Skip', `app:skip:${application.id}`),
+    },
+  );
 }
 
 export { meter, scoreVerdict };
