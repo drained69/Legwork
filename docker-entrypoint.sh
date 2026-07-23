@@ -85,7 +85,25 @@ if command -v okx-a2a >/dev/null 2>&1; then
   # `doctor --fix` owns the rest (package version, daemon, runtime binding,
   # agent refresh). Trust its `ready` field, not its exit code: it can exit 0
   # while still reporting ready:false with an action the operator must take.
-  a2a_out="$(okx-a2a doctor --fix --json 2>&1)"
+  #
+  # `--non-interactive` is NOT optional here. Once a codex/claude provider is
+  # bound, the doctor gains a `provider_cli` check whose auto-fix LAUNCHES AN
+  # INTERACTIVE OAUTH LOGIN and blocks ~180s on a prompt no one can answer in a
+  # container. Because this runs before `exec "$@"`, that delay pushed the app
+  # past Railway's 2-minute healthcheck window and took the whole service down.
+  # The flag makes the check degrade to a manual instruction instead.
+  #
+  # The hard timeout is the belt to that suspenders: a bootstrap diagnostic must
+  # never be able to stop the app from starting, whatever a future check decides
+  # to do. If it trips, we boot anyway and the poller's own heartbeat re-checks
+  # the channel within five minutes.
+  if command -v timeout >/dev/null 2>&1; then
+    a2a_out="$(timeout 100 okx-a2a doctor --fix --non-interactive --json 2>&1)" || \
+      a2a_out="${a2a_out}
+[a2a] doctor exceeded its 100s budget and was stopped so the app could start."
+  else
+    a2a_out="$(okx-a2a doctor --fix --non-interactive --json 2>&1)"
+  fi
   if echo "$a2a_out" | grep -q '"ready"[[:space:]]*:[[:space:]]*true'; then
     echo "[a2a] communication ready"
   else
