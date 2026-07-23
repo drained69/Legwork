@@ -303,21 +303,42 @@ export async function deliverTask(
     return { submitted: false, contentVerified: false, error: res.error };
   }
 
-  const contentVerified = await deliverableRetrievable(jobId);
+  // Two independent facts, neither sufficient alone:
+  //  - savedLocally: the payload is in OUR manifest. Necessary (the repair path
+  //    needs the artifact) but NOT evidence the buyer got anything — it was
+  //    true for every delivery while the XMTP leg had a 100% failure rate.
+  //  - transportOk: the daemon actually accepted an outbound message for this
+  //    job. This is the leg the buyer experiences.
+  const savedLocally = await deliverableRetrievable(jobId);
+  const transportOk = await outboundTransportHealthy(jobId);
+  const contentVerified = savedLocally && transportOk;
   audit(
     'okx-marketplace',
     contentVerified ? 'DELIVERED_ONCHAIN' : 'DELIVERED_EMPTY',
-    `job=${jobId} contentVerified=${contentVerified}`,
+    `job=${jobId} savedLocally=${savedLocally} transportOk=${transportOk}`,
   );
   return { submitted: true, contentVerified };
 }
 
 /**
- * Is there a deliverable the buyer can actually retrieve for this job?
+ * Did any outbound XMTP message for this job actually leave?
  *
- * `deliver` persists the payload as its last step, so an empty list after a
- * successful submit means the payload legs (upload / xmtp) did not complete —
- * the precise state that looks delivered on-chain and empty to the buyer.
+ * Sends are queued: the CLI returns success as soon as the command is accepted,
+ * and the daemon may fail it milliseconds later. Session history is the record
+ * of what genuinely went out, so it — not an exit code — is what "the buyer can
+ * see this" rests on.
+ */
+async function outboundTransportHealthy(jobId: string): Promise<boolean> {
+  const res = await a2a(['session', 'query', '--job-id', jobId, '--json'], 20_000);
+  return res.ok && /sessionKey/.test(res.raw);
+}
+
+/**
+ * Is the payload recorded in OUR local deliverables manifest?
+ *
+ * This is a local ledger (`~/.onchainos/deliverables/<role>/<jobId>/`), not a
+ * window into the buyer's inbox. Treat it as "we still hold the artifact and
+ * can re-send it", never as "the buyer received it".
  */
 export async function deliverableRetrievable(jobId: string): Promise<boolean> {
   const res = await cli<{ deliverables?: unknown[]; results?: unknown[] }>([
@@ -375,6 +396,39 @@ export async function resendDeliverable(
 }
 
 /**
+ * Establish the local XMTP session for a job+counterparty.
+ *
+ * WITHOUT THIS EVERY OUTBOUND MESSAGE SILENTLY FAILS. The daemon resolves our
+ * local XMTP address from a session keyed `job:<id>:my:<us>:to:<them>`; with no
+ * session it rejects the queued command with "Cannot infer local XMTP address"
+ * — and because sends are queued asynchronously, the CLI has already returned
+ * success by then. Production ran with zero sessions and a 0% delivery rate
+ * while every call reported ok: the buyer's criteria request, the nudge, and
+ * the `[intent:deliver]` carrying the actual shortlist all died in the queue.
+ * `contact-user` opens the group on the backend but does not create this local
+ * mapping.
+ *
+ * Idempotent, and cheap enough to run before every send rather than tracking
+ * whether we have done it — the daemon's state does not survive a redeploy,
+ * and a missing session is invisible until a buyer reports silence.
+ */
+export async function ensureSession(jobId: string, toAgentId: string): Promise<{ ok: boolean; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  const found = await a2a(['session', 'find', '--job-id', jobId, '--to-agent-id', toAgentId, '--json'], 20_000);
+  if (found.ok && /sessionKey/.test(found.raw)) return { ok: true };
+
+  const created = await a2a([
+    'session', 'create',
+    '--job-id', jobId,
+    '--my-agent-id', config.okx.aspAgentId,
+    '--to-agent-id', toAgentId,
+    '--json',
+  ], 30_000);
+  audit('okx-marketplace', created.ok ? 'XMTP_SESSION_CREATED' : 'XMTP_SESSION_FAILED', `job=${jobId} to=${toAgentId} ${created.error ?? ''}`.trim());
+  return { ok: created.ok, error: created.error };
+}
+
+/**
  * Send a plain chat message to the buyer's agent in the task's XMTP group.
  *
  * Unlike `resendDeliverable` this carries no `[intent:deliver]` envelope — it
@@ -386,13 +440,24 @@ export async function chatToBuyer(
   toAgentId: string,
   message: string,
 ): Promise<{ ok: boolean; error?: string }> {
+  const session = await ensureSession(jobId, toAgentId);
+  if (!session.ok) {
+    audit('okx-marketplace', 'BUYER_CHAT_FAILED', `job=${jobId} no-session ${session.error ?? ''}`.trim());
+    return { ok: false, error: `no XMTP session: ${session.error}` };
+  }
+  // `session send` rather than `xmtp-send`: it targets the session directly and
+  // reports the delivery result, where `xmtp-send` queues the command and
+  // returns success before the daemon has tried — which is how a 100% failure
+  // rate looked like a 100% success rate for this agent's entire lifetime.
   const res = await a2a([
-    'xmtp-send',
+    'session', 'send',
     '--job-id', jobId,
     '--to-agent-id', toAgentId,
-    '--message', message,
+    '--content', message,
+    '--agent-id', config.okx.aspAgentId,
+    '--retry',
     '--json',
-  ]);
+  ], 60_000);
   audit('okx-marketplace', res.ok ? 'BUYER_CHAT_SENT' : 'BUYER_CHAT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
   return res;
 }

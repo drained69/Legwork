@@ -264,3 +264,51 @@ test('delivery: a verified payload does NOT trigger a redundant XMTP re-send', a
   assert.notEqual(res.repaired, true, 'repair path must not run when the payload is verifiably there');
   assert.equal(readState().sentMessages.length, 0, 'no duplicate delivery message');
 });
+
+// ── the silent-transport bug: no XMTP session, 100% send failure ──────────
+
+test('delivery: an outbound message establishes the XMTP session first', async () => {
+  // Production ran its entire lifetime with zero sessions. Every send was
+  // queued, reported ok, then rejected by the daemon with "Cannot infer local
+  // XMTP address" — so the criteria request, the nudge and the
+  // [intent:deliver] carrying the shortlist all died silently.
+  const { chatToBuyer } = await import('../src/okx/marketplace.js');
+  setState({ retrievable: true });
+
+  const res = await chatToBuyer('0xjob-session', '9001', 'hello buyer');
+
+  assert.equal(res.ok, true);
+  const s = readState();
+  assert.ok(s.calls.some((c) => c.startsWith('okx-a2a session create')), 'session created before sending');
+  assert.equal(s.sentMessages.length, 1, 'and the message actually went out');
+  assert.equal(s.sentMessages[0], 'hello buyer');
+});
+
+test('delivery: a send that cannot get a session reports failure, never false success', async () => {
+  const { chatToBuyer } = await import('../src/okx/marketplace.js');
+  setState({ retrievable: true, sessionCreateFails: true } as never);
+
+  const res = await chatToBuyer('0xjob-nosession', '9001', 'hello buyer');
+
+  assert.equal(res.ok, false, 'silent success here is what hid a 0% delivery rate');
+  assert.match(res.error ?? '', /session/i);
+  assert.equal(readState().sentMessages.length, 0);
+});
+
+test('delivery: nothing is submitted on-chain when the payload could not be routed', async () => {
+  // The submit is one-way. Submitting while the [intent:deliver] cannot leave
+  // produces exactly the empty submission the first buyer rejected.
+  setState({ retrievable: true, sessionCreateFails: true } as never);
+  const engagement = newEngagement('0xjob-unroutable');
+
+  const res = await submitDeliverable(engagement, PAYLOAD, 'summary');
+
+  assert.equal(res.submitted, false);
+  assert.equal(res.ok, false);
+  assert.match(res.error ?? '', /session/i);
+  assert.ok(
+    !readState().calls.some((c) => c.startsWith('onchainos agent deliver')),
+    'deliver must not run when its payload leg cannot succeed',
+  );
+  assert.equal(getEngagementById(engagement.id)?.deliveredAt, undefined, 'task stays deliverable');
+});

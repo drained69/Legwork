@@ -7,6 +7,7 @@ import {
   a2aDaemonUp,
   deliverTask,
   deliverableRetrievable,
+  ensureSession,
   resendDeliverable,
   startA2aDaemon,
 } from './marketplace.js';
@@ -63,6 +64,19 @@ export async function submitDeliverable(
 
   if (!(await payloadChannelReady(jobId))) {
     return { ok: false, submitted: false, error: 'XMTP channel down — deliverable held' };
+  }
+
+  // `deliver` sends the `[intent:deliver]` itself, and that send needs the same
+  // local session every other outbound message needs. Without it the payload
+  // leg dies in the daemon queue while the submit still lands — the exact empty
+  // submission a buyer rejects. Establish it BEFORE the one-way submit.
+  if (engagement.okxBuyerAgentId) {
+    const session = await ensureSession(jobId, engagement.okxBuyerAgentId);
+    if (!session.ok) {
+      console.error(`[okx-delivery] ${jobId}: no XMTP session (${session.error}) — holding rather than submitting a payload that cannot reach the buyer.`);
+      audit('okx-delivery', 'DELIVERY_HELD', `job=${jobId} reason=no-session`);
+      return { ok: false, submitted: false, error: `no XMTP session: ${session.error}` };
+    }
   }
 
   const file = await writeDeliverable(jobId, deliverable);
