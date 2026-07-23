@@ -35,19 +35,20 @@ if (args[0] === 'status') {
       : { ok: true, session: { sessionKey: `job:${jobId}:my:6658:to:9001` } }));
     if (state.sessionCreateFails) process.exitCode = 1;
   } else if (sub === 'send') {
-    // A send without a session is rejected, exactly as the daemon rejects it.
-    if (!state.sessions.includes(jobId)) {
-      console.log(JSON.stringify({ ok: false, error: 'Cannot infer local XMTP address; create a session for this job and toAgentId first' }));
-      process.exitCode = 1;
-    } else {
-      state.sentMessages.push(args[args.indexOf('--content') + 1]);
-      console.log(JSON.stringify({ ok: true }));
-    }
+    // Verified live: `session send` is AI DISPATCH, not outbound messaging —
+    // in a container with no AI CLI it always fails this way.
+    console.log(JSON.stringify({ ok: false, error: 'No supported AI CLI found. Install one of: codex, claude, hermes, openclaw.' }));
+    process.exitCode = 1;
   }
 } else if (args[0] === 'xmtp-send') {
-  // The real CLI QUEUES this and returns ok before the daemon has tried, so a
-  // send with no session reports success and then dies. Model that faithfully.
-  state.sentMessages.push(args[args.indexOf('--message') + 1]);
+  // Faithful to the daemon: the CLI queues and reports ok REGARDLESS, but the
+  // message only actually leaves when a session exists for the job. A test
+  // that asserts on sentMessages therefore proves the session precondition —
+  // this exact gap hid a 100% send-failure rate behind ok responses.
+  const jobId = args[args.indexOf('--job-id') + 1];
+  if ((state.sessions ?? []).includes(jobId)) {
+    state.sentMessages.push(args[args.indexOf('--message') + 1]);
+  }
   console.log(JSON.stringify({ ok: true }));
 }
 

@@ -384,6 +384,13 @@ export async function resendDeliverable(
   toAgentId: string,
   content: string,
 ): Promise<{ ok: boolean; error?: string }> {
+  // Same precondition as every outbound path: without the local session the
+  // daemon rejects the queued send after the CLI has already said ok.
+  const session = await ensureSession(jobId, toAgentId);
+  if (!session.ok) {
+    audit('okx-marketplace', 'DELIVERABLE_RESEND_FAILED', `job=${jobId} no-session ${session.error ?? ''}`.trim());
+    return { ok: false, error: `no XMTP session: ${session.error}` };
+  }
   const res = await a2a([
     'xmtp-send',
     '--job-id', jobId,
@@ -445,17 +452,19 @@ export async function chatToBuyer(
     audit('okx-marketplace', 'BUYER_CHAT_FAILED', `job=${jobId} no-session ${session.error ?? ''}`.trim());
     return { ok: false, error: `no XMTP session: ${session.error}` };
   }
-  // `session send` rather than `xmtp-send`: it targets the session directly and
-  // reports the delivery result, where `xmtp-send` queues the command and
-  // returns success before the daemon has tried — which is how a 100% failure
-  // rate looked like a 100% success rate for this agent's entire lifetime.
+  // `xmtp-send` IS the outbound path — verified live: with the session in
+  // place the daemon logs `outbound message-eligible … xmtp-send command
+  // completed` and the message reaches the buyer's group. (`session send`
+  // looks like the obvious upgrade but routes to the LOCAL AI dispatcher, not
+  // the counterparty — tested, it dies with "No supported AI CLI found".)
+  // The command is still queued, so ensureSession above is what makes the ok
+  // meaningful: with a session the queue's only failure modes are transport
+  // errors the daemon retries itself.
   const res = await a2a([
-    'session', 'send',
+    'xmtp-send',
     '--job-id', jobId,
     '--to-agent-id', toAgentId,
-    '--content', message,
-    '--agent-id', config.okx.aspAgentId,
-    '--retry',
+    '--message', message,
     '--json',
   ], 60_000);
   audit('okx-marketplace', res.ok ? 'BUYER_CHAT_SENT' : 'BUYER_CHAT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
