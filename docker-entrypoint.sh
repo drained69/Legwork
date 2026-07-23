@@ -39,8 +39,12 @@ if command -v okx-a2a >/dev/null 2>&1; then
   #
   # Idempotent, and the okx-a2a store lives outside the persistent volume, so
   # this must run on every boot rather than once at build time.
+  # `config provider` is the current spelling; `ai-provider set` is the one the
+  # doctor's own remediation still prints and is marked legacy. Try the modern
+  # form first so this keeps working if the legacy alias is ever dropped.
   a2a_provider="${OKX_A2A_PROVIDER:-claude}"
-  if okx-a2a ai-provider set --provider "$a2a_provider" >/dev/null 2>&1; then
+  if okx-a2a config provider --provider "$a2a_provider" >/dev/null 2>&1 ||
+     okx-a2a ai-provider set --provider "$a2a_provider" >/dev/null 2>&1; then
     echo "[a2a] default AI provider bound: $a2a_provider"
   else
     echo "[a2a] could not bind AI provider '$a2a_provider' — the doctor will report it below" >&2
