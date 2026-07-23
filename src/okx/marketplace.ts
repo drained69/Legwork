@@ -259,7 +259,13 @@ export async function applyForTask(
 export interface DeliverOutcome {
   /** The submit tx is on-chain. The task is now `submitted` and cannot be re-delivered. */
   submitted: boolean;
-  /** The payload is retrievable by the buyer — verified, not assumed. */
+  /**
+   * The deliver pipeline's payload legs completed — the CLI records the
+   * submitted copy in the local deliverables manifest only after the upload
+   * and XMTP send succeed, and `task-deliverable-list` reads that manifest.
+   * (It is a local ledger, not the buyer's inbox — their copy appears in
+   * THEIR manifest when their agent processes the [intent:deliver].)
+   */
   contentVerified: boolean;
   error?: string;
 }

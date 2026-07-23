@@ -32,7 +32,14 @@ import {
  */
 
 export interface DeliveryResult {
-  /** The buyer can retrieve the payload — verified against the backend. */
+  /**
+   * Every leg of the deliver pipeline completed on our side: file persisted to
+   * the local deliverables manifest, [intent:deliver] queued over XMTP, submit
+   * on-chain. Verified via `task-deliverable-list`, which reads the manifest —
+   * the CLI writes it only after the earlier legs succeed. NOT proof the buyer
+   * has opened it: XMTP is store-and-forward, and their side of the ledger is
+   * theirs. The repair path re-sends the payload for exactly that reason.
+   */
   ok: boolean;
   /** The submit tx landed. The task has left `accepted` for good. */
   submitted: boolean;
