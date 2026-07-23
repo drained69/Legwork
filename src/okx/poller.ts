@@ -101,12 +101,24 @@ export async function startMarketplacePoller(deps: PollerDeps): Promise<PollerHa
     );
     return null;
   }
-  commsReady = gate.communication;
+  // Ask the daemon directly rather than trusting gate-check's `communication`.
+  //
+  // That flag mirrors `okx-a2a doctor`, which fails on `provider_binding` —
+  // whether a local AI CLI (Claude Code, Codex, …) is configured for prompt
+  // dispatch. This deployment never dispatches prompts: inbound A2A arrives at
+  // our own endpoint and the poller drives the lifecycle. So the flag reported
+  // chat as down while XMTP was healthy and sending fine, needlessly
+  // suppressing buyer greetings and cold-start discovery at every boot.
+  // `a2aDaemonUp` tests the thing that actually carries messages.
+  commsReady = await a2aDaemonUp().catch(() => false);
   if (!commsReady) {
     console.warn(
-      '[okx-poller] A2A chat is unavailable — claiming still runs so tasks do not expire, but the buyer greeting is skipped ' +
-        'and negotiation messages will not be delivered. Fix with `okx-a2a doctor --fix`.',
+      '[okx-poller] XMTP daemon is not responding — claiming still runs so tasks do not expire, but the buyer greeting ' +
+        'is skipped and negotiation messages will not be delivered. Re-checked every 5 minutes; fix with `okx-a2a doctor --fix`.',
     );
+  } else if (!gate.communication) {
+    // Worth one line: the two disagree, and the daemon is the one that matters.
+    console.log('[okx-poller] XMTP daemon is up (gate-check reports otherwise — it also gates on local AI-CLI config, which this deployment does not use).');
   }
   if (gate.agentId && gate.agentId !== config.okx.aspAgentId) {
     console.warn(`[okx-poller] configured OKX_ASP_AGENT_ID=${config.okx.aspAgentId} but the signed-in identity is ${gate.agentId}.`);
