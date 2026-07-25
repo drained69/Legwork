@@ -32,7 +32,7 @@ process.env.OKX_ONCHAINOS_HOME = '';
 
 const { saveEngagement, getEngagementById } = await import('../src/db.js');
 const { submitDeliverable, repairDeliverable } = await import('../src/okx/delivery.js');
-const { textDeliverIntent } = await import('../src/okx/marketplace.js');
+const { textDeliverIntent, fileDeliverIntent, uploadFileDeliverable, a2aDeliveryMessageBroadcast } = await import('../src/okx/marketplace.js');
 const { uid } = await import('../src/db.js');
 const type = await import('../src/types.js');
 
@@ -132,9 +132,9 @@ test('delivery: a submit with no retrievable payload is repaired over XMTP, not 
   assert.equal(res.ok, true);
 
   const sent = readState().sentMessages;
-  assert.equal(sent.length, 1, 'exactly one re-send');
-  assert.ok(sent[0].startsWith('[intent:deliver]'), 'the re-send is a protocol message the buyer agent routes');
-  assert.ok(sent[0].includes(PAYLOAD), 'the re-send carries the actual content');
+  assert.ok(sent.length >= 1, 'at least one XMTP message sent');
+  assert.ok(sent[0].startsWith('[intent:deliver]'), 'the send is a protocol message the buyer agent routes');
+  assert.ok(sent[0].includes(PAYLOAD) || sent[0].includes('fileKey:'), 'the send carries the actual content');
 });
 
 test('delivery: repair is skipped when the payload turns out to have landed', async () => {
@@ -252,9 +252,9 @@ test('delivery: retrievability is read from BOTH array shapes the CLI returns', 
   assert.equal(countDeliverables(undefined), 0);
 });
 
-test('delivery: a verified payload does NOT trigger a redundant XMTP re-send', async () => {
-  // The direct consequence of the key bug: because verification always failed,
-  // every successful delivery also re-sent the payload over XMTP.
+test('delivery: a verified payload sends exactly one XMTP delivery message without triggering repair', async () => {
+  // Now deliverTask explicitly uploads and sends the XMTP [intent:deliver] message
+  // right after on-chain submit, confirming delivery without extra repair loops.
   setState({ retrievable: true });
   const engagement = newEngagement('0xjob-noresend');
 
@@ -262,7 +262,8 @@ test('delivery: a verified payload does NOT trigger a redundant XMTP re-send', a
 
   assert.equal(res.ok, true);
   assert.notEqual(res.repaired, true, 'repair path must not run when the payload is verifiably there');
-  assert.equal(readState().sentMessages.length, 0, 'no duplicate delivery message');
+  assert.equal(readState().sentMessages.length, 1, 'exactly one XMTP delivery message sent');
+  assert.ok(readState().sentMessages[0].includes('[intent:deliver]'));
 });
 
 // ── the silent-transport bug: no XMTP session, 100% send failure ──────────
@@ -311,4 +312,59 @@ test('delivery: nothing is submitted on-chain when the payload could not be rout
     'deliver must not run when its payload leg cannot succeed',
   );
   assert.equal(getEngagementById(engagement.id)?.deliveredAt, undefined, 'task stays deliverable');
+});
+
+test('delivery: file deliver intent format matches OKX A2A specification', () => {
+  const intent = fileDeliverIntent('0x123', {
+    fileKey: '0x123/key-456',
+    digest: 'digest789',
+    salt: 'saltabc',
+    nonce: 'noncedef',
+    secret: 'secretxyz',
+    filename: 'report.md',
+  });
+  assert.equal(
+    intent,
+    [
+      '[intent:deliver]',
+      'jobId: 0x123',
+      'deliverableType: file',
+      'fileKey: 0x123/key-456',
+      'digest: digest789',
+      'salt: saltabc',
+      'nonce: noncedef',
+      'secret: secretxyz',
+      'filename: report.md',
+    ].join('\n'),
+  );
+});
+
+test('delivery: uploadFileDeliverable uploads attachment via okx-a2a file upload', async () => {
+  setState({ retrievable: true });
+  const samplePath = join(workDir, 'sample.md');
+  writeFileSync(samplePath, PAYLOAD);
+  const res = await uploadFileDeliverable(samplePath, '0xjob-upload');
+  assert.equal(res.ok, true);
+  assert.equal(res.data?.fileKey, '0xjob-upload/key-123');
+  assert.equal(res.data?.digest, 'digest123');
+  const calls = readState().calls;
+  assert.ok(calls.some((c) => c.includes('okx-a2a file upload --file-path')));
+});
+
+test('delivery: a2aDeliveryMessageBroadcast checks session history for deliver intent', async () => {
+  setState({ retrievable: true });
+  const jobId = '0xjob-broadcast';
+  const engagement = newEngagement(jobId);
+  await submitDeliverable(engagement, PAYLOAD, 'summary');
+  const isBroadcast = await a2aDeliveryMessageBroadcast(jobId, engagement.okxBuyerAgentId);
+  assert.equal(isBroadcast, true, 'delivery message present in session history');
+});
+
+test('delivery: extracts buyer communication address from task details when missing on engagement', async () => {
+  const { extractCounterpartyAgentId } = await import('../src/okx/marketplace.js');
+  const address = '0x80f831639b0B8E27aA77195CdD10A5313926A19E';
+  assert.equal(extractCounterpartyAgentId({ counterpartyAgentId: address }), address);
+  assert.equal(extractCounterpartyAgentId({ buyerAddress: address }), address);
+  assert.equal(extractCounterpartyAgentId({ creatorAddress: address }), address);
+  assert.equal(extractCounterpartyAgentId({ buyerAgentId: address }), address);
 });

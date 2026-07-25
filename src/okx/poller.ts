@@ -818,6 +818,10 @@ function upsertEngagement(task: MarketplaceTask): Engagement {
       existing.brief = task.description;
       changed = true;
     }
+    if (task.counterpartyAgentId && existing.okxBuyerAgentId !== task.counterpartyAgentId) {
+      existing.okxBuyerAgentId = task.counterpartyAgentId;
+      changed = true;
+    }
     if (changed) saveEngagement(existing);
     return existing;
   }

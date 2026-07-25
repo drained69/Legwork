@@ -132,6 +132,18 @@ export interface MarketplaceTask {
 
 // ── read paths ─────────────────────────────────────────────────────────────
 
+export function extractCounterpartyAgentId(t: Record<string, unknown>): string | undefined {
+  const val =
+    t.counterpartyAgentId ??
+    t.buyerAgentId ??
+    t.buyerAddress ??
+    t.creatorAddress ??
+    t.creatorAgentId ??
+    t.senderAddress ??
+    t.userAddress;
+  return val ? String(val) : undefined;
+}
+
 /**
  * Tasks where THIS account is the provider — the ones that expire if we do
  * nothing. Returns JSON, so this is the poller's primary source of truth.
@@ -150,7 +162,7 @@ export async function activeTasks(): Promise<{ ok: boolean; tasks: MarketplaceTa
       status: t.status ? String(t.status) : undefined,
       tokenAmount: t.tokenAmount ? String(t.tokenAmount) : undefined,
       tokenSymbol: t.tokenSymbol ? String(t.tokenSymbol) : undefined,
-      counterpartyAgentId: t.counterpartyAgentId ? String(t.counterpartyAgentId) : undefined,
+      counterpartyAgentId: extractCounterpartyAgentId(t),
       myAgentId: t.myAgentId ? String(t.myAgentId) : undefined,
       // active-tasks only ever returns tasks already routed to this agent.
       designated: true,
@@ -208,11 +220,26 @@ export function parseRecommendedTasks(raw: string): MarketplaceTask[] {
 }
 
 /** Full detail for one task — used to read the buyer's brief before working. */
-export async function taskDetail(jobId: string): Promise<{ ok: boolean; raw: string; error?: string }> {
+export async function taskDetail(jobId: string): Promise<{ ok: boolean; task?: MarketplaceTask; raw: string; error?: string }> {
   const args = ['status', jobId];
   if (config.okx.aspAgentId) args.push('--agent-id', config.okx.aspAgentId);
-  const res = await cli<unknown>(args);
-  return { ok: res.ok, raw: res.raw, error: res.error };
+  const res = await cli<Record<string, unknown>>(args);
+  if (!res.ok) return { ok: false, raw: res.raw, error: res.error };
+  const d = res.data ?? {};
+  const counterpartyAgentId = extractCounterpartyAgentId(d);
+  const task: MarketplaceTask = {
+    jobId: String(d.jobId ?? jobId),
+    title: String(d.title ?? ''),
+    statusCode: Number(d.statusCode ?? -1),
+    status: d.status ? String(d.status) : undefined,
+    tokenAmount: d.tokenAmount ? String(d.tokenAmount) : undefined,
+    tokenSymbol: d.tokenSymbol ? String(d.tokenSymbol) : undefined,
+    counterpartyAgentId,
+    myAgentId: d.myAgentId ? String(d.myAgentId) : undefined,
+    description: d.description ? String(d.description) : undefined,
+    designated: true,
+  };
+  return { ok: true, task, raw: res.raw };
 }
 
 // ── write paths ────────────────────────────────────────────────────────────
@@ -261,10 +288,8 @@ export interface DeliverOutcome {
   submitted: boolean;
   /**
    * The deliver pipeline's payload legs completed — the CLI records the
-   * submitted copy in the local deliverables manifest only after the upload
-   * and XMTP send succeed, and `task-deliverable-list` reads that manifest.
-   * (It is a local ledger, not the buyer's inbox — their copy appears in
-   * THEIR manifest when their agent processes the [intent:deliver].)
+   * submitted copy in the local deliverables manifest, and the [intent:deliver]
+   * message (with encrypted file envelope or inline text) was sent and verified in XMTP stream.
    */
   contentVerified: boolean;
   error?: string;
@@ -273,21 +298,25 @@ export interface DeliverOutcome {
 /**
  * Submit the deliverable. Only valid while the task is `accepted`.
  *
- * `agent deliver` does FOUR things behind one exit code: upload the file,
- * xmtp-send `[intent:deliver]` to the buyer, submit on-chain, and save locally.
- * The on-chain leg can succeed while the XMTP leg silently fails (daemon down),
- * which the buyer experiences as a task that reached `submitted` with nothing
- * in it — an empty submission they then reject, with no escrow ever funded.
- *
- * So a zero exit code is NOT proof of delivery. Every call verifies that the
- * payload actually landed, and reports the two legs separately so the caller
- * can repair the payload leg without re-submitting on-chain.
+ * `agent deliver` submits on-chain. Immediately after calling deliver(), this
+ * ALSO uploads the deliverable file attachment via `uploadFileDeliverable` to get
+ * the full encrypted file envelope (fileKey, digest, salt, nonce, secret) or text intent,
+ * sends the XMTP `[intent:deliver]` message to the buyer communication address, and confirms
+ * broadcast receipt in XMTP session history.
  */
 export async function deliverTask(
   jobId: string,
-  opts: { file: string; message: string },
+  opts: { file: string; message: string; toAgentId?: string; content?: string },
 ): Promise<DeliverOutcome> {
   if (!config.okx.aspAgentId) return { submitted: false, contentVerified: false, error: 'OKX_ASP_AGENT_ID not set' };
+
+  let toAgentId = opts.toAgentId;
+  if (!toAgentId) {
+    const detail = await taskDetail(jobId);
+    if (detail.ok && detail.task?.counterpartyAgentId) {
+      toAgentId = detail.task.counterpartyAgentId;
+    }
+  }
 
   const res = await cli<unknown>([
     'deliver', jobId,
@@ -303,34 +332,58 @@ export async function deliverTask(
     return { submitted: false, contentVerified: false, error: res.error };
   }
 
-  // Two independent facts, neither sufficient alone:
-  //  - savedLocally: the payload is in OUR manifest. Necessary (the repair path
-  //    needs the artifact) but NOT evidence the buyer got anything — it was
-  //    true for every delivery while the XMTP leg had a 100% failure rate.
-  //  - transportOk: the daemon actually accepted an outbound message for this
-  //    job. This is the leg the buyer experiences.
-  const savedLocally = await deliverableRetrievable(jobId);
-  const transportOk = await outboundTransportHealthy(jobId);
-  const contentVerified = savedLocally && transportOk;
-  audit(
-    'okx-marketplace',
-    contentVerified ? 'DELIVERED_ONCHAIN' : 'DELIVERED_EMPTY',
-    `job=${jobId} savedLocally=${savedLocally} transportOk=${transportOk}`,
-  );
+  console.log(`[okx-marketplace] ${jobId}: on-chain submit landed.`);
+
+  let contentVerified = false;
+  if (toAgentId) {
+    let fileMeta: FileDeliverMeta | undefined;
+    if (opts.file) {
+      const uploadRes = await uploadFileDeliverable(opts.file, jobId);
+      if (uploadRes.ok && uploadRes.data) {
+        fileMeta = uploadRes.data;
+        console.log(`[okx-marketplace] ${jobId}: uploaded file deliverable attachment key=${fileMeta.fileKey}`);
+      } else if (uploadRes.error) {
+        console.warn(`[okx-marketplace] ${jobId}: file upload notice (${uploadRes.error}), falling back to text deliver intent if needed`);
+      }
+    }
+
+    const deliverContent = opts.content ?? opts.message;
+    let sendRes = await resendDeliverable(jobId, toAgentId, deliverContent, fileMeta);
+    let broadcastOk = await a2aDeliveryMessageBroadcast(jobId, toAgentId);
+
+    if (!sendRes.ok || !broadcastOk) {
+      console.warn(`[okx-marketplace] ${jobId}: initial XMTP deliver message send (ok=${sendRes.ok}, broadcast=${broadcastOk}) incomplete — retrying...`);
+      sendRes = await resendDeliverable(jobId, toAgentId, deliverContent, fileMeta);
+      broadcastOk = await a2aDeliveryMessageBroadcast(jobId, toAgentId);
+    }
+
+    const savedLocally = await deliverableRetrievable(jobId);
+    contentVerified = savedLocally && sendRes.ok && broadcastOk;
+
+    console.log(
+      `[okx-marketplace] ${jobId}: XMTP deliver message send result to ${toAgentId}: ok=${sendRes.ok}, broadcastConfirmed=${broadcastOk}, savedLocally=${savedLocally}`,
+    );
+    audit(
+      'okx-marketplace',
+      contentVerified ? 'DELIVERED_ONCHAIN' : 'DELIVERED_EMPTY',
+      `job=${jobId} to=${toAgentId} savedLocally=${savedLocally} sendOk=${sendRes.ok} broadcastOk=${broadcastOk}`,
+    );
+  } else {
+    console.error(`[okx-marketplace] ${jobId}: on-chain submit landed BUT missing buyer communication address / agent ID — cannot send XMTP deliver message!`);
+    audit('okx-marketplace', 'DELIVERED_UNROUTABLE', `job=${jobId}`);
+  }
+
   return { submitted: true, contentVerified };
 }
 
 /**
- * Did any outbound XMTP message for this job actually leave?
- *
- * Sends are queued: the CLI returns success as soon as the command is accepted,
- * and the daemon may fail it milliseconds later. Session history is the record
- * of what genuinely went out, so it — not an exit code — is what "the buyer can
- * see this" rests on.
+ * Has an [intent:deliver] message for this job actually been broadcast into the XMTP session stream?
  */
-async function outboundTransportHealthy(jobId: string): Promise<boolean> {
-  const res = await a2a(['session', 'query', '--job-id', jobId, '--json'], 20_000);
-  return res.ok && /sessionKey/.test(res.raw);
+export async function a2aDeliveryMessageBroadcast(jobId: string, toAgentId?: string): Promise<boolean> {
+  if (!toAgentId) return false;
+  const hist = await chatHistory(jobId, toAgentId);
+  if (!hist.ok) return false;
+  return hist.messages.some((m) => m.content.includes('[intent:deliver]') && m.content.includes(jobId));
 }
 
 /**
@@ -345,19 +398,70 @@ export async function deliverableRetrievable(jobId: string): Promise<boolean> {
     'task-deliverable-list', '--job-id', jobId, '--role', 'asp',
   ]);
   if (!res.ok) return false;
-  // The CLI names this array differently depending on the mode: a single-job
-  // query (`--job-id`, which is always what we send) returns `deliverables`,
-  // while the all-jobs listing returns `results`. Reading only `results` meant
-  // this returned false unconditionally — so the retrievability check that the
-  // empty-submission fix depends on never actually verified anything, and every
-  // delivery fell through to the XMTP repair path. Verified against the live
-  // CLI: `--job-id` → {"data":{"deliverables":[]}}, no job id → {"results":[]}.
   return countDeliverables(res.data) > 0;
 }
 
 /** Length of whichever array shape this CLI version returned. */
 export function countDeliverables(data: { deliverables?: unknown[]; results?: unknown[] } | undefined): number {
   return (data?.deliverables?.length ?? 0) || (data?.results?.length ?? 0);
+}
+
+export interface FileDeliverMeta {
+  fileKey: string;
+  digest: string;
+  salt: string;
+  nonce: string;
+  secret: string;
+  filename?: string;
+  mimeType?: string;
+}
+
+/**
+ * Upload a deliverable file attachment via `okx-a2a file upload`.
+ * Returns encryption metadata needed for the file deliver intent.
+ */
+export async function uploadFileDeliverable(
+  filePath: string,
+  jobId: string,
+): Promise<{ ok: boolean; data?: FileDeliverMeta; error?: string }> {
+  if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
+  const res = await a2a([
+    'file', 'upload',
+    '--file-path', filePath,
+    '--agent-id', config.okx.aspAgentId,
+    '--job-id', jobId,
+    '--json',
+  ], 60_000);
+  if (!res.ok) return { ok: false, error: res.error };
+  try {
+    const parsed = JSON.parse(res.raw.slice(res.raw.indexOf('{'))) as FileDeliverMeta;
+    if (parsed.fileKey && parsed.digest && parsed.salt && parsed.nonce && parsed.secret) {
+      return { ok: true, data: parsed };
+    }
+    return { ok: false, error: 'missing required encryption fields in file upload result' };
+  } catch (err) {
+    return { ok: false, error: `failed to parse upload result: ${String(err)}` };
+  }
+}
+
+/**
+ * The `[intent:deliver]` file payload format for A2A message delivery.
+ */
+export function fileDeliverIntent(jobId: string, meta: FileDeliverMeta): string {
+  const lines = [
+    '[intent:deliver]',
+    `jobId: ${jobId}`,
+    'deliverableType: file',
+    `fileKey: ${meta.fileKey}`,
+    `digest: ${meta.digest}`,
+    `salt: ${meta.salt}`,
+    `nonce: ${meta.nonce}`,
+    `secret: ${meta.secret}`,
+  ];
+  if (meta.filename) {
+    lines.push(`filename: ${meta.filename}`);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -383,6 +487,7 @@ export async function resendDeliverable(
   jobId: string,
   toAgentId: string,
   content: string,
+  fileMeta?: FileDeliverMeta,
 ): Promise<{ ok: boolean; error?: string }> {
   // Same precondition as every outbound path: without the local session the
   // daemon rejects the queued send after the CLI has already said ok.
@@ -391,11 +496,17 @@ export async function resendDeliverable(
     audit('okx-marketplace', 'DELIVERABLE_RESEND_FAILED', `job=${jobId} no-session ${session.error ?? ''}`.trim());
     return { ok: false, error: `no XMTP session: ${session.error}` };
   }
+  const message = fileMeta
+    ? fileDeliverIntent(jobId, fileMeta)
+    : content.startsWith('[intent:deliver]')
+    ? content
+    : textDeliverIntent(jobId, content);
+
   const res = await a2a([
     'xmtp-send',
     '--job-id', jobId,
     '--to-agent-id', toAgentId,
-    '--message', textDeliverIntent(jobId, content),
+    '--message', message,
     '--json',
   ]);
   audit('okx-marketplace', res.ok ? 'DELIVERABLE_RESENT' : 'DELIVERABLE_RESEND_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());

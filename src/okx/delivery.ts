@@ -5,11 +5,15 @@ import { audit, now, saveEngagement } from '../db.js';
 import type { Engagement } from '../types.js';
 import {
   a2aDaemonUp,
+  a2aDeliveryMessageBroadcast,
   deliverTask,
   deliverableRetrievable,
   ensureSession,
   resendDeliverable,
   startA2aDaemon,
+  taskDetail,
+  uploadFileDeliverable,
+  type FileDeliverMeta,
 } from './marketplace.js';
 
 /**
@@ -66,10 +70,15 @@ export async function submitDeliverable(
     return { ok: false, submitted: false, error: 'XMTP channel down — deliverable held' };
   }
 
-  // `deliver` sends the `[intent:deliver]` itself, and that send needs the same
-  // local session every other outbound message needs. Without it the payload
-  // leg dies in the daemon queue while the submit still lands — the exact empty
-  // submission a buyer rejects. Establish it BEFORE the one-way submit.
+  if (!engagement.okxBuyerAgentId) {
+    const detail = await taskDetail(jobId);
+    if (detail.ok && detail.task?.counterpartyAgentId) {
+      engagement.okxBuyerAgentId = detail.task.counterpartyAgentId;
+      saveEngagement(engagement);
+    }
+  }
+
+  // Establish local session before the one-way submit so XMTP payload send succeeds.
   if (engagement.okxBuyerAgentId) {
     const session = await ensureSession(jobId, engagement.okxBuyerAgentId);
     if (!session.ok) {
@@ -84,7 +93,12 @@ export async function submitDeliverable(
   engagement.status = 'delivering';
   saveEngagement(engagement);
 
-  const res = await deliverTask(jobId, { file, message: summary });
+  const res = await deliverTask(jobId, {
+    file,
+    message: summary,
+    toAgentId: engagement.okxBuyerAgentId,
+    content: deliverable,
+  });
   if (!res.submitted) {
     // Nothing went on-chain, so the task is still `accepted` and the caller can
     // retry the whole thing cleanly on the next pass.
@@ -115,7 +129,17 @@ export async function submitDeliverable(
 export async function repairDeliverable(engagement: Engagement, deliverable: string): Promise<DeliveryResult> {
   const jobId = engagement.okxJobId;
 
-  if (await deliverableRetrievable(jobId)) {
+  if (!engagement.okxBuyerAgentId) {
+    const detail = await taskDetail(jobId);
+    if (detail.ok && detail.task?.counterpartyAgentId) {
+      engagement.okxBuyerAgentId = detail.task.counterpartyAgentId;
+      saveEngagement(engagement);
+    }
+  }
+
+  const retrievable = await deliverableRetrievable(jobId);
+  const broadcast = await a2aDeliveryMessageBroadcast(jobId, engagement.okxBuyerAgentId);
+  if (retrievable && broadcast) {
     engagement.deliverableSentAt = now();
     saveEngagement(engagement);
     audit('okx-delivery', 'DELIVERABLE_CONFIRMED', `job=${jobId}`);
@@ -131,10 +155,21 @@ export async function repairDeliverable(engagement: Engagement, deliverable: str
     return { ok: false, submitted: true, error };
   }
 
-  const res = await resendDeliverable(jobId, engagement.okxBuyerAgentId, deliverable);
+  let fileMeta: FileDeliverMeta | undefined;
+  if (engagement.deliverableFile) {
+    const uploadRes = await uploadFileDeliverable(engagement.deliverableFile, jobId);
+    if (uploadRes.ok) fileMeta = uploadRes.data;
+  }
+
+  const res = await resendDeliverable(jobId, engagement.okxBuyerAgentId, deliverable, fileMeta);
   if (!res.ok) {
     console.error(`[okx-delivery] ${jobId}: deliverable re-send failed: ${res.error}`);
     return { ok: false, submitted: true, error: res.error };
+  }
+
+  const broadcastConfirmed = await a2aDeliveryMessageBroadcast(jobId, engagement.okxBuyerAgentId);
+  if (!broadcastConfirmed) {
+    console.warn(`[okx-delivery] ${jobId}: re-sent deliverable over XMTP, session history confirmation pending.`);
   }
 
   engagement.deliverableSentAt = now();

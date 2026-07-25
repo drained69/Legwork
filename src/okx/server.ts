@@ -141,7 +141,13 @@ export function handleEnvelope(env: OkxEnvelope, handlers: OkxHandlers = {}): Re
       engagement = {
         id: uid(),
         okxJobId: jobId,
-        okxBuyerAgentId: env.sender?.agentId,
+        okxBuyerAgentId:
+          env.sender?.agentId ||
+          ((env.sender as Record<string, unknown> | undefined)?.address as string) ||
+          ((env.sender as Record<string, unknown> | undefined)?.communicationAddress as string) ||
+          ((env as Record<string, unknown>).counterpartyAgentId as string) ||
+          ((env as Record<string, unknown>).buyerAddress as string) ||
+          ((env as Record<string, unknown>).creatorAddress as string),
         taskCode: newTaskCode(),
         listing: listingId,
         status: 'awaiting_link',
