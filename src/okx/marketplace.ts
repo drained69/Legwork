@@ -318,6 +318,29 @@ export async function deliverTask(
     }
   }
 
+  // ── BEFORE the one-way submit, register a backend-visible deliverable ─────
+  // Two things must happen while the task is still `accepted`, because the
+  // `deliver` below flips it to `submitted` and both become impossible after:
+  //   1. task-attach — puts the file in the buyer's `list-attachments`, the
+  //      one delivery path that does not depend on the buyer's AI-dispatch.
+  //   2. file-upload — encrypts the file and returns the envelope the
+  //      `[intent:deliver]` message carries. Done here so an upload failure is
+  //      known before we burn the irreversible submit.
+  let fileMeta: FileDeliverMeta | undefined;
+  if (opts.file) {
+    const attachRes = await attachDeliverable(jobId, opts.file);
+    if (attachRes.ok) console.log(`[okx-marketplace] ${jobId}: attached deliverable to task (buyer-queryable in list-attachments).`);
+    else console.warn(`[okx-marketplace] ${jobId}: task-attach notice (${attachRes.error}) — relying on the XMTP intent message.`);
+
+    const uploadRes = await uploadFileDeliverable(opts.file, jobId);
+    if (uploadRes.ok && uploadRes.data) {
+      fileMeta = uploadRes.data;
+      console.log(`[okx-marketplace] ${jobId}: uploaded encrypted file envelope key=${fileMeta.fileKey}`);
+    } else if (uploadRes.error) {
+      console.warn(`[okx-marketplace] ${jobId}: file upload failed (${uploadRes.error}) — the intent message will carry inline text instead.`);
+    }
+  }
+
   const res = await cli<unknown>([
     'deliver', jobId,
     // A real file, not `--deliverable-text`: the CLI converts any text over
@@ -334,42 +357,36 @@ export async function deliverTask(
 
   console.log(`[okx-marketplace] ${jobId}: on-chain submit landed.`);
 
+  // ── AFTER submit, send the [intent:deliver] message the buyer awaits ───────
+  // The buyer receives job_submitted on-chain and then waits for this XMTP
+  // message (file envelope, or inline text between - - -) to actually read the
+  // work. Sent via `session send`, which reports real delivery — unlike
+  // fire-and-forget xmtp-send, whose queued "ok" hid a 100% failure rate.
   let contentVerified = false;
   if (toAgentId) {
-    let fileMeta: FileDeliverMeta | undefined;
-    if (opts.file) {
-      const uploadRes = await uploadFileDeliverable(opts.file, jobId);
-      if (uploadRes.ok && uploadRes.data) {
-        fileMeta = uploadRes.data;
-        console.log(`[okx-marketplace] ${jobId}: uploaded file deliverable attachment key=${fileMeta.fileKey}`);
-      } else if (uploadRes.error) {
-        console.warn(`[okx-marketplace] ${jobId}: file upload notice (${uploadRes.error}), falling back to text deliver intent if needed`);
-      }
-    }
-
     const deliverContent = opts.content ?? opts.message;
     let sendRes = await resendDeliverable(jobId, toAgentId, deliverContent, fileMeta);
-    let broadcastOk = await a2aDeliveryMessageBroadcast(jobId, toAgentId);
+    let broadcastOk = sendRes.ok && (await a2aDeliveryMessageBroadcast(jobId, toAgentId));
 
-    if (!sendRes.ok || !broadcastOk) {
-      console.warn(`[okx-marketplace] ${jobId}: initial XMTP deliver message send (ok=${sendRes.ok}, broadcast=${broadcastOk}) incomplete — retrying...`);
+    if (!broadcastOk) {
+      console.warn(`[okx-marketplace] ${jobId}: deliver message not confirmed (sendOk=${sendRes.ok}) — retrying once.`);
       sendRes = await resendDeliverable(jobId, toAgentId, deliverContent, fileMeta);
-      broadcastOk = await a2aDeliveryMessageBroadcast(jobId, toAgentId);
+      broadcastOk = sendRes.ok && (await a2aDeliveryMessageBroadcast(jobId, toAgentId));
     }
 
-    const savedLocally = await deliverableRetrievable(jobId);
-    contentVerified = savedLocally && sendRes.ok && broadcastOk;
+    // Buyer-visible via EITHER the backend attachment OR the confirmed intent
+    // message. The local manifest (deliverableRetrievable) is ours, not proof
+    // the buyer can see it — so it is not part of this verdict.
+    contentVerified = broadcastOk;
 
-    console.log(
-      `[okx-marketplace] ${jobId}: XMTP deliver message send result to ${toAgentId}: ok=${sendRes.ok}, broadcastConfirmed=${broadcastOk}, savedLocally=${savedLocally}`,
-    );
+    console.log(`[okx-marketplace] ${jobId}: deliver message to ${toAgentId}: sendOk=${sendRes.ok}, broadcastConfirmed=${broadcastOk}, type=${fileMeta ? 'file' : 'text'}`);
     audit(
       'okx-marketplace',
       contentVerified ? 'DELIVERED_ONCHAIN' : 'DELIVERED_EMPTY',
-      `job=${jobId} to=${toAgentId} savedLocally=${savedLocally} sendOk=${sendRes.ok} broadcastOk=${broadcastOk}`,
+      `job=${jobId} to=${toAgentId} type=${fileMeta ? 'file' : 'text'} sendOk=${sendRes.ok} broadcastOk=${broadcastOk}`,
     );
   } else {
-    console.error(`[okx-marketplace] ${jobId}: on-chain submit landed BUT missing buyer communication address / agent ID — cannot send XMTP deliver message!`);
+    console.error(`[okx-marketplace] ${jobId}: on-chain submit landed BUT no buyer agent id — cannot send the XMTP deliver message.`);
     audit('okx-marketplace', 'DELIVERED_UNROUTABLE', `job=${jobId}`);
   }
 
@@ -377,13 +394,42 @@ export async function deliverTask(
 }
 
 /**
- * Has an [intent:deliver] message for this job actually been broadcast into the XMTP session stream?
+ * Attach the deliverable file to the task so it lands in the buyer's
+ * backend-queryable `list-attachments`.
+ *
+ * This is the delivery path that does NOT depend on the buyer's agent
+ * processing an XMTP `[intent:deliver]` through a local AI CLI (which fails
+ * with "No supported AI CLI found" on their side exactly as it does on ours).
+ * The attachment is registered on the backend, so the buyer sees it directly.
+ *
+ * HARD CONSTRAINT: only valid while the task is `created` or `accepted`. Once
+ * the on-chain `deliver` flips it to `submitted`, attachment is refused — so
+ * this MUST run before the submit, which is why delivery attaches first.
  */
-export async function a2aDeliveryMessageBroadcast(jobId: string, toAgentId?: string): Promise<boolean> {
+export async function attachDeliverable(jobId: string, filePath: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await cli<unknown>(['task-attach', '--file', filePath, jobId]);
+  audit('okx-marketplace', res.ok ? 'DELIVERABLE_ATTACHED' : 'DELIVERABLE_ATTACH_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return { ok: res.ok, error: res.error };
+}
+
+/**
+ * Has an [intent:deliver] message for this job reached the XMTP session stream?
+ *
+ * Polled, not sampled once: the daemon persists sends asynchronously, so an
+ * immediate read races the write and returns a false negative — which is what
+ * logged DELIVERED_EMPTY for deliveries whose message had in fact published.
+ */
+export async function a2aDeliveryMessageBroadcast(jobId: string, toAgentId?: string, tries = 4): Promise<boolean> {
   if (!toAgentId) return false;
-  const hist = await chatHistory(jobId, toAgentId);
-  if (!hist.ok) return false;
-  return hist.messages.some((m) => m.content.includes('[intent:deliver]') && m.content.includes(jobId));
+  const delayMs = Number(process.env.OKX_BROADCAST_POLL_MS ?? 2000);
+  for (let i = 0; i < tries; i++) {
+    const hist = await chatHistory(jobId, toAgentId);
+    if (hist.ok && hist.messages.some((m) => m.content.includes('[intent:deliver]') && m.content.includes(jobId))) {
+      return true;
+    }
+    if (i < tries - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false;
 }
 
 /**
@@ -502,6 +548,13 @@ export async function resendDeliverable(
     ? content
     : textDeliverIntent(jobId, content);
 
+  // `xmtp-send` with the session precondition above — NOT `session send`.
+  // Verified from the daemon log (commit 19900c4): `session send` hands the
+  // message to the LOCAL AI dispatcher ("No supported AI CLI found"), never to
+  // the counterparty. `xmtp-send` is what logs `outbound message-eligible …
+  // xmtp-send command completed` and actually reaches the buyer's group. Its
+  // queued "ok" is not proof of receipt, which is why the caller confirms the
+  // message via a2aDeliveryMessageBroadcast rather than trusting this result.
   const res = await a2a([
     'xmtp-send',
     '--job-id', jobId,

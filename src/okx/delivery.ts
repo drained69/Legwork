@@ -167,14 +167,18 @@ export async function repairDeliverable(engagement: Engagement, deliverable: str
     return { ok: false, submitted: true, error: res.error };
   }
 
+  // The re-send returned a queued "ok" — not proof it landed. Confirm the
+  // intent actually reached the buyer's session stream before marking it sent,
+  // or the SUBMITTED-repair loop will (correctly) keep retrying next tick.
   const broadcastConfirmed = await a2aDeliveryMessageBroadcast(jobId, engagement.okxBuyerAgentId);
   if (!broadcastConfirmed) {
-    console.warn(`[okx-delivery] ${jobId}: re-sent deliverable over XMTP, session history confirmation pending.`);
+    console.warn(`[okx-delivery] ${jobId}: re-sent deliverable but session history has not confirmed it — will retry next tick.`);
+    return { ok: false, submitted: true, error: 'broadcast not confirmed in session history' };
   }
 
   engagement.deliverableSentAt = now();
   saveEngagement(engagement);
-  console.log(`[okx-delivery] ${jobId}: deliverable re-sent to buyer agent ${engagement.okxBuyerAgentId}`);
+  console.log(`[okx-delivery] ${jobId}: deliverable re-sent and confirmed to buyer agent ${engagement.okxBuyerAgentId}`);
   return { ok: true, submitted: true, repaired: true };
 }
 

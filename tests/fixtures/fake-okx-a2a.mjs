@@ -54,15 +54,9 @@ if (args[0] === 'status') {
     sentAt: new Date().toISOString(),
     deliveryStatus: 'published',
   }));
-  if (state.retrievable && sentRows.length === 0) {
-    sentRows.push({
-      id: 'sent-initial',
-      senderInboxId: 'inbox-self',
-      content: JSON.stringify({ msgType: 'a2a-agent-chat', content: `[intent:deliver]\njobId: ${jobId}\ndeliverableType: text\n- - -\nPAYLOAD\n- - -`, sender: { agentId: '6658' } }),
-      sentAt: new Date().toISOString(),
-      deliveryStatus: 'published',
-    });
-  }
+  // History reflects only what was actually sent — no synthetic intent. The
+  // real deliver flow pushes its [intent:deliver] through xmtp-send, which
+  // populates sentMessages, so broadcast confirmation reads genuine sends.
   console.log(JSON.stringify([...chatRows, ...sentRows]));
 } else if (args[0] === 'session') {
   const sub = args[1];
@@ -91,7 +85,10 @@ if (args[0] === 'status') {
   // that asserts on sentMessages therefore proves the session precondition —
   // this exact gap hid a 100% send-failure rate behind ok responses.
   const jobId = args[args.indexOf('--job-id') + 1];
-  if ((state.sessions ?? []).includes(jobId)) {
+  // `broadcastFails` models the daemon accepting the queued send (ok) but the
+  // message never landing in the group — so it never appears in session
+  // history and the broadcast-confirmation check correctly reports failure.
+  if ((state.sessions ?? []).includes(jobId) && !state.broadcastFails) {
     state.sentMessages.push(args[args.indexOf('--message') + 1]);
   }
   console.log(JSON.stringify({ ok: true }));

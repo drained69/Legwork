@@ -22,6 +22,7 @@ process.env.ADZUNA_APP_KEY = '';
 process.env.USAJOBS_API_KEY = '';
 process.env.TELEGRAM_BOT_TOKEN = '';
 process.env.OKX_ASP_AGENT_ID = '6658';
+process.env.OKX_BROADCAST_POLL_MS = '10';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -128,7 +129,8 @@ test('lifecycle: brief from chat → hunt → deliverable with real ranked listi
   const deliverCall = s.calls.find((c) => c.includes('agent deliver'));
   assert.ok(deliverCall, 'deliver ran once criteria existed');
   assert.match(deliverCall!, /--file \S+\.md/, 'submitted as a real file');
-  assert.ok(s.calls.some((c) => c.includes('task-deliverable-list')), 'retrievability verified, not assumed');
+  assert.ok(s.calls.some((c) => c.startsWith('onchainos agent task-attach')), 'deliverable attached to the task for backend visibility');
+  assert.ok(s.calls.some((c) => c.startsWith('okx-a2a session history')), 'intent broadcast confirmed in the buyer session stream');
   assert.ok(engagement.deliveredAt, 'submit recorded');
   assert.ok(engagement.deliverableSentAt, 'buyer can actually retrieve it');
 

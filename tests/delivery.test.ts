@@ -12,6 +12,7 @@
  */
 process.env.DATABASE_PATH = ':memory:';
 process.env.ANTHROPIC_API_KEY = '';
+process.env.OKX_BROADCAST_POLL_MS = '10';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -80,7 +81,7 @@ const PAYLOAD = 'Job hunt results\n\n1. Backend Engineer @ Acme — score 89\n2.
 
 // ── the happy path still works ─────────────────────────────────────────────
 
-test('delivery: payload verified retrievable marks the engagement delivered', async () => {
+test('delivery: the deliverable is registered on the backend BEFORE the one-way submit', async () => {
   setState({ retrievable: true });
   const engagement = newEngagement('0xjob-happy');
 
@@ -89,16 +90,19 @@ test('delivery: payload verified retrievable marks the engagement delivered', as
   assert.equal(res.ok, true);
   assert.equal(res.submitted, true);
   assert.ok(getEngagementById(engagement.id)?.deliveredAt, 'on-chain submit recorded');
-  assert.ok(getEngagementById(engagement.id)?.deliverableSentAt, 'payload confirmed reaching the buyer');
+  assert.ok(getEngagementById(engagement.id)?.deliverableSentAt, 'delivery confirmed reaching the buyer');
 
   const calls = readState().calls;
+  const attachIdx = calls.findIndex((c) => c.startsWith('onchainos agent task-attach'));
+  const deliverIdx = calls.findIndex((c) => c.startsWith('onchainos agent deliver 0xjob-happy'));
+  assert.ok(attachIdx >= 0, 'the file is attached to the task (buyer-queryable in list-attachments)');
+  assert.ok(deliverIdx >= 0, 'deliver ran');
+  // The attach must precede the submit: task-attach is refused once the task
+  // leaves `accepted`, so attaching after the submit is impossible.
+  assert.ok(attachIdx < deliverIdx, 'attach happens BEFORE the one-way submit, not after');
   assert.ok(
-    calls.some((c) => c.startsWith('onchainos agent deliver 0xjob-happy')),
-    'deliver ran',
-  );
-  assert.ok(
-    calls.some((c) => c.includes('task-deliverable-list --job-id 0xjob-happy --role asp')),
-    'retrievability was verified rather than assumed',
+    calls.some((c) => c.startsWith('okx-a2a session history')),
+    'the [intent:deliver] broadcast is confirmed in the buyer session stream, not assumed',
   );
 });
 
@@ -119,32 +123,47 @@ test('delivery: the deliverable is submitted as a real file, not a bare message'
 
 // ── the incident: submitted on-chain, payload never arrived ────────────────
 
-test('delivery: a submit with no retrievable payload is repaired over XMTP, not reported as success', async () => {
-  // The exact incident: `deliver` exits 0, the tx lands, but the payload leg
-  // never completed, so the buyer's deliverable list stays empty.
-  setState({ retrievable: false });
+test('delivery: an unconfirmed broadcast is NOT reported as success', async () => {
+  // The exact incident: `deliver` exits 0, the tx lands, but the [intent:deliver]
+  // never reaches the buyer's stream. contentVerified rests on confirming the
+  // message in session history — so an unlanded broadcast must fail, not pass.
+  setState({ retrievable: true, broadcastFails: true } as never);
   const engagement = newEngagement('0xjob-empty');
 
   const res = await submitDeliverable(engagement, PAYLOAD, 'summary');
 
-  assert.equal(res.submitted, true, 'the tx did land');
-  assert.equal(res.repaired, true, 'the payload was pushed over XMTP instead of left empty');
-  assert.equal(res.ok, true);
-
-  const sent = readState().sentMessages;
-  assert.ok(sent.length >= 1, 'at least one XMTP message sent');
-  assert.ok(sent[0].startsWith('[intent:deliver]'), 'the send is a protocol message the buyer agent routes');
-  assert.ok(sent[0].includes(PAYLOAD) || sent[0].includes('fileKey:'), 'the send carries the actual content');
+  assert.equal(res.submitted, true, 'the tx did land — submit is one-way');
+  assert.notEqual(res.ok, true, 'an unconfirmed broadcast is never success');
+  assert.equal(getEngagementById(engagement.id)?.deliverableSentAt, undefined, 'not marked buyer-visible');
+  // The task stays in the poller's SUBMITTED-repair loop, which retries the
+  // intent every tick until session history confirms it.
 });
 
-test('delivery: repair is skipped when the payload turns out to have landed', async () => {
+test('delivery: a confirmed broadcast carries the protocol intent message', async () => {
+  setState({ retrievable: true });
+  const engagement = newEngagement('0xjob-intent');
+
+  const res = await submitDeliverable(engagement, PAYLOAD, 'summary');
+
+  assert.equal(res.ok, true);
+  const sent = readState().sentMessages;
+  assert.ok(sent.length >= 1, 'an XMTP intent message was sent');
+  assert.ok(sent[0].startsWith('[intent:deliver]'), 'it is the protocol message the buyer agent routes');
+  assert.ok(sent[0].includes('fileKey:') || sent[0].includes(PAYLOAD), 'carrying the encrypted file envelope or inline text');
+});
+
+test('delivery: repair is skipped when the intent already landed in the buyer stream', async () => {
   setState({ retrievable: true });
   const engagement = newEngagement('0xjob-late');
+  // Simulate the [intent:deliver] already confirmed in session history.
+  const st = readState();
+  st.sentMessages = [`[intent:deliver]\njobId: 0xjob-late\ndeliverableType: file\nfileKey: k`];
+  writeFileSync(statePath, JSON.stringify(st, null, 2));
 
   const res = await repairDeliverable(engagement, PAYLOAD);
 
   assert.equal(res.ok, true);
-  assert.equal(readState().sentMessages.length, 0, 'no duplicate sent when the buyer can already retrieve it');
+  assert.equal(readState().sentMessages.length, 1, 'no DUPLICATE sent when the intent already landed');
   assert.ok(getEngagementById(engagement.id)?.deliverableSentAt);
 });
 
