@@ -532,3 +532,26 @@ test('x402: an unsettleable payment points the buyer at routes that DO work', as
     config.x402.devAcceptUnverified = true;
   }
 });
+
+test('x402: a configured-but-unusable facilitator never leaks its internal error to the buyer', async () => {
+  // Live test caught this: with the URL set but credentials missing, the buyer
+  // received a raw "50103: OK-ACCESS-KEY can not be empty" — an OKX internal
+  // they can do nothing with. Settlement viability is checked BEFORE the call.
+  const { verifyAndSettle, PRICED_SERVICES } = await import('../src/okx/x402.js');
+  const { config } = await import('../src/config.js');
+  const service = PRICED_SERVICES.find((s) => s.id === 'job-hunt')!;
+
+  config.x402.devAcceptUnverified = false;
+  config.x402.facilitatorUrl = 'https://web3.okx.com/api/v6/pay/x402';
+  config.x402.facilitatorApiKey = '';
+  try {
+    const res = await verifyAndSettle(makePayment({}, { nonce: '0x' + 'dd'.repeat(32) }), service, '/api/hunt');
+    assert.equal(res.ok, false);
+    assert.doesNotMatch(res.error ?? '', /OK-ACCESS-KEY|50103/, 'no raw facilitator internals');
+    assert.match(res.error ?? '', /preview/i, 'names the free tier that works');
+    assert.match(res.error ?? '', /marketplace/i, 'names the escrow route that works');
+  } finally {
+    config.x402.facilitatorUrl = '';
+    config.x402.devAcceptUnverified = true;
+  }
+});

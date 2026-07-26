@@ -286,6 +286,23 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
   // would permanently brick a perfectly valid authorization — the buyer's
   // retry would come back "replay rejected" and they could not pay us at all.
   // So every path that ends without a settled payment releases it.
+  // Refuse early when settlement cannot possibly succeed. A configured-but-
+  // unusable facilitator (URL set, credentials missing) would otherwise burn a
+  // network round-trip and hand the buyer a raw OKX error like
+  // "50103: OK-ACCESS-KEY can not be empty" — an internal detail they can do
+  // nothing with. Fail with the routes that DO work instead.
+  const settlement = settlementStatus();
+  if (!settlement.available) {
+    releaseNonce(nonceKey);
+    return {
+      ok: false, status: 402,
+      error:
+        `per-call payment is not currently available (${settlement.reason ?? 'settlement unconfigured'}). ` +
+        `Use the free preview at POST /api/hunt/preview, or hire agent ${config.okx.agentId} ` +
+        'on the OKX marketplace where tasks settle in USDT via escrow.',
+    };
+  }
+
   let transaction = '';
   if (config.x402.facilitatorUrl) {
     const requirements = acceptsV2(service, resource);
