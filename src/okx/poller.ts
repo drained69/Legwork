@@ -411,15 +411,26 @@ async function fulfil(task: MarketplaceTask, engagement: Engagement, deps: Polle
   const provisional = !briefIsUsable(brief);
   if (provisional && !(await criteriaWaitExpired(task, engagement))) return;
 
-  const criteria = provisional
+  let criteria = provisional
     ? provisionalCriteria(task.title, brief)
     : await criteriaFromBrief(task.title, brief);
-  const result = await runAdhocHunt(criteria);
+  let result = await runAdhocHunt(criteria);
 
   // Never submit an empty shortlist. "top 0 of 0 postings" is not a
   // deliverable — it is a rejection with extra steps. Hold the task in
   // `accepted` (still deliverable) and retry on the next tick, telling the
   // buyer what we searched so they can correct it.
+  // A provisional hunt that finds nothing means OUR GUESS was bad, not that the
+  // market is empty — the buyer never gave criteria to be wrong about. Retry
+  // once with the generic default before withholding, so a task titled
+  // "Legwork shortlist test" (which scrubs to the unsearchable "legwork test")
+  // still returns real postings the buyer can react to and correct.
+  if (!result.matches.length && provisional && criteria.roles?.[0] !== FALLBACK_ROLE) {
+    console.warn(`[okx-poller] ${task.jobId}: provisional query "${criteria.roles?.[0]}" matched nothing — retrying as "${FALLBACK_ROLE}".`);
+    criteria = { ...criteria, roles: [FALLBACK_ROLE] };
+    result = await runAdhocHunt(criteria);
+  }
+
   if (!result.matches.length) {
     await handleNoMatches(task, engagement, criteria, result.found, deps);
     return;
@@ -603,6 +614,9 @@ const TITLE_NOISE = new Set([
   'resume', 'cv', 'best', 'good', 'great', 'new', 'please',
 ]);
 
+/** The generic query used when a title yields no recognisable role. */
+export const FALLBACK_ROLE = 'software engineer';
+
 const ROLE_NOUNS = ['engineer', 'developer', 'designer', 'manager', 'analyst', 'scientist', 'architect', 'writer', 'marketer'];
 const ROLE_QUALIFIERS = [
   'software', 'backend', 'frontend', 'full-stack', 'full stack', 'data', 'product', 'marketing',
@@ -633,7 +647,7 @@ export function provisionalCriteria(title: string, partialBrief: string): HuntCr
     // Nothing usable even after scrubbing — fall back to the leftover
     // meaningful words, else the single most generic tech query.
     const leftovers = text.split(/[^a-z0-9+#]+/).filter((w) => w.length > 2 && !TITLE_NOISE.has(w));
-    role = leftovers.slice(0, 3).join(' ') || 'software engineer';
+    role = leftovers.slice(0, 3).join(' ') || FALLBACK_ROLE;
   }
 
   const seniority = ['principal', 'staff', 'senior', 'junior'].find((s) => text.includes(s)) ?? 'mid';

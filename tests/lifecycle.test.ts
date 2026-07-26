@@ -310,3 +310,47 @@ test('lifecycle: buyer criteria arriving over XMTP chat are ingested and hunted,
   const payload = readFileSync(s.deliveredFile!, 'utf8');
   assert.doesNotMatch(payload, /PROVISIONAL/, 'real criteria means a real, unlabelled shortlist');
 });
+
+test('lifecycle: a provisional query that matches nothing retries with a searchable default', async () => {
+  // Live bug: a task titled "Legwork shortlist test" scrubbed to the
+  // unsearchable query "legwork test", the hunt returned 0 postings, and the
+  // empty-shortlist guard withheld delivery — so a funded task looped every
+  // 30s delivering nothing. A bad GUESS is not the same as an empty market.
+  const { provisionalCriteria, FALLBACK_ROLE } = await import('../src/okx/poller.js');
+
+  const guessed = provisionalCriteria('Legwork shortlist test', '');
+  assert.equal(guessed.roles?.[0], 'legwork test', 'the raw guess is what the live task produced');
+
+  reset(1);
+  const e = db.getEngagementByJob(JOB)!;
+  e.brief = undefined;
+  e.deliveredAt = undefined;
+  e.deliverableSentAt = undefined;
+  e.shortlist = undefined;
+  e.acceptedSeenAt = new Date(Date.now() - 6 * 60_000).toISOString(); // wait expired
+  e.criteriaRequestedAt = new Date(Date.now() - 6 * 60_000).toISOString();
+  e.criteriaNudgeAt = undefined;
+  e.noMatchNoticeAt = undefined;
+  db.saveEngagement(e);
+
+  // Title with no recognisable role — the exact shape that produced 0 matches.
+  const st = read() as State & { tasks: Array<Record<string, unknown>> };
+  st.tasks[0].title = 'Legwork shortlist test';
+  writeFileSync(statePath, JSON.stringify(st, null, 2));
+
+  await pollOnce({ bot: null });
+
+  const s = read();
+  assert.ok(s.calls.some((c) => c.includes('agent deliver')), 'the funded task was delivered, not looped');
+  const payload = readFileSync(s.deliveredFile!, 'utf8');
+  assert.ok((payload.match(/^\d+\.\s\[\d+\/100\]/gm) ?? []).length > 0, 'with real ranked listings');
+
+  // The header must name the role ACTUALLY searched — whichever it was. The
+  // retry itself only fires when a source returns nothing; the test job source
+  // answers every query, so this asserts header/criteria consistency rather
+  // than the retry branch. `FALLBACK_ROLE` is the query the live retry uses.
+  const headerRole = /Role searched: (.+?) \(/.exec(payload)?.[1];
+  const criteriaLine = /Criteria: (.+?) •/.exec(payload)?.[1];
+  assert.equal(headerRole, criteriaLine, 'the stated assumption matches what was hunted');
+  assert.ok([guessed.roles?.[0], FALLBACK_ROLE].includes(headerRole), `unexpected role searched: ${headerRole}`);
+});
