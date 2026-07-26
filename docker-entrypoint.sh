@@ -21,6 +21,41 @@ fi
 if command -v okx-a2a >/dev/null 2>&1; then
   echo "[a2a] bootstrapping communication runtime…"
 
+  # Clear stale RUNTIME state before the doctor looks at it.
+  #
+  # OKX_AGENT_TASK_HOME lives on the persistent volume so the XMTP identity and
+  # session history survive a redeploy — but `run/` holds a pidfile, a lock dir
+  # and a unix socket, and those describe a PROCESS, which never survives one.
+  # A fresh container therefore starts with a pidfile naming a process that does
+  # not exist; `okx-a2a status` reports "running pid=NNN", the doctor's
+  # daemon_running check passes, and the daemon is never actually started. The
+  # result is silent and total: nothing listens on the RPC port, so every
+  # session create and every outbound message fails — while the boot log says
+  # communication is healthy. In a fresh container any pidfile is stale by
+  # definition, so remove them and let the doctor start a real daemon.
+  a2a_home="${OKX_AGENT_TASK_HOME:-$HOME/.okx-agent-task}"
+  if [ -d "$a2a_home/run" ]; then
+    rm -rf "$a2a_home/run/listener.pid" "$a2a_home/run/daemon.lock" "$a2a_home"/run/*.sock 2>/dev/null || true
+    echo "[a2a] cleared stale daemon runtime state from a previous container"
+  fi
+
+  # Keep the daemon's command queue from filling the volume.
+  #
+  # It is an append-only queue of outbound commands. A delivery bug once
+  # enqueued ~25k copies of a 7KB payload and it reached 391MB, filling the
+  # 434MB volume — at which point the CLI could not write its keyring temp
+  # file, agent resolution returned zero agents, and the poller went blind to
+  # every task while reporting itself healthy. The queue is disposable
+  # (recreated empty on start), the session store next to it is NOT.
+  a2a_queue="$a2a_home/sqlite/command-store.sqlite"
+  if [ -f "$a2a_queue" ]; then
+    queue_mb=$(du -m "$a2a_queue" 2>/dev/null | cut -f1)
+    if [ "${queue_mb:-0}" -gt 100 ]; then
+      rm -f "$a2a_queue" "$a2a_queue-wal" "$a2a_queue-shm"
+      echo "[a2a] dropped an oversized command queue (${queue_mb}MB) — it is disposable and was starving the volume"
+    fi
+  fi
+
   # NOTE ON `provider_binding: fail`
   #
   # The doctor reports an unbound default AI provider as a blocking failure, so
