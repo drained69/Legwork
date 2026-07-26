@@ -467,3 +467,68 @@ test('preview: loopback callers are keyed per user, not lumped together', async 
   assert.equal((await call('alice')).status, 429, 'alice exhausts her own quota');
   assert.equal((await call('bob')).status, 200, 'bob must not inherit alice’s exhausted quota');
 });
+
+// ── settlement honesty: never advertise what cannot be paid ────────────────
+
+test('x402: the catalog states plainly whether payments can actually settle', async () => {
+  // Advertising paid endpoints we cannot settle is over-promising: a buyer
+  // agent signs an authorization, gets a 402, and rates the agent broken.
+  const { serviceCatalog, settlementStatus } = await import('../src/okx/x402.js');
+  const { config } = await import('../src/config.js');
+
+  // No facilitator, no dev-accept → payments cannot complete.
+  config.x402.devAcceptUnverified = false;
+  config.x402.facilitatorUrl = '';
+  try {
+    const status = settlementStatus();
+    assert.equal(status.available, false);
+    assert.match(status.reason ?? '', /facilitator/i);
+
+    const cat = serviceCatalog() as {
+      payment: { settlementAvailable: boolean; settlementNote?: string };
+      services: Array<{ available: boolean }>;
+      marketplace: { settledIn: string };
+    };
+    assert.equal(cat.payment.settlementAvailable, false, 'the catalog must not claim payments work');
+    for (const s of cat.services) assert.equal(s.available, false, 'each service is marked unavailable');
+    // The working route stays discoverable.
+    assert.match(cat.marketplace.settledIn, /USDT/);
+  } finally {
+    config.x402.devAcceptUnverified = true;
+    config.x402.facilitatorUrl = '';
+  }
+});
+
+test('x402: an OKX facilitator without credentials is reported unavailable, not "ready"', async () => {
+  // A URL alone is not enough — OKX's facilitator is authenticated. Treating a
+  // credential-less config as ready would advertise unpayable endpoints.
+  const { settlementStatus } = await import('../src/okx/x402.js');
+  const { config } = await import('../src/config.js');
+  config.x402.devAcceptUnverified = false;
+  config.x402.facilitatorUrl = 'https://web3.okx.com/api/v6/pay/x402';
+  config.x402.facilitatorApiKey = '';
+  try {
+    const status = settlementStatus();
+    assert.equal(status.available, false);
+    assert.match(status.reason ?? '', /credential/i);
+  } finally {
+    config.x402.facilitatorUrl = '';
+    config.x402.devAcceptUnverified = true;
+  }
+});
+
+test('x402: an unsettleable payment points the buyer at routes that DO work', async () => {
+  const { verifyAndSettle, PRICED_SERVICES } = await import('../src/okx/x402.js');
+  const { config } = await import('../src/config.js');
+  const service = PRICED_SERVICES.find((s) => s.id === 'job-hunt')!;
+  config.x402.devAcceptUnverified = false;
+  config.x402.facilitatorUrl = '';
+  try {
+    const res = await verifyAndSettle(makePayment({}, { nonce: '0x' + 'ee'.repeat(32) }), service, '/api/hunt');
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? '', /preview/i, 'names the free tier');
+    assert.match(res.error ?? '', /marketplace/i, 'names the escrow route that works');
+  } finally {
+    config.x402.devAcceptUnverified = true;
+  }
+});

@@ -1,6 +1,7 @@
 import { config } from './config.js';
 import { createBot } from './telegram/bot.js';
 import { startOkxServer } from './okx/server.js';
+import { settlementStatus } from './okx/x402.js';
 import { pollOnce, startMarketplacePoller } from './okx/poller.js';
 import { startScheduler } from './scheduler.js';
 import { walletCliAvailable } from './wallet/okxWallet.js';
@@ -22,6 +23,16 @@ async function main(): Promise<void> {
   console.log('Legwork starting…');
   console.log(`  sources: adzuna=${config.adzuna.enabled} usajobs=${config.usajobs.enabled} (mock fallback when both off)`);
   console.log(`  llm=${config.llm.enabled} gmail=${config.gmail.enabled}`);
+
+  // x402 per-call payments are optional — the marketplace escrow flow is the
+  // primary route — but a half-configured facilitator must never be silent:
+  // buyers would sign authorizations that can never settle.
+  const settlement = settlementStatus();
+  console.log(
+    settlement.available
+      ? `  x402: per-call payments ENABLED${settlement.reason ? ` — ${settlement.reason}` : ''}`
+      : `  x402: per-call payments DISABLED — ${settlement.reason}. Free preview and OKX escrow tasks are unaffected.`,
+  );
 
   // Surface wallet availability at boot: without the CLI, sign-in reports
   // itself unavailable in-chat, and that should not be the first time anyone

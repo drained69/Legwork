@@ -1,6 +1,7 @@
 import { audit, consumeNonce, releaseNonce, now, savePayment, uid } from '../db.js';
 import { config } from '../config.js';
 import { fetchWithTimeout } from '../http.js';
+import { createHmac } from 'node:crypto';
 
 /**
  * x402 seller-side implementation (OKX Agent Payments Protocol).
@@ -288,12 +289,22 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
   let transaction = '';
   if (config.x402.facilitatorUrl) {
     const requirements = acceptsV2(service, resource);
-    const verified = await facilitator('/verify', { x402Version: payment.x402Version, paymentHeader, paymentRequirements: requirements });
+    const facilitatorBody = {
+      x402Version: payment.x402Version,
+      // OKX and modern x402 facilitators expect the DECODED payload; older
+      // Coinbase-style ones take the base64 header. Send both — each ignores
+      // the field it does not use, and sending only one silently fails on the
+      // other implementation.
+      paymentPayload: payment,
+      paymentHeader,
+      paymentRequirements: requirements,
+    };
+    const verified = await facilitator('/verify', facilitatorBody);
     if (!verified.ok) {
       releaseNonce(nonceKey);
       return { ok: false, status: 402, error: `facilitator rejected payment: ${verified.error}` };
     }
-    const settled = await facilitator('/settle', { x402Version: payment.x402Version, paymentHeader, paymentRequirements: requirements });
+    const settled = await facilitator('/settle', facilitatorBody);
     if (!settled.ok) {
       releaseNonce(nonceKey);
       return { ok: false, status: 402, error: `settlement failed: ${settled.error}` };
@@ -305,9 +316,15 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
     audit('x402', 'DEV_ACCEPT_UNVERIFIED', `service=${service.id} payer=${auth.from}`);
   } else {
     releaseNonce(nonceKey);
+    const { reason } = settlementStatus();
     return {
       ok: false, status: 402,
-      error: 'payment verification unavailable: agent has no facilitator configured (X402_FACILITATOR_URL)',
+      // Name the working alternative: a buyer agent that cannot pay per call
+      // can still get the same work through the OKX marketplace escrow flow.
+      error:
+        `per-call payment is not currently available (${reason ?? 'settlement unconfigured'}). ` +
+        `Use the free preview at POST /api/hunt/preview, or hire agent ${config.okx.agentId} ` +
+        'on the OKX marketplace where tasks settle in USDT via escrow.',
     };
   }
 
@@ -339,34 +356,105 @@ export async function verifyAndSettle(paymentHeader: string, service: PricedServ
 /** Settlement can involve an on-chain write, so it gets a longer leash than a scan. */
 const FACILITATOR_TIMEOUT_MS = 30_000;
 
+/**
+ * OKX authenticates its facilitator with the standard OKX API scheme:
+ *   OK-ACCESS-SIGN = base64(hmac_sha256(timestamp + METHOD + path + body, secret))
+ * Coinbase-style facilitators are open, so the headers are attached only when
+ * a key is configured — one client serves both.
+ */
+function facilitatorHeaders(path: string, body: string): Record<string, string> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const { facilitatorApiKey: key, facilitatorApiSecret: secret, facilitatorPassphrase: pass } = config.x402;
+  if (!key || !secret) return headers;
+
+  const timestamp = new Date().toISOString();
+  const sign = createHmac('sha256', secret).update(`${timestamp}POST${path}${body}`).digest('base64');
+  headers['OK-ACCESS-KEY'] = key;
+  headers['OK-ACCESS-SIGN'] = sign;
+  headers['OK-ACCESS-TIMESTAMP'] = timestamp;
+  if (pass) headers['OK-ACCESS-PASSPHRASE'] = pass;
+  return headers;
+}
+
+/** Facilitator reply, either flat (Coinbase-style) or wrapped in OKX's envelope. */
+interface FacilitatorReply {
+  code?: string;
+  msg?: string;
+  data?: FacilitatorReply;
+  isValid?: boolean;
+  success?: boolean;
+  invalidReason?: string;
+  invalidMessage?: string;
+  errorReason?: string;
+  errorMessage?: string;
+  transaction?: string;
+  txHash?: string;
+}
+
 async function facilitator(
   endpoint: '/verify' | '/settle',
   body: Record<string, unknown>,
 ): Promise<{ ok: boolean; error?: string; transaction?: string }> {
   try {
+    const base = config.x402.facilitatorUrl.replace(/\/$/, '');
+    const url = base + endpoint;
+    const payload = JSON.stringify(body);
+    // Sign over the path only (no origin), per the OKX signing scheme.
+    const path = new URL(url).pathname;
+
     const res = await fetchWithTimeout(
-      config.x402.facilitatorUrl.replace(/\/$/, '') + endpoint,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      },
+      url,
+      { method: 'POST', headers: facilitatorHeaders(path, payload), body: payload },
       FACILITATOR_TIMEOUT_MS,
     );
-    const data = (await res.json()) as { isValid?: boolean; success?: boolean; invalidReason?: string; errorReason?: string; transaction?: string; txHash?: string };
+
+    const raw = (await res.json()) as FacilitatorReply;
+    // OKX wraps the result in {code, msg, data}; Coinbase-style returns it
+    // flat. Reading the flat shape against an OKX reply yields `undefined`
+    // for every field — which reads as "invalid" and rejects EVERY genuine
+    // payment, so unwrap before interpreting.
+    const envelopeFailed = raw.code !== undefined && raw.code !== '0';
+    if (envelopeFailed) {
+      return { ok: false, error: `${raw.code}: ${raw.msg ?? 'facilitator error'}` };
+    }
+    const data = raw.data ?? raw;
+
     if (endpoint === '/verify') {
-      return data.isValid ? { ok: true } : { ok: false, error: data.invalidReason ?? 'invalid' };
+      return data.isValid
+        ? { ok: true }
+        : { ok: false, error: data.invalidMessage ?? data.invalidReason ?? 'invalid' };
     }
     return data.success
       ? { ok: true, transaction: data.transaction ?? data.txHash }
-      : { ok: false, error: data.errorReason ?? 'settlement error' };
+      : { ok: false, error: data.errorMessage ?? data.errorReason ?? 'settlement error' };
   } catch (err) {
     return { ok: false, error: `facilitator unreachable: ${String(err)}` };
   }
 }
 
+/**
+ * Can a payment actually be settled right now?
+ *
+ * A facilitator URL alone is not enough: OKX's requires API credentials, and
+ * without them every genuine payment is refused. Advertising paid endpoints we
+ * cannot settle is over-promising — a buyer agent would sign an authorization,
+ * get a 402 back, and rate the agent as broken. So the catalog reports this
+ * honestly rather than listing services that cannot complete.
+ */
+export function settlementStatus(): { available: boolean; reason?: string } {
+  if (config.x402.devAcceptUnverified) return { available: true, reason: 'dev-accept mode (no on-chain settlement)' };
+  if (!config.x402.facilitatorUrl) return { available: false, reason: 'no facilitator configured (X402_FACILITATOR_URL)' };
+  // OKX's facilitator is authenticated; an unauthenticated one needs no key.
+  const okxHosted = /okx\.com/i.test(config.x402.facilitatorUrl);
+  if (okxHosted && !(config.x402.facilitatorApiKey && config.x402.facilitatorApiSecret)) {
+    return { available: false, reason: 'facilitator credentials missing (OKX_API_KEY / OKX_API_SECRET)' };
+  }
+  return { available: true };
+}
+
 /** Public catalog served free at GET /api/services (what okx.ai/agents shows). */
 export function serviceCatalog(): Record<string, unknown> {
+  const settlement = settlementStatus();
   return {
     agent: 'Legwork',
     category: 'Resume & Career Workflows',
@@ -378,11 +466,24 @@ export function serviceCatalog(): Record<string, unknown> {
       assetSymbol: config.x402.assetSymbol,
       payTo: config.x402.payTo,
       maxPricePerCallUsd: '0.10',
+      // Stated plainly so a buyer agent can tell, before signing anything,
+      // whether a payment can complete. `false` means the per-call HTTP API is
+      // not currently accepting payments — the free tier and the OKX
+      // marketplace escrow tasks are unaffected.
+      settlementAvailable: settlement.available,
+      ...(settlement.reason ? { settlementNote: settlement.reason } : {}),
     },
     freeTier: {
       endpoint: 'POST /api/hunt/preview',
       description: 'Free ranked preview: top 3 matches with scores and headline reasons. 3 calls/hour per client.',
       limitPerHour: 3,
+    },
+    // Where per-call payment cannot settle, the marketplace escrow tasks are
+    // the working route — the same work, paid through the OKX task flow.
+    marketplace: {
+      agentId: config.okx.agentId,
+      settledIn: 'USDT via OKX task escrow',
+      note: 'Ranked shortlists and tailored application drafts are delivered as OKX agent-to-agent tasks.',
     },
     services: PRICED_SERVICES.map((s) => ({
       id: s.id,
@@ -390,6 +491,7 @@ export function serviceCatalog(): Record<string, unknown> {
       priceUsd: s.priceUsd,
       priceAtomic: s.priceAtomic,
       description: s.description,
+      available: settlement.available,
       input: s.input,
     })),
   };

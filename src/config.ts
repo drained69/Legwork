@@ -86,7 +86,15 @@ export const config = {
     // The agent wallet address payments settle to.
     payTo: env('X402_PAY_TO', '0x0000000000000000000000000000000000000000'),
     // x402 facilitator for signature verification + on-chain settlement.
+    // OKX's own is https://web3.okx.com/api/v6/pay/x402 (X Layer, USDT/USDC).
     facilitatorUrl: env('X402_FACILITATOR_URL', ''),
+    // OKX facilitator credentials. Its /verify and /settle are authenticated
+    // with the standard OKX HMAC scheme, unlike Coinbase-style facilitators
+    // which are open. Leave empty for an unauthenticated facilitator — the
+    // headers are only attached when a key is present.
+    facilitatorApiKey: env('OKX_API_KEY', ''),
+    facilitatorApiSecret: env('OKX_API_SECRET', ''),
+    facilitatorPassphrase: env('OKX_API_PASSPHRASE', ''),
     // Dev/test ONLY: accept structurally-valid payments without settlement.
     devAcceptUnverified: env('X402_DEV_ACCEPT_UNVERIFIED') === 'true',
   },
