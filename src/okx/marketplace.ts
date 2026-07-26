@@ -36,9 +36,36 @@ export interface CliResult<T> {
   error?: string;
 }
 
-/** Last JSON object printed on stdout; the CLI logs plain text above it. */
-function lastJson(stdout: string): string | undefined {
-  return stdout.trim().split('\n').filter((l) => l.trim().startsWith('{')).pop();
+/**
+ * Extract the JSON result from CLI output.
+ *
+ * Two shapes must both work: a command that prints log lines and then a
+ * single-line JSON object, and one that prints a pretty-printed object or
+ * ARRAY spanning many lines. Scanning for "the last line starting with {"
+ * handles only the first — on pretty-printed output it returns the bare
+ * string "{", whose parse failure previously threw into the catch block and
+ * discarded stdout entirely. That made `session history` look permanently
+ * empty, so a delivered payload could never be confirmed and was re-sent to
+ * the buyer on every 30s tick.
+ */
+export function parseCliJson(stdout: string): unknown | undefined {
+  const trimmed = stdout.trim();
+  if (!trimmed) return undefined;
+  // Whole-output first: the only shape that can represent a multi-line array.
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    /* not a single JSON document — fall back to line scanning */
+  }
+  const lines = trimmed.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('{'));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      return JSON.parse(lines[i]);
+    } catch {
+      /* a fragment such as a bare "{" — keep looking backwards */
+    }
+  }
+  return undefined;
 }
 
 async function cli<T>(args: string[], timeoutMs = TIMEOUT_MS): Promise<CliResult<T>> {
@@ -49,9 +76,9 @@ async function cli<T>(args: string[], timeoutMs = TIMEOUT_MS): Promise<CliResult
 
   try {
     const { stdout } = await run(CLI, ['agent', ...args], { env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
-    const line = lastJson(stdout);
-    if (!line) return { ok: true, raw: stdout }; // text-mode command (e.g. recommend-task)
-    const parsed = JSON.parse(line) as { ok?: boolean; data?: T; error?: string; msg?: string; message?: string };
+    const json = parseCliJson(stdout);
+    if (json === undefined) return { ok: true, raw: stdout }; // text-mode command (e.g. recommend-task)
+    const parsed = json as { ok?: boolean; data?: T; error?: string; msg?: string; message?: string };
     return {
       ok: parsed.ok !== false,
       data: parsed.data,
@@ -60,14 +87,10 @@ async function cli<T>(args: string[], timeoutMs = TIMEOUT_MS): Promise<CliResult
     };
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; killed?: boolean; message?: string };
-    const line = lastJson(e.stdout ?? '');
-    if (line) {
-      try {
-        const parsed = JSON.parse(line) as { error?: string; msg?: string; message?: string };
-        return { ok: false, raw: e.stdout ?? '', error: parsed.error ?? parsed.msg ?? parsed.message ?? 'command failed' };
-      } catch {
-        /* fall through */
-      }
+    // A non-zero exit still often carries a JSON error body on stdout.
+    const failure = parseCliJson(e.stdout ?? '') as { error?: string; msg?: string; message?: string } | undefined;
+    if (failure && (failure.error || failure.msg || failure.message)) {
+      return { ok: false, raw: e.stdout ?? '', error: failure.error ?? failure.msg ?? failure.message };
     }
     if (e.killed) return { ok: false, raw: e.stdout ?? '', error: `TIMEOUT after ${timeoutMs}ms` };
     return { ok: false, raw: e.stdout ?? '', error: (e.stderr || e.message || String(err)).split('\n')[0].slice(0, 300) };
@@ -80,9 +103,11 @@ async function a2a(args: string[], timeoutMs = TIMEOUT_MS): Promise<{ ok: boolea
   if (config.okx.home) env.ONCHAINOS_HOME = config.okx.home;
   try {
     const { stdout } = await run(A2A_CLI, args, { env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
-    const line = lastJson(stdout);
-    if (!line) return { ok: true, raw: stdout };
-    const parsed = JSON.parse(line) as { ok?: boolean; error?: string; message?: string };
+    const json = parseCliJson(stdout);
+    if (json === undefined) return { ok: true, raw: stdout };
+    // An array result (e.g. `session history`) carries no `ok` field — absence
+    // means success, not failure.
+    const parsed = json as { ok?: boolean; error?: string; message?: string };
     return { ok: parsed.ok !== false, raw: stdout, error: parsed.ok === false ? parsed.error ?? parsed.message : undefined };
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; killed?: boolean; message?: string };

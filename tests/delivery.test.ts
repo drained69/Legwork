@@ -387,3 +387,33 @@ test('delivery: extracts buyer communication address from task details when miss
   assert.equal(extractCounterpartyAgentId({ creatorAddress: address }), address);
   assert.equal(extractCounterpartyAgentId({ buyerAgentId: address }), address);
 });
+
+// ── CLI output parsing: the bug that made every delivery unconfirmable ─────
+
+test('delivery: pretty-printed JSON arrays parse — a bare "{" line must not discard the output', async () => {
+  // `session history` prints a multi-line JSON ARRAY. The old extractor took
+  // "the last line starting with {", which for pretty output is the bare
+  // string "{" — its parse failure threw into the catch block and returned
+  // raw:''. chatHistory therefore reported EMPTY history forever, so a
+  // delivered payload could never be confirmed and was re-sent to the buyer
+  // every 30 seconds. Verified against real CLI output shapes.
+  const { parseCliJson } = await import('../src/okx/marketplace.js');
+
+  const prettyArray = '[\n  {\n    "id": "a",\n    "content": "hello"\n  },\n  {\n    "id": "b"\n  }\n]';
+  const arr = parseCliJson(prettyArray) as Array<{ id: string }>;
+  assert.ok(Array.isArray(arr), 'a pretty-printed array must parse as an array');
+  assert.equal(arr.length, 2);
+  assert.equal(arr[0].id, 'a');
+
+  // Pretty-printed object.
+  const prettyObj = parseCliJson('{\n  "ok": true,\n  "fileKey": "k"\n}') as { fileKey: string };
+  assert.equal(prettyObj.fileKey, 'k');
+
+  // The original shape must still work: log lines, then single-line JSON.
+  const logged = parseCliJson('[info] starting\n[info] done\n{"ok":true,"data":{"x":1}}') as { ok: boolean };
+  assert.equal(logged.ok, true);
+
+  // Non-JSON output is reported as absent, not as a crash.
+  assert.equal(parseCliJson('Task status: submitted\n  title: x'), undefined);
+  assert.equal(parseCliJson(''), undefined);
+});
