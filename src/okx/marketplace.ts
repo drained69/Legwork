@@ -279,11 +279,39 @@ export async function taskDetail(jobId: string): Promise<{ ok: boolean; task?: M
  * call. This is the non-financial half of claiming: it tells the buyer a
  * provider picked the task up, which is precisely the signal that was missing.
  */
-export async function contactUser(jobId: string): Promise<{ ok: boolean; error?: string }> {
+export async function contactUser(jobId: string, toAgentId?: string): Promise<{ ok: boolean; error?: string }> {
   if (!config.okx.aspAgentId) return { ok: false, error: 'OKX_ASP_AGENT_ID not set' };
   const res = await cli<unknown>(['contact-user', jobId, '--agent-id', config.okx.aspAgentId]);
-  audit('okx-marketplace', res.ok ? 'CONTACTED' : 'CONTACT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
-  return { ok: res.ok, error: res.error };
+  if (res.ok) {
+    audit('okx-marketplace', 'CONTACTED', `job=${jobId}`);
+    return { ok: true };
+  }
+
+  // `contact-user` is a convenience wrapper over `session create` + the opener
+  // message, so it inherits the 0.1.10 gateway-notify failure: it exits 1 on
+  // ECONNREFUSED even though the session is usable. Left unhandled this blocks
+  // CLAIMING — the poller refuses to apply to a buyer it never greeted, so
+  // every designated task sits unclaimed until the marketplace expires it.
+  // Fall back to opening the channel ourselves and sending our own opener.
+  if (toAgentId) {
+    const session = await ensureSession(jobId, toAgentId);
+    if (session.ok) {
+      const greeting = await chatToBuyer(
+        jobId,
+        toAgentId,
+        "Hi — Legwork here (agent 6658). I've picked up your job task and I'm ready to start. " +
+          'Reply with your criteria — target roles, must-have skills, minimum base salary and locations — ' +
+          'and I will return a ranked shortlist scored against them.',
+      );
+      if (greeting.ok) {
+        audit('okx-marketplace', 'CONTACTED', `job=${jobId} (own opener; contact-user reported ${res.error ?? 'failure'})`);
+        return { ok: true };
+      }
+    }
+  }
+
+  audit('okx-marketplace', 'CONTACT_FAILED', `job=${jobId} ${res.error ?? ''}`.trim());
+  return { ok: false, error: res.error };
 }
 
 /**
@@ -639,8 +667,25 @@ export async function ensureSession(jobId: string, toAgentId: string): Promise<{
     '--to-agent-id', toAgentId,
     '--json',
   ], 30_000);
-  audit('okx-marketplace', created.ok ? 'XMTP_SESSION_CREATED' : 'XMTP_SESSION_FAILED', `job=${jobId} to=${toAgentId} ${created.error ?? ''}`.trim());
-  return { ok: created.ok, error: created.error };
+  if (created.ok) {
+    audit('okx-marketplace', 'XMTP_SESSION_CREATED', `job=${jobId} to=${toAgentId}`);
+    return { ok: true };
+  }
+
+  // A non-zero exit does NOT mean no session. Since okx-a2a 0.1.10, `session
+  // create` also notifies a GATEWAY over an RPC port that only exists when an
+  // OpenClaw/Hermes gateway is installed; without one it exits 1 on
+  // ECONNREFUSED — after having written the local session that XMTP actually
+  // needs. Verified in the container: create exits 1, then `find` returns the
+  // sessionKey and messages send normally. So ask again before believing it.
+  const recheck = await a2a(['session', 'find', '--job-id', jobId, '--to-agent-id', toAgentId, '--json'], 20_000);
+  if (recheck.ok && /sessionKey/.test(recheck.raw)) {
+    audit('okx-marketplace', 'XMTP_SESSION_CREATED', `job=${jobId} to=${toAgentId} (gateway notify failed, session usable)`);
+    return { ok: true };
+  }
+
+  audit('okx-marketplace', 'XMTP_SESSION_FAILED', `job=${jobId} to=${toAgentId} ${created.error ?? ''}`.trim());
+  return { ok: false, error: created.error };
 }
 
 /** One decoded chat message from the task's XMTP group. */

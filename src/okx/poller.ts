@@ -330,7 +330,7 @@ async function claim(task: MarketplaceTask, engagement: Engagement, deps: Poller
         console.warn(`[okx-poller] ${task.jobId}: A2A chat down — applying without the buyer greeting so the task does not expire.`);
       }
     } else {
-      const contact = await contactUser(task.jobId);
+      const contact = await contactUser(task.jobId, engagement.okxBuyerAgentId ?? task.counterpartyAgentId);
       if (contact.ok) {
         engagement.claimedAt = now();
         saveEngagement(engagement);
