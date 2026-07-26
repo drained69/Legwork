@@ -417,3 +417,29 @@ test('delivery: pretty-printed JSON arrays parse — a bare "{" line must not di
   assert.equal(parseCliJson('Task status: submitted\n  title: x'), undefined);
   assert.equal(parseCliJson(''), undefined);
 });
+
+test('delivery: the canonical artifact survives — CLIs get a disposable copy', async () => {
+  // Verified in production: after a delivery the original .md was GONE from
+  // $DATA_DIR/deliverables. The tooling consumes the file it is handed, which
+  // destroys the dispute evidence and leaves the repair path unable to re-send
+  // as a file. The CLI must never be given our only copy.
+  setState({ retrievable: true });
+  const engagement = newEngagement('0xjob-artifact');
+
+  await submitDeliverable(engagement, PAYLOAD, 'summary');
+
+  const stored = getEngagementById(engagement.id)!;
+  assert.ok(stored.deliverableFile, 'the artifact path is recorded');
+  assert.equal(readFileSync(stored.deliverableFile!, 'utf8'), PAYLOAD, 'and the artifact still exists afterwards');
+
+  // Every CLI that touches a file must have been handed the copy, not it.
+  const calls = readState().calls;
+  const fileArgs = calls
+    .filter((c) => c.includes('--file'))
+    .map((c) => c.split(/--file(?:-path)? /)[1]?.split(' ')[0])
+    .filter(Boolean);
+  assert.ok(fileArgs.length > 0, 'a file was passed to the CLI');
+  for (const arg of fileArgs) {
+    assert.notEqual(arg, stored.deliverableFile, 'the canonical artifact must never be handed to a CLI');
+  }
+});

@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { copyFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { config } from '../config.js';
 import { audit } from '../db.js';
 
@@ -351,13 +354,29 @@ export async function deliverTask(
   //   2. file-upload — encrypts the file and returns the envelope the
   //      `[intent:deliver]` message carries. Done here so an upload failure is
   //      known before we burn the irreversible submit.
+  // Hand the CLIs a DISPOSABLE COPY, never our canonical artifact. Verified in
+  // production: after a delivery the original .md was gone from
+  // $DATA_DIR/deliverables — the tooling consumes the file it is given. That
+  // destroys the dispute evidence we are supposed to retain and leaves the
+  // repair path unable to re-send as a file.
+  let cliFile = opts.file;
+  if (opts.file) {
+    try {
+      const tmp = join(tmpdir(), `legwork-deliver-${jobId.slice(0, 18)}-${Date.now()}.md`);
+      await copyFile(opts.file, tmp);
+      cliFile = tmp;
+    } catch (err) {
+      console.warn(`[okx-marketplace] ${jobId}: could not copy the deliverable (${String(err)}) — passing the original.`);
+    }
+  }
+
   let fileMeta: FileDeliverMeta | undefined;
   if (opts.file) {
-    const attachRes = await attachDeliverable(jobId, opts.file);
+    const attachRes = await attachDeliverable(jobId, cliFile);
     if (attachRes.ok) console.log(`[okx-marketplace] ${jobId}: attached deliverable to task (buyer-queryable in list-attachments).`);
     else console.warn(`[okx-marketplace] ${jobId}: task-attach notice (${attachRes.error}) — relying on the XMTP intent message.`);
 
-    const uploadRes = await uploadFileDeliverable(opts.file, jobId);
+    const uploadRes = await uploadFileDeliverable(cliFile, jobId);
     if (uploadRes.ok && uploadRes.data) {
       fileMeta = uploadRes.data;
       console.log(`[okx-marketplace] ${jobId}: uploaded encrypted file envelope key=${fileMeta.fileKey}`);
@@ -371,7 +390,7 @@ export async function deliverTask(
     // A real file, not `--deliverable-text`: the CLI converts any text over
     // 200 chars into a temp .md anyway, and an explicit path gives us a stable
     // filename plus a local artifact to fall back on and to keep as evidence.
-    '--file', opts.file,
+    '--file', cliFile,
     '--message', opts.message,
     '--agent-id', config.okx.aspAgentId,
   ]);
