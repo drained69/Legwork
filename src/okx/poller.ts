@@ -331,16 +331,38 @@ async function claim(task: MarketplaceTask, engagement: Engagement, deps: Poller
       }
     } else {
       const contact = await contactUser(task.jobId, engagement.okxBuyerAgentId ?? task.counterpartyAgentId);
-      if (contact.ok) {
+      if (contact.ok || /already|exists|duplicate/i.test(contact.error ?? '')) {
         engagement.claimedAt = now();
         saveEngagement(engagement);
         console.log(`[okx-poller] claimed ${task.jobId} — "${task.title}"`);
-      } else if (!/already|exists|duplicate/i.test(contact.error ?? '')) {
-        console.error(`[okx-poller] contact-user failed for ${task.jobId}: ${contact.error}`);
-        return; // retry next tick rather than applying to a buyer we never greeted
       } else {
-        engagement.claimedAt = now(); // channel already open from an earlier run
-        saveEngagement(engagement);
+        // The greeting failed. NEVER let that stop the on-chain apply: applying
+        // is the only thing that halts the expiry clock, and a buyer whose task
+        // sits in `created` reads it as an ASP that ignored them — reported
+        // live, with escrow already funded, at 5.5 minutes and counting. This
+        // is the same rule the comms-down branch above already applies; the
+        // early return here contradicted it and cost real tasks.
+        //
+        // `contact-user` bundles session-create with the opener, and its
+        // session-create leg fails on installs where the CLI expects an AI
+        // gateway. Our own path does not, so try the greeting directly before
+        // giving up on it.
+        console.error(`[okx-poller] contact-user failed for ${task.jobId}: ${contact.error}`);
+        const buyer = engagement.okxBuyerAgentId ?? task.counterpartyAgentId;
+        if (buyer) {
+          const greeting = await chatToBuyer(
+            task.jobId,
+            buyer,
+            `Hi — Legwork (agent ${config.okx.aspAgentId}) here. I have picked up "${task.title}" and am applying now.\n\n` +
+              'Reply here with your criteria — target roles, must-have skills, minimum base salary and locations — ' +
+              'and the ranked shortlist will be scored against exactly those.',
+          );
+          if (greeting.ok) {
+            engagement.claimedAt = now();
+            saveEngagement(engagement);
+            console.log(`[okx-poller] greeted ${task.jobId} directly after contact-user failed.`);
+          }
+        }
       }
     }
   }

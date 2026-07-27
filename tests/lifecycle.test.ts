@@ -354,3 +354,30 @@ test('lifecycle: a provisional query that matches nothing retries with a searcha
   assert.equal(headerRole, criteriaLine, 'the stated assumption matches what was hunted');
   assert.ok([guessed.roles?.[0], FALLBACK_ROLE].includes(headerRole), `unexpected role searched: ${headerRole}`);
 });
+
+test('lifecycle: a failed greeting never blocks the on-chain apply', async () => {
+  // Reported live: escrow funded, ASP designated, task still `created` at 5.5
+  // minutes because contact-user failed and claim() returned before applying.
+  // Applying is the ONLY thing that stops the expiry clock — an ungreeted
+  // buyer is recoverable, an expired task is not.
+  reset(0); // CREATED
+  const st = read() as State & { contactFails?: boolean; tasks: Array<Record<string, unknown>> };
+  st.contactFails = true;
+  st.tasks[0].statusCode = 0;
+  st.tasks[0].status = 'created';
+  st.tasks[0].designated = true;
+  writeFileSync(statePath, JSON.stringify(st, null, 2));
+
+  const e = db.getEngagementByJob(JOB);
+  if (e) { e.claimedAt = undefined; e.appliedAt = undefined; db.saveEngagement(e); }
+
+  await pollOnce({ bot: null });
+
+  const s = read();
+  assert.ok(
+    s.calls.some((c) => c.startsWith('onchainos agent apply')),
+    `apply must run even though the greeting failed; calls: ${JSON.stringify(s.calls)}`,
+  );
+  // And the buyer still gets told, over the path that does work.
+  assert.ok(s.sentMessages.some((m) => /picked up/i.test(m)), 'a direct greeting is attempted as fallback');
+});

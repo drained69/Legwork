@@ -30,6 +30,14 @@ if (args[0] === '--version') {
 } else if (cmd === 'heartbeat') {
   out({ ok: true, data: {} });
 } else if (cmd === 'contact-user') {
+  // Real failure mode: contact-user bundles session-create with the opener,
+  // and its session-create leg fails on installs expecting an AI gateway.
+  if (state.contactFails) {
+    out({ ok: false, error: 'session create failed: connect ECONNREFUSED 127.0.0.1:18789' });
+    process.exitCode = 1;
+    writeFileSync(statePath, JSON.stringify(state, null, 2));
+    process.exit(1);
+  }
   out({ ok: true, data: {} });
 } else if (cmd === 'apply') {
   out({ ok: true, data: { txHash: '0xapply' } });
