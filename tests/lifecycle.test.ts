@@ -381,3 +381,68 @@ test('lifecycle: a failed greeting never blocks the on-chain apply', async () =>
   // And the buyer still gets told, over the path that does work.
   assert.ok(s.sentMessages.some((m) => /picked up/i.test(m)), 'a direct greeting is attempted as fallback');
 });
+
+// ── the listing rejection: buyer wrote, agent went silent ─────────────────
+
+test('lifecycle: every inbound buyer message gets a reply, not just the first', async () => {
+  // OKX rejected the listing with "unable to receive a response from your
+  // Agent, causing the task to time out". The tester wrote twice more after
+  // delivery and got nothing: the refresh was once-per-engagement, so message
+  // two onwards hit silence. A buyer cannot tell that apart from a dead agent.
+  reset(2); // SUBMITTED — already delivered
+  const e = db.getEngagementByJob(JOB)!;
+  const past = new Date(Date.now() - 20 * 60_000).toISOString();
+  e.deliveredAt = past;
+  e.deliverableSentAt = past;
+  e.shortlist = 'delivered shortlist';
+  e.brief = undefined;
+  e.briefUpdatedAt = undefined;
+  e.refreshSentAt = undefined;
+  e.chatAckAt = undefined;
+  e.chatIngestedThrough = undefined;
+  db.saveEngagement(e);
+
+  const send = (text: string, at: string) => {
+    const st = read() as State & { chatHistory?: unknown[] };
+    st.chatHistory = [{ fromAgentId: '1908', content: text, sentAt: at }];
+    st.sentMessages = [];
+    writeFileSync(statePath, JSON.stringify(st, null, 2));
+  };
+
+  // 1st inbound: real criteria → corrected shortlist.
+  send(BUYER_BRIEF, new Date().toISOString());
+  await pollOnce({ bot: null });
+  assert.ok(read().sentMessages.length > 0, 'first message answered');
+
+  // 2nd inbound, the one that was previously ignored.
+  send('Re-sending in case my earlier reply did not land — same criteria.', new Date(Date.now() + 1000).toISOString());
+  await pollOnce({ bot: null });
+  assert.ok(read().sentMessages.length > 0, 'SECOND message must also be answered — silence failed review');
+
+  // 3rd inbound, conversational, carrying no new criteria.
+  send('Understood, thanks — keep scanning and send anything that clears the bar.', new Date(Date.now() + 2000).toISOString());
+  await pollOnce({ bot: null });
+  assert.ok(read().sentMessages.length > 0, 'a message with no new criteria still gets an answer');
+});
+
+test('lifecycle: a pre-delivery message is acknowledged so the buyer knows it landed', async () => {
+  reset(1); // ACCEPTED, nothing delivered yet
+  const e = db.getEngagementByJob(JOB)!;
+  e.deliveredAt = undefined; e.deliverableSentAt = undefined; e.shortlist = undefined;
+  e.brief = undefined; e.briefUpdatedAt = undefined; e.chatAckAt = undefined;
+  e.chatIngestedThrough = undefined; e.refreshSentAt = undefined;
+  e.acceptedSeenAt = new Date().toISOString();
+  e.criteriaRequestedAt = new Date().toISOString();
+  db.saveEngagement(e);
+
+  const st = read() as State & { chatHistory?: unknown[] };
+  st.chatHistory = [{ fromAgentId: '1908', content: 'Hi — what do you need from me?', sentAt: new Date().toISOString() }];
+  st.sentMessages = [];
+  writeFileSync(statePath, JSON.stringify(st, null, 2));
+
+  await pollOnce({ bot: null });
+
+  const sent = read().sentMessages;
+  assert.ok(sent.length > 0, 'a pre-delivery message is never left hanging');
+  assert.ok(sent.some((m) => /criteria|roles|salary/i.test(m)), `the reply says what is needed: ${JSON.stringify(sent)}`);
+});

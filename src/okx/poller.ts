@@ -208,7 +208,12 @@ async function handleTask(task: MarketplaceTask, deps: PollerDeps): Promise<void
   // negotiation all live there. Skipping this is how a live buyer ended up
   // restating their criteria twice while we were still asking for criteria.
   if (!TERMINAL_STATUSES.includes(task.statusCode)) {
-    await ingestBuyerChat(task, engagement);
+    const inbound = await ingestBuyerChat(task, engagement);
+    // A buyer who writes and hears nothing back concludes the agent is dead —
+    // that is precisely why the listing review failed: the tester's last two
+    // messages went unanswered because the refresh was once-only, and the task
+    // was stopped as timed out. Every inbound message now gets a reply.
+    if (inbound > 0) await answerBuyer(task, engagement);
   }
 
   switch (task.statusCode) {
@@ -528,17 +533,17 @@ export function briefIsUsable(brief: string): boolean {
  * "in case they didn't reach your scanner" — they did, twice, and both copies
  * must not double the brief).
  */
-async function ingestBuyerChat(task: MarketplaceTask, engagement: Engagement): Promise<void> {
-  if (!engagement.okxBuyerAgentId) return;
+async function ingestBuyerChat(task: MarketplaceTask, engagement: Engagement): Promise<number> {
+  if (!engagement.okxBuyerAgentId) return 0;
   const hist = await chatHistory(task.jobId, engagement.okxBuyerAgentId);
-  if (!hist.ok) return;
+  if (!hist.ok) return 0;
 
   const cursor = engagement.chatIngestedThrough ? Date.parse(engagement.chatIngestedThrough) : 0;
   const fresh = hist.messages
     .filter((m) => m.fromAgentId === engagement.okxBuyerAgentId)
     .filter((m) => Date.parse(m.sentAt) > cursor)
     .sort((a, b) => Date.parse(a.sentAt) - Date.parse(b.sentAt));
-  if (!fresh.length) return;
+  if (!fresh.length) return 0;
 
   for (const m of fresh) {
     engagement.brief = appendBrief(engagement.brief, m.content.trim());
@@ -548,6 +553,70 @@ async function ingestBuyerChat(task: MarketplaceTask, engagement: Engagement): P
   saveEngagement(engagement);
   audit('okx-poller', 'BRIEF_INGESTED_XMTP', `job=${task.jobId} messages=${fresh.length}`);
   console.log(`[okx-poller] ${task.jobId}: ingested ${fresh.length} buyer message(s) from XMTP chat into the brief.`);
+  return fresh.length;
+}
+
+/**
+ * Answer an inbound buyer message. Always.
+ *
+ * The listing review failed on exactly this: the tester wrote twice more after
+ * our last delivery, got nothing back, and the task was stopped as timed out.
+ * A buyer cannot distinguish "working as designed" from "dead" — only a reply
+ * can. So every message earns one, and the best available reply is chosen:
+ *
+ *   delivered already  → re-run the hunt against the updated brief and send a
+ *                        corrected shortlist (or say plainly that nothing new
+ *                        clears the bar, and that scanning continues)
+ *   not yet delivered  → confirm what was understood and what happens next, so
+ *                        the buyer knows the criteria landed
+ */
+async function answerBuyer(task: MarketplaceTask, engagement: Engagement): Promise<void> {
+  const buyer = engagement.okxBuyerAgentId;
+  if (!buyer) return;
+
+  if (engagement.deliveredAt) {
+    // maybeRefreshAfterReply re-hunts and replies when the brief is usable.
+    await maybeRefreshAfterReply(task, engagement);
+    const answered =
+      engagement.refreshSentAt && engagement.briefUpdatedAt &&
+      Date.parse(engagement.refreshSentAt) >= Date.parse(engagement.briefUpdatedAt);
+    if (answered) return;
+
+    // It declined to re-hunt (brief still too thin, or nothing new). Say so
+    // rather than leaving the message hanging.
+    const res = await chatToBuyer(
+      task.jobId,
+      buyer,
+      'Got your message — the shortlist for this task has already been delivered, and I have it on file.\n\n' +
+        'If you send concrete criteria (target roles, must-have skills, minimum base salary, locations) I will ' +
+        're-run the hunt against them and send a corrected shortlist here.',
+    );
+    if (res.ok) {
+      engagement.refreshSentAt = now();
+      saveEngagement(engagement);
+    }
+    return;
+  }
+
+  // Pre-delivery: confirm receipt so the buyer is not left wondering, and say
+  // what happens next. Once per inbound batch, tracked on the same cursor.
+  if (engagement.chatAckAt && engagement.briefUpdatedAt &&
+      Date.parse(engagement.chatAckAt) >= Date.parse(engagement.briefUpdatedAt)) return;
+
+  const brief = (engagement.brief ?? '').trim();
+  const usable = briefIsUsable(brief);
+  const res = await chatToBuyer(
+    task.jobId,
+    buyer,
+    usable
+      ? 'Got your criteria — running the hunt against them now. The ranked shortlist is delivered to this task shortly.'
+      : 'Got your message. To score a shortlist properly I still need target roles, must-have skills, a minimum base ' +
+        'salary and locations. Send those here and the hunt starts immediately.',
+  );
+  if (res.ok) {
+    engagement.chatAckAt = now();
+    saveEngagement(engagement);
+  }
 }
 
 /**
@@ -696,9 +765,11 @@ export function provisionalHeader(criteria: HuntCriteria): string {
  * this is a correction loop, not a subscription.
  */
 async function maybeRefreshAfterReply(task: MarketplaceTask, engagement: Engagement): Promise<void> {
-  if (engagement.refreshSentAt || !engagement.okxBuyerAgentId) return;
+  if (!engagement.okxBuyerAgentId) return;
   if (!engagement.briefUpdatedAt || !engagement.deliveredAt) return;
   if (Date.parse(engagement.briefUpdatedAt) <= Date.parse(engagement.deliveredAt)) return;
+  // Answered already for this exact message? Then stay quiet until a new one.
+  if (engagement.refreshSentAt && Date.parse(engagement.refreshSentAt) >= Date.parse(engagement.briefUpdatedAt)) return;
   const brief = (engagement.brief ?? '').trim();
   if (!briefIsUsable(brief)) return;
 
