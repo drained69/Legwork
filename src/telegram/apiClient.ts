@@ -220,7 +220,7 @@ export function tailorViaApi(
 export async function fetchCatalog(): Promise<{
   services: Array<{ id: string; endpoint: string; priceUsd: string; description: string }>;
   freeTier?: { endpoint: string; limitPerHour: number };
-  payment?: { network: string; assetSymbol: string };
+  payment?: { network: string; assetSymbol: string; settlementAvailable?: boolean };
 } | null> {
   try {
     const res = await fetchWithTimeout(`${baseUrl()}/api/services`, {}, PROBE_TIMEOUT_MS);

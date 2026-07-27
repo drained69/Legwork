@@ -159,6 +159,35 @@ function editFieldKeyboard(sectionIndex: number): InlineKeyboard {
   return kb.row().text('‹ Sections', 'profile:edit');
 }
 
+/**
+ * Is this engagement live enough to cover a paid service call?
+ *
+ * The bot cannot pay per call: it holds no wallet it may sign x402
+ * authorizations with, so `apiClient` either presents an engagement token or
+ * the request is refused. Anything paid is therefore engagement-only, and the
+ * menu must say so before the user does any work.
+ */
+export function engagementCovers(e?: Engagement): boolean {
+  if (!e) return false;
+  if (!['active', 'onboarding', 'delivering'].includes(e.status)) return false;
+  return !e.endsAt || new Date(e.endsAt) > new Date();
+}
+
+/** One explanation for every engagement-only action, naming what does work. */
+export function needsEngagement(what: string): string {
+  return (
+    `${title(`${what} needs an active engagement`)}\n\n` +
+    'Paid services run under an engagement bought on the OKX marketplace — they are not charged per message here.\n\n' +
+    '<b>Free right now</b>\n· Preview hunt — your top 3 matches, scored and explained\n· Profile, wallet and status\n\n' +
+    `<b>To unlock the rest</b>\nHire Legwork (agent ${esc(config.okx.agentId)}) on the OKX marketplace. ` +
+    'Every call then runs under that engagement at no extra charge.'
+  );
+}
+
+function needsEngagementKb(): InlineKeyboard {
+  return new InlineKeyboard().text('Free preview', 'act:preview').row().text('Services & pricing', 'act:catalog').text('‹ Menu', 'menu:open');
+}
+
 function backHome(): InlineKeyboard {
   return new InlineKeyboard().text('‹ Back to menu', 'nav:home');
 }
@@ -366,13 +395,19 @@ export function createBot(): Bot {
         case 'preview':
           return void (await runPreviewFlow(ctx, p!));
         case 'score': {
+          // Gate BEFORE asking for a posting. Scoring is only reachable through
+          // an engagement — the bot has no way to make a per-call payment on the
+          // user's behalf — so prompting first and failing after the paste sent
+          // people to a bare "Payment required" with their work already typed.
+          if (!engagementCovers(e)) return void (await send(ctx.reply.bind(ctx), needsEngagement('Scoring a posting'), { ...HTML, reply_markup: needsEngagementKb() }));
           setOnboarding(userId, 'act:score', {});
           return void (await send(ctx.reply.bind(ctx),
-            `${title('Score a posting', 'Live call · $0.01')}\n\nPaste the job posting — title, company and description. I will score it against your profile on the 100-point rubric.`,
+            `${title('Score a posting', 'Covered by your engagement')}\n\nPaste the job posting — title, company and description. I will score it against your profile on the 100-point rubric.`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
           ));
         }
         case 'tailor': {
+          if (!engagementCovers(e)) return void (await send(ctx.reply.bind(ctx), needsEngagement('Tailored drafts'), { ...HTML, reply_markup: needsEngagementKb() }));
           if (!p!.resumeText) {
             return void (await send(ctx.reply.bind(ctx),
               `${title('Résumé needed')}\n\nTailoring writes from your real experience only. Add your résumé first — it is stored and reused.`,
@@ -381,7 +416,7 @@ export function createBot(): Bot {
           }
           setOnboarding(userId, 'act:tailor', {});
           return void (await send(ctx.reply.bind(ctx),
-            `${title('Tailor an application', 'Live call · $0.10')}\n\nPaste the job posting — title, company and description. I will draft a tailored résumé, cover letter and application email.`,
+            `${title('Tailor an application', 'Covered by your engagement')}\n\nPaste the job posting — title, company and description. I will draft a tailored résumé, cover letter and application email.`,
             { ...HTML, reply_markup: new InlineKeyboard().text('Cancel', 'edit:cancel') },
           ));
         }
@@ -1240,13 +1275,23 @@ async function showCatalog(ctx: Ctx): Promise<void> {
       reply_markup: backHome(),
     }));
   }
+  // The catalog reports whether a payment can actually settle. Quoting a
+  // per-call price the buyer cannot pay is the over-promise that gets an agent
+  // rejected, so say how each service is really reachable from here.
+  const payable = catalog.payment?.settlementAvailable === true;
   const rows = catalog.services
-    .map((s) => `<b>${esc(s.id)}</b> · $${esc(s.priceUsd)} per call\n<code>${esc(s.endpoint)}</code>\n${esc(s.description)}`)
+    .map((s) => {
+      const how = payable ? `$${esc(s.priceUsd)} per call` : 'included in an engagement';
+      return `<b>${esc(s.id)}</b> · ${how}\n<code>${esc(s.endpoint)}</code>\n${esc(s.description)}`;
+    })
     .join('\n\n');
   await send(ctx.reply.bind(ctx),
     `${title('Services & pricing', healthy ? 'Live' : 'Service unreachable')}\n\n${rows}` +
-      (catalog.freeTier ? `\n\n<b>Free tier</b> · ${esc(catalog.freeTier.endpoint)} — ${catalog.freeTier.limitPerHour}/hour` : '') +
-      (catalog.payment ? `\n\n<b>Settlement</b> · ${esc(catalog.payment.assetSymbol)} on ${esc(catalog.payment.network)}` : ''),
+      (catalog.freeTier ? `\n\n<b>Free tier</b> · ${esc(catalog.freeTier.endpoint)} — ${catalog.freeTier.limitPerHour}/hour, no charge` : '') +
+      (payable
+        ? (catalog.payment ? `\n\n<b>Settlement</b> · ${esc(catalog.payment.assetSymbol)} on ${esc(catalog.payment.network)}` : '')
+        : `\n\n<b>How to buy</b> · Per-call payment is not open here. Hire Legwork (agent ${esc(config.okx.agentId)}) ` +
+          'on the OKX marketplace — tasks settle in USDT via escrow and every call is then covered.'),
     { ...HTML, reply_markup: backHome() },
   );
 }

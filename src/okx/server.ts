@@ -50,20 +50,26 @@ export const LISTINGS = {
     days: 1,
   },
   'job-hunt-weekly': {
-    title: 'Job Hunt — weekly (7 days)',
-    description: 'Same criteria-approved hunt, running daily for 7 days with fresh shortlists (deduped — never the same posting twice).',
+    title: 'Job Hunt + 7-Day Thread',
+    description:
+      'One ranked shortlist delivered to the task, plus a 7-day private thread where the hunt re-runs every 6 hours ' +
+      'and fresh, de-duplicated matches are sent to you. The recurring scans happen in that thread.',
     priceUsd: '1.00',
     days: 7,
   },
   'tailor-one-application': {
-    title: 'Tailor one application',
-    description: 'One posting: tailored resume variant + cover letter, delivered for your approval. Never fabricates.',
+    title: 'Role-Targeted Shortlist',
+    description:
+      'A ranked shortlist narrowed to one role you name, scored on the same 100-point rubric. Tailored resume and ' +
+      'cover-letter drafting happens in the linked private thread, not in the task deliverable.',
     priceUsd: '0.25',
     days: 1,
   },
   'job-search-sprint-7d': {
-    title: 'Job Search Sprint (7 days) — full loop',
-    description: 'Daily hunt + tailored drafts for top matches + approval-gated submission + weekly digest. The whole search.',
+    title: 'Job Search Sprint (7 Days)',
+    description:
+      'Ranked shortlist delivered to the task, plus a 7-day private thread with the largest call allowance: hunts every ' +
+      '6 hours, tailored drafts from your real experience, and application sending gated on your explicit approval.',
     priceUsd: '2.00',
     days: 7,
   },

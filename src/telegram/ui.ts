@@ -304,10 +304,12 @@ function renderReturningWelcome(s: WelcomeState): string {
 
 export function listingLabel(listing: string): string {
   const labels: Record<string, string> = {
-    'job-hunt': 'Job Hunt (24h)',
-    'job-hunt-weekly': 'Job Hunt Weekly',
-    'tailor-one-application': 'Tailored Application',
-    'job-search-sprint-7d': 'Full Search Sprint',
+    // Kept in step with the on-chain service names a buyer sees on OKX, so the
+    // two surfaces never describe the same purchase differently.
+    'job-hunt': 'Job Hunt Shortlist',
+    'job-hunt-weekly': 'Job Hunt + 7-Day Thread',
+    'tailor-one-application': 'Role-Targeted Shortlist',
+    'job-search-sprint-7d': 'Job Search Sprint (7 Days)',
   };
   return labels[listing] ?? listing;
 }
