@@ -1,8 +1,9 @@
 import { config } from '../config.js';
 import { now, recordUsage, uid } from '../db.js';
 import { fetchWithTimeout } from '../http.js';
-import { engagementToken } from '../okx/server.js';
-import type { Engagement, Posting, Profile, ScoreBreakdown } from '../types.js';
+import { payForService } from '../wallet/baseWallet.js';
+import { serviceById } from '../payments/services.js';
+import type { Posting, Profile, ScoreBreakdown } from '../types.js';
 
 /**
  * Deadlines. A user is watching a chat window, so "no reply ever" is the worst
@@ -19,16 +20,14 @@ const PROBE_TIMEOUT_MS = 8_000;
  * The bot does NOT call the skills in-process — it makes real HTTP requests to
  * Legwork's own public endpoints, exactly as any third-party agent would. That
  * keeps one code path in production: what the user gets in Telegram is served
- * by the same endpoint OKX buyers pay for.
+ * by the same endpoint external clients pay for.
  *
- * Billing: an OKX engagement is already paid for on the marketplace, so calls
- * made on its behalf carry an engagement token instead of an x402 payment —
- * charging again per call would be double-billing. Every call is written to the
- * usage ledger with the user's X Layer wallet for attribution.
+ * Billing: each paid call transfers the service price from the user's Base
+ * Sepolia wallet, then sends the transaction hash to the API for verification.
  */
 
 function baseUrl(): string {
-  return (config.okx.publicUrl || `http://127.0.0.1:${config.okx.endpointPort}`).replace(/\/$/, '');
+  return (config.server.publicUrl || `http://127.0.0.1:${config.server.endpointPort}`).replace(/\/$/, '');
 }
 
 export interface ApiResult<T> {
@@ -42,19 +41,20 @@ export interface ApiResult<T> {
 async function call<T>(
   path: string,
   body: unknown,
-  ctx: { profile?: Profile; engagement?: Engagement; service: string; priceUsd: string; timeoutMs?: number },
+  ctx: { profile?: Profile; service: string; priceUsd: string; timeoutMs?: number },
 ): Promise<ApiResult<T>> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
 
   // Attribution: which wallet this work was done for.
   if (ctx.profile?.wallet) {
     headers['x-user-wallet'] = ctx.profile.wallet;
-    headers['x-user-chain'] = config.x402.network;
+    headers['x-user-chain'] = config.payments.network;
   }
-  // Authorization: prepaid engagement instead of a per-call x402 charge.
-  if (ctx.engagement) {
-    headers['x-engagement-id'] = ctx.engagement.id;
-    headers['x-engagement-token'] = engagementToken(ctx.engagement.id);
+  const service = serviceById(ctx.service);
+  let transactionHash: string | undefined;
+  if (service && ctx.profile?.userId) {
+    transactionHash = await payForService(ctx.profile.userId, service.priceAtomic);
+    headers['x-payment-tx'] = transactionHash;
   }
 
   let status = 0;
@@ -78,7 +78,7 @@ async function call<T>(
     } else {
       error =
         status === 402
-          ? String(payload.error ?? 'This call is not covered by your engagement.')
+          ? String(payload.error ?? 'Payment required for this call.')
           : String(payload.error ?? `Request failed (${status})`);
     }
   } catch (err) {
@@ -89,12 +89,12 @@ async function call<T>(
     recordUsage({
       id: uid(),
       userId: ctx.profile.userId,
-      engagementId: ctx.engagement?.id,
       wallet: ctx.profile.wallet,
       service: ctx.service,
       endpoint: path,
       priceUsd: ctx.priceUsd,
-      paid: billing !== 'engagement',
+      paid: Boolean(transactionHash),
+      transactionHash,
       status,
       at: now(),
     });
@@ -123,12 +123,11 @@ export function criteriaFromProfile(p: Profile): Record<string, unknown> {
   };
 }
 
-export function huntViaApi(profile: Profile, engagement?: Engagement): Promise<ApiResult<HuntApiResult>> {
+export function huntViaApi(profile: Profile): Promise<ApiResult<HuntApiResult>> {
   return call<HuntApiResult>('/api/hunt', criteriaFromProfile(profile), {
     profile,
-    engagement,
     service: 'job-hunt',
-    priceUsd: '0.05',
+    priceUsd: '0.01',
     timeoutMs: HUNT_TIMEOUT_MS,
   });
 }
@@ -183,11 +182,9 @@ export interface ScoreApiResult {
 export function scoreViaApi(
   profile: Profile,
   posting: { title: string; company: string; description: string; location?: string; compMin?: number; compMax?: number; url?: string },
-  engagement?: Engagement,
 ): Promise<ApiResult<ScoreApiResult>> {
   return call<ScoreApiResult>('/api/score', { criteria: criteriaFromProfile(profile), posting }, {
     profile,
-    engagement,
     service: 'score-posting',
     priceUsd: '0.01',
   });
@@ -203,7 +200,6 @@ export interface TailorApiResult {
 export function tailorViaApi(
   profile: Profile,
   posting: { title: string; company: string; description: string; location?: string; url?: string },
-  engagement?: Engagement,
 ): Promise<ApiResult<TailorApiResult>> {
   return call<TailorApiResult>('/api/tailor', {
     candidate: {
@@ -213,7 +209,66 @@ export function tailorViaApi(
       email: profile.email,
     },
     posting,
-  }, { profile, engagement, service: 'tailor-application', priceUsd: '0.10' });
+  }, { profile, service: 'tailor-application', priceUsd: '0.01' });
+}
+
+export interface RedflagApiResult {
+  label: string;
+  confidence: number;
+  verdict: string;
+  company: string;
+  role?: string;
+  flags: Array<{ severity: string; title: string; detail: string; source: string; costUsd?: number }>;
+  questions: string[];
+  checks: Array<{ label: string; status: string; source: string; miner?: string; costUsd: number }>;
+  spendUsd: number;
+  budgetUsd: number;
+  degraded?: boolean;
+}
+
+export function redflagViaApi(
+  profile: Profile,
+  posting: { title: string; company: string; description: string; location?: string; url?: string },
+): Promise<ApiResult<RedflagApiResult>> {
+  // A due-diligence report buys several live miner answers — it gets the long
+  // timeout, like the hunt.
+  return call<RedflagApiResult>('/api/redflag', posting, {
+    profile,
+    service: 'redflag-vetting',
+    priceUsd: '0.05',
+    timeoutMs: HUNT_TIMEOUT_MS,
+  });
+}
+
+/** The free tier: local scam scan + comp benchmark, zero miner spend. */
+export function redflagPreviewViaApi(
+  userId: string,
+  posting: { title?: string; company?: string; description?: string; text?: string; url?: string; location?: string },
+): Promise<ApiResult<RedflagApiResult>> {
+  return callFlatFree<RedflagApiResult>('/api/redflag/preview', posting, userId);
+}
+
+/** Free flat-payload call with per-user rate-limit attribution (no wallet needed). */
+async function callFlatFree<T>(path: string, body: unknown, userId: string): Promise<ApiResult<T>> {
+  try {
+    const res = await fetchWithTimeout(
+      `${baseUrl()}${path}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-internal-client': `telegram:${userId}` },
+        body: JSON.stringify(body ?? {}),
+      },
+      CALL_TIMEOUT_MS,
+    );
+    const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    recordUsage({
+      id: uid(), userId, service: 'redflag-preview', endpoint: path, priceUsd: '0.00', paid: false, status: res.status, at: now(),
+    });
+    if (!res.ok) return { ok: false, error: String(payload.error ?? `Request failed (${res.status})`), status: res.status };
+    return { ok: true, data: payload.result as T, status: res.status };
+  } catch (err) {
+    return { ok: false, error: `Could not reach the service: ${String(err)}`, status: 0 };
+  }
 }
 
 /** Free catalog — powers the menu's live service list. */

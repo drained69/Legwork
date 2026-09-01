@@ -11,6 +11,11 @@
  */
 process.env.DATABASE_PATH = ':memory:';
 process.env.ANTHROPIC_API_KEY = '';
+// Both providers, or dotenv's real key leaks in and the suite makes live API
+// calls — slow, quota-burning, and dependent on someone else's uptime.
+process.env.ANTHROPIC_AUTH_TOKEN = '';
+process.env.GEMINI_API_KEY = '';
+process.env.GOOGLE_API_KEY = '';
 process.env.ADZUNA_APP_ID = '';
 process.env.ADZUNA_APP_KEY = '';
 process.env.USAJOBS_API_KEY = '';
@@ -192,34 +197,4 @@ test('telegram: a full profile renders within one message', () => {
 test('telegram: esc survives undefined without throwing', () => {
   assert.equal(esc(undefined as unknown as string), '');
   assert.equal(esc('<b>&</b>'), '&lt;b&gt;&amp;&lt;/b&gt;');
-});
-
-// ── paid actions are engagement-only; the menu must say so up front ────────
-
-test('telegram: engagementCovers only accepts a live, unexpired engagement', async () => {
-  const { engagementCovers } = await import('../src/telegram/bot.js');
-  const live = { status: 'active', endsAt: new Date(Date.now() + 3600_000).toISOString() };
-  assert.equal(engagementCovers(undefined), false, 'no engagement');
-  assert.equal(engagementCovers(live as never), true);
-  assert.equal(engagementCovers({ ...live, status: 'settled' } as never), false, 'settled is over');
-  assert.equal(engagementCovers({ ...live, status: 'closed' } as never), false);
-  assert.equal(
-    engagementCovers({ status: 'active', endsAt: new Date(Date.now() - 1000).toISOString() } as never),
-    false,
-    'expired window',
-  );
-  assert.equal(engagementCovers({ status: 'active' } as never), true, 'no endsAt = open-ended');
-});
-
-test('telegram: the needs-engagement notice names what is free and how to buy', async () => {
-  // The bot holds no wallet it can sign x402 authorizations with, so paid
-  // services are reachable only through an engagement. Prompting for a posting
-  // first and failing after the paste left users at a bare "Payment required"
-  // with their work already typed.
-  const { needsEngagement } = await import('../src/telegram/bot.js');
-  const msg = needsEngagement('Scoring a posting');
-  assert.match(msg, /needs an active engagement/i);
-  assert.match(msg, /preview/i, 'names the free route');
-  assert.match(msg, /marketplace/i, 'names how to unlock the rest');
-  assert.doesNotMatch(msg, /\$0\.\d/, 'must not quote a per-call price the bot cannot charge');
 });

@@ -1,4 +1,5 @@
 import { INJECTION_GUARD, extractJson, llm, untrusted } from '../llm.js';
+import { mentionsSkill, skillsInText } from './skillVocab.js';
 import type { Posting, Profile, ScoreBreakdown } from '../types.js';
 
 /**
@@ -8,11 +9,19 @@ import type { Posting, Profile, ScoreBreakdown } from '../types.js';
  * Every sub-score carries a one-line reason — the match card renders these,
  * so there is never a black-box number.
  */
-export async function scorePosting(profile: Profile, posting: Posting): Promise<ScoreBreakdown> {
+export async function scorePosting(
+  profile: Profile,
+  posting: Posting,
+  opts?: { llmTimeoutMs?: number; useLlm?: boolean },
+): Promise<ScoreBreakdown> {
   const comp = scoreComp(profile, posting);
   const location = scoreLocation(profile, posting);
   const seniority = scoreSeniority(profile, posting);
-  const { skills, culture } = (await scoreWithLlm(profile, posting)) ?? scoreHeuristic(profile, posting);
+  // `useLlm: false` scores this posting on deterministic axes and keyword
+  // heuristics only, with no network call. The hunt uses it to rank the whole
+  // board cheaply before spending its small LLM budget on the shortlist.
+  const llmScores = opts?.useLlm === false ? null : await scoreWithLlm(profile, posting, opts);
+  const { skills, culture } = llmScores ?? scoreHeuristic(profile, posting);
 
   const total = Math.round(skills.score + comp.score + location.score + seniority.score + culture.score);
   return { skills, comp, location, seniority, culture, total };
@@ -78,7 +87,7 @@ interface LlmScores {
   culture: ScoreBreakdown['culture'];
 }
 
-async function scoreWithLlm(profile: Profile, posting: Posting): Promise<LlmScores | null> {
+async function scoreWithLlm(profile: Profile, posting: Posting, opts?: { llmTimeoutMs?: number }): Promise<LlmScores | null> {
   const system =
     `You are a job-match scorer. ${INJECTION_GUARD} ` +
     'Reply with ONLY a JSON object: {"skills": {"score": 0-40, "reason": "one line"}, ' +
@@ -91,7 +100,7 @@ async function scoreWithLlm(profile: Profile, posting: Posting): Promise<LlmScor
     `Dealbreakers: ${profile.dealbreakers.join(', ') || 'none'}\n` +
     `Stated priorities (score culture against these when present): ${(profile.factors ?? []).join(', ') || 'none stated'}\n\n` +
     `Job: ${posting.title} at ${posting.company}\n${untrusted(posting.description.slice(0, 4000))}`;
-  const reply = await llm(system, user, 400);
+  const reply = await llm(system, user, 400, opts?.llmTimeoutMs);
   if (!reply) return null;
   const parsed = extractJson<{ skills?: { score?: number; reason?: string }; culture?: { score?: number; reason?: string } }>(reply);
   if (!parsed?.skills || !parsed?.culture) return null;
@@ -103,18 +112,54 @@ async function scoreWithLlm(profile: Profile, posting: Posting): Promise<LlmScor
 
 // ── keyless heuristic fallback ─────────────────────────────────────────────
 
+/**
+ * Stacks that imply each other in practice: a posting that wants React almost
+ * always accepts adjacent frontend skills, "node" implies javascript, etc.
+ * Used only for PARTIAL credit — a literal word-boundary match always beats it.
+ */
+const SKILL_NEIGHBORS: Record<string, string[]> = {
+  typescript: ['javascript', 'node', 'react', 'next.js', 'angular', 'vue', 'svelte'],
+  javascript: ['typescript', 'node', 'react', 'vue'],
+  node: ['javascript', 'typescript'],
+  react: ['javascript', 'typescript', 'next.js', 'vue'],
+  python: ['django', 'flask', 'fastapi', 'pandas', 'numpy'],
+  go: ['golang', 'kubernetes', 'docker'],
+  postgres: ['mysql', 'sql', 'database'],
+  kubernetes: ['docker', 'terraform', 'aws'],
+  aws: ['gcp', 'azure', 'docker', 'kubernetes'],
+  'machine learning': ['pytorch', 'tensorflow', 'python', 'nlp'],
+};
+
 function scoreHeuristic(profile: Profile, posting: Posting): LlmScores {
-  const text = `${posting.title} ${posting.description}`.toLowerCase();
-  const hits = profile.skills.filter((s) => text.includes(s.toLowerCase()));
-  const frac = profile.skills.length ? hits.length / profile.skills.length : 0;
-  const skillsScore = Math.round(frac * 40);
+  const text = `${posting.title} ${posting.description}`;
+  const postingSkills = new Set(skillsInText(text));
+
+  // Word-boundary matching (not substring): "go" must not match "django".
+  // Partial credit for adjacent-stack skills so a TypeScript candidate on a
+  // JavaScript posting scores meaningfully rather than zero.
+  const direct: string[] = [];
+  const adjacent: string[] = [];
+  for (const skill of profile.skills) {
+    if (mentionsSkill(text, skill) || postingSkills.has(skill)) direct.push(skill);
+    else if ((SKILL_NEIGHBORS[skill] ?? []).some((n) => postingSkills.has(n))) adjacent.push(skill);
+  }
+  const denom = profile.skills.length || 1;
+  const skillsScore = Math.min(40, Math.round((direct.length + adjacent.length * 0.5) / denom * 40));
+
+  const skillsReason = direct.length
+    ? `${direct.length}/${profile.skills.length} of your skills appear${adjacent.length ? ` (${direct.slice(0, 4).join(', ')}) plus adjacent stack (${adjacent.slice(0, 3).join(', ')})` : `: ${direct.slice(0, 4).join(', ')}`}`
+    : adjacent.length
+      ? `Posting stack is adjacent to your skills (${adjacent.slice(0, 3).join(', ')} → ${[...postingSkills].slice(0, 4).join(', ') || 'related stack'})`
+      : profile.skills.length
+        ? `Posting stack (${[...postingSkills].slice(0, 4).join(', ') || 'not in vocabulary'}) does not overlap your skills`
+        : 'No candidate skills stated — skills axis unscored';
 
   // Culture axis: when the user stated explicit priority factors, score how
   // many the posting satisfies. Neutral 6/10 only when no factors were given.
   const factors = profile.factors ?? [];
   let culture: LlmScores['culture'];
   if (factors.length) {
-    const fHits = factors.filter((f) => text.includes(f.toLowerCase()));
+    const fHits = factors.filter((f) => text.toLowerCase().includes(f.toLowerCase()));
     culture = {
       score: Math.round((fHits.length / factors.length) * 10),
       max: 10,
@@ -127,13 +172,7 @@ function scoreHeuristic(profile: Profile, posting: Posting): LlmScores {
   }
 
   return {
-    skills: {
-      score: skillsScore,
-      max: 40,
-      reason: hits.length
-        ? `${hits.length}/${profile.skills.length} of your skills appear: ${hits.slice(0, 4).join(', ')}`
-        : 'None of your listed skills appear in the posting',
-    },
+    skills: { score: skillsScore, max: 40, reason: skillsReason },
     culture,
   };
 }

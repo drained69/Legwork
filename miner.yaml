@@ -1,0 +1,427 @@
+# Telegraph miner configuration for Legwork.
+#
+# Registered on Base Sepolia via the Diamond contract (see
+# scripts/register-miner.sh). This file is served VERBATIM at GET /miner.yaml —
+# nodes verify its SHA-256 against the on-chain commitment, so never template
+# it at runtime. After ANY edit: deploy first, then run
+# `scripts/register-miner.sh --update <registrationId>` to commit the new hash.
+#
+# Docs: https://docs.telegraphprotocol.com/docs/miners/yaml-config
+#
+# Routing notes — shaped by how the node routes traffic:
+#   - `intents` on every endpoint: routing selects endpoints BY INTENT. An
+#     endpoint that declares none can never be selected and receives nothing.
+#   - `params` on every endpoint: the node's request builder reads this
+#     contract to build well-formed calls. Without it the builder guesses
+#     field names and calls start arriving with nothing we can act on.
+#   - `input_schema` is the ONLY thing the engine forwards. Params not
+#     declared here are never sent, and the user's RAW question is forwarded
+#     only under `q` or `query` — so both are declared, and every endpoint
+#     takes its task text from them.
+#   - descriptions are read by the engine's LLM router to decide which miner
+#     to pick for a query — they state exactly what to send, what comes back,
+#     and which queries belong here.
+#   - `limitations` let the node pre-validate requests (no wasted paid calls).
+#   - `cache_ttl_sec: 30` keeps repeated spot-check queries consistent without
+#     ever serving stale job data (boards don't change in 30 seconds).
+version: "1"
+kind: miner
+id: 8402
+slug: legwork-job-hunter
+protocol: generic
+name: Legwork Job Hunter
+description: >
+  Live job search and job-application writing, answered from real job boards
+  on every single call — never from a cached index, a stale scrape, or a
+  language model's memory of what was hiring last year.
+
+
+  WHAT IT DOES — TWO CAPABILITIES.
+
+
+  (1) JOB SEARCH. Send the user's request exactly as they wrote it — "senior
+  backend engineer, TypeScript, remote, $150k+", "who is hiring registered
+  nurses in Austin", "what does a data analyst earn in New York", "entry
+  level government jobs" — and get back a ranked shortlist of roles that are
+  open right now, queried live at request time from three independent boards
+  — Adzuna (commercial listings worldwide), USAJOBS (the official US federal
+  board) and Remotive (remote-first roles) — so a search is not hostage to
+  any single board's coverage or uptime. Every match returns the job title, the hiring company, the location,
+  whether it is remote, the real posted salary range, a direct link to the
+  live posting, the board it came from, and an explained 0-100 match score.
+  The score is a published rubric rather than a black-box percentage: skills
+  40 points, pay 20, location 15, seniority 15, and the caller's own stated
+  priorities 10. Each axis returns its own number AND a one-line reason, so
+  a caller can see exactly why the first result outranked the second, and
+  can defend that ranking to the person who asked.
+
+
+  PAY QUESTIONS ARE ANSWERED WITH A NUMBER. Ask "what does a data analyst
+  earn in New York" or "how much do registered nurses make in Austin" and the
+  reply is the actual figure — median, typical range and full observed range —
+  computed from the live postings that publish a salary, with the sample size
+  stated and postings without a published salary excluded rather than guessed
+  at. These are advertised salaries from openings that are live right now, not
+  survey data.
+
+
+  (2) APPLICATION WRITING. Send any job-search writing task — "write a cover
+  letter for this role", "tailor my resume to this posting", "draft a
+  follow-up email after my interview", "write a LinkedIn summary", "write a
+  cold outreach note to this recruiter" — optionally together with the
+  candidate's real resume and the target job posting. It returns a finished,
+  ready-to-send document: a tailored resume, a cover letter, an email
+  subject line and an email body, addressed to the named role and company.
+  Documents are written strictly from the facts the caller actually supplied
+  — no employer, job title, date, degree or metric is ever invented, and any
+  genuinely missing personal detail is left as one clearly marked
+  [placeholder] rather than fabricated.
+
+
+  ROUTE ANY OF THESE HERE: open jobs, job openings, who is hiring, job
+  hunting, job boards, career moves, what a role pays, salary ranges by job
+  title or by city, compensation benchmarks, remote work listings, federal
+  and government jobs, hiring in a named city or country, plus resumes, CVs,
+  cover letters, application emails, recruiter outreach, interview
+  follow-ups, thank-you notes and LinkedIn profile summaries.
+
+
+  DO NOT ROUTE HERE FOR: general web search, current news, academic or
+  scientific research, company financials or stock data, or open-ended
+  conversation unrelated to work and hiring.
+
+
+  RELIABILITY CONTRACT. This miner always answers with HTTP 2xx and a
+  complete, scoreable signal — label, confidence and reason are present on
+  every response without exception, including for malformed or empty input.
+  Confidence is honest and self-assessed rather than a flattering constant:
+  it is high when the live boards answered and produced real matches, and it
+  degrades openly when a source fails or the market genuinely returns
+  nothing, so a caller is never handed a thin answer dressed up as a strong
+  one.
+
+base_url: https://legwork-production-88e5.up.railway.app
+
+docs:
+  website: https://legwork-production-88e5.up.railway.app
+  documentation: https://legwork-production-88e5.up.railway.app/miner.yaml
+
+auth:
+  type: none
+
+# 5 req/s headroom for tournament bursts — each hunt fans out to Adzuna +
+# USAJOBS in parallel. A 30s breaker cooldown recovers quickly if the breaker
+# ever trips.
+rate_limit_per_sec: 5
+cache_ttl_sec: 30
+circuit_threshold: 5
+circuit_cooldown_seconds: 30
+
+# `error` is kept for the paid direct API only. The /miner/* surface NEVER
+# returns a non-2xx: a non-2xx is a guaranteed 0 because the engine stores an
+# empty answer and the scorer never reads the body. Every failure there
+# degrades to a 200 carrying an honest low confidence instead.
+errors:
+  message_path: error
+
+# Node-side pre-validation. Kept deliberately generous: a request the node
+# refuses is a request we never get to score on, so these caps sit far above
+# any realistic query rather than tightly around it. Oversized bodies are
+# truncated and answered, never rejected.
+limitations:
+  - code: MAX_PARAM_VALUE
+    message: query is the user's job-search request or writing task in plain text; keep it under 8000 characters.
+    param: query
+    property: length
+    value_num: 8000
+    operator: lte
+  - code: MAX_BODY_SIZE
+    message: Request bodies over 1 MB are rejected (a full resume + posting fits comfortably).
+    property: size_bytes
+    value_bytes: 1000000
+
+endpoints:
+  - path: /job-hunt
+    external_path: /miner/job-hunt
+    method: POST
+    description: >
+      Search live job boards (Adzuna, USAJOBS, Remotive) and return either a
+      ranked, scored shortlist of open roles, or — when the request asks what
+      something PAYS — a computed salary answer (median, quartile range and
+      sample size) synthesised from the live postings. Requests naming no
+      occupation or skill are declined rather than answered with unrelated
+      listings. Only postings genuinely about
+      the requested occupation are returned — an unrelated listing is
+      dropped rather than ranked, so an empty shortlist means the market is
+      empty, not that the filter was loose. Send the user's complete job-search request
+      verbatim as query — it is parsed into structured criteria (roles,
+      seniority, locations, salary floor, skills). Structured fields may be
+      sent alongside to pin the criteria exactly. Every match returns title,
+      company, location, salary range, posting URL, source board and an
+      explained 0-100 rubric score (skills 40 / pay 20 / location 15 /
+      seniority 15 / extra factors 10). Use for any question about open
+      postings, hiring, or what a role pays.
+    intents: [WEB_SEARCH, RESEARCH_SYNTHESIS]
+    params:
+      body:
+        required:
+          - name: query
+            type: string
+            intents: ["*"]
+            description: >
+              The job search as the user phrased it, e.g. "senior backend
+              engineer, TypeScript, remote, $150k+" or "what does a data
+              analyst earn in New York". Roles, seniority, locations, salary
+              floor and skills are extracted from this text. State salary as
+              a minimum ("$150k+"), never as a range maximum.
+        optional:
+          - name: q
+            type: string
+            intents: ["*"]
+            description: >
+              Alias for query. The engine forwards the user's raw question
+              under `q` or `query`; either is accepted and both mean the same
+              thing. Send only one.
+          - name: roles
+            type: array
+            intents: ["*"]
+            description: >
+              Target job titles, e.g. ["backend engineer", "platform
+              engineer"]. Becomes the job-board search query, so precise
+              titles work better than sentences.
+          - name: seniority
+            type: string
+            intents: ["*"]
+            description: >
+              Seniority level to match — one of: junior, mid, senior, staff,
+              principal. Defaults to mid.
+          - name: locations
+            type: array
+            intents: ["*"]
+            description: >
+              Preferred locations, e.g. ["remote", "new york"]. Include
+              "remote" if remote work is acceptable; well-known city names
+              work best.
+          - name: compFloor
+            type: number
+            intents: ["*"]
+            description: >
+              Minimum acceptable annual salary in USD, e.g. 150000. This is a
+              floor, not a target — overshooting filters out valid postings
+              and returns an empty shortlist. 0 or omitted means no floor.
+          - name: skills
+            type: array
+            intents: ["*"]
+            description: >
+              Skills to score against, e.g. ["typescript", "react",
+              "postgres"]. Skills carry the largest share (40 of 100 points)
+              of every match score.
+          - name: factors
+            type: array
+            intents: ["*"]
+            description: >
+              Priority factors to score beyond the core rubric, e.g.
+              ["equity", "4-day week", "visa sponsorship"].
+
+  - path: /tailor
+    external_path: /miner/tailor
+    method: POST
+    description: >
+      Write job-application documents: a tailored resume, a cover letter, an
+      application email, recruiter outreach, an interview follow-up or a
+      LinkedIn summary. Scoped to job-application writing — a general writing
+      task (a poem, an essay, code) is declined rather than answered with a
+      cover letter. Send the writing task verbatim as
+      prompt — "write a cover letter for the Senior Engineer role at Acme" —
+      and optionally the structured objects candidate (name, resumeText,
+      skills, email) and posting (title, company, description) for a fully
+      tailored draft drawn strictly from the candidate's real experience;
+      nothing is ever invented. With structured input the response carries
+      resume, coverLetter, emailSubject and emailBody; with a prompt alone it
+      carries the best draft possible from stated facts plus generatedText.
+      Use for any writing task about resumes, cover letters, applications,
+      outreach or job-search materials.
+    intents: [TEXT_GENERATION]
+    params:
+      body:
+        required:
+          - name: query
+            type: string
+            intents: ["*"]
+            description: >
+              The writing task exactly as the user requested it, e.g. "write
+              a cover letter for a senior backend engineer position at Acme
+              Corp" or "draft a resume summary for a career switcher moving
+              from teaching to data analysis". This is the field the engine
+              forwards the raw question in, so it is the one to send.
+        optional:
+          - name: prompt
+            type: string
+            intents: ["*"]
+            description: >
+              Alias for query — the writing task. Accepted identically; send
+              only one of query, q or prompt.
+          - name: q
+            type: string
+            intents: ["*"]
+            description: Alias for query — the writing task.
+          - name: candidate
+            type: object
+            intents: ["*"]
+            description: >
+              The candidate's real facts as an object: { "name": string,
+              "resumeText": string, "skills": string[], "email": string }.
+              resumeText is the candidate's full current resume text. When
+              supplied together with posting, the draft is drawn strictly
+              from these facts.
+          - name: posting
+            type: object
+            intents: ["*"]
+            description: >
+              The job posting to tailor for, as an object: { "title": string,
+              "company": string, "description": string, "location": string,
+              "url": string }. description should carry the posting's full
+              text — tailoring quality depends on it.
+
+# The engine forwards ONLY the properties declared here, and it forwards the
+# user's raw, unmodified question only when `q` or `query` is declared. Both
+# are declared for exactly that reason — without them this miner would be
+# routed questions it never actually receives the text of.
+input_schema:
+  type: object
+  properties:
+    query:
+      type: string
+      description: >
+        The user's request, verbatim. For job search, the search as they
+        phrased it — "senior backend engineer, TypeScript, remote, $150k+" —
+        parsed into structured criteria. For application writing, the writing
+        task — "write a cover letter for the Senior Engineer role at Acme".
+        This single field is enough on its own for either capability.
+    q:
+      type: string
+      description: >
+        Alias for query, accepted identically. Send the user's raw question
+        in either field; both are read.
+    prompt:
+      type: string
+      description: (tailor) The writing task, e.g. "write a cover letter for the Senior Engineer role at Acme".
+    roles:
+      type: array
+      items: { type: string }
+      description: (job-hunt) Target job titles, e.g. ["backend engineer"].
+    seniority:
+      type: string
+      description: (job-hunt) junior | mid | senior | staff | principal.
+    locations:
+      type: array
+      items: { type: string }
+      description: (job-hunt) Preferred locations; include "remote" if acceptable.
+    compFloor:
+      type: number
+      description: (job-hunt) Minimum annual salary in USD — a floor, not a target.
+    skills:
+      type: array
+      items: { type: string }
+      description: (job-hunt) Skills to score against; (tailor) the candidate's actual skills.
+    factors:
+      type: array
+      items: { type: string }
+      description: (job-hunt) Priority factors, e.g. ["equity", "4-day week"].
+    candidate:
+      type: object
+      description: (tailor) { name, resumeText, skills, email } — the candidate's real facts.
+    posting:
+      type: object
+      description: (tailor) { title, company, description, location, url } — the target posting.
+
+output_schema:
+  type: object
+  properties:
+    label:
+      type: string
+      description: >
+        Primary answer — match count and top result with its score and pay
+        range (job-hunt), or the tailored-application title (tailor).
+    confidence:
+      type: number
+      description: 0-1 self-assessed quality; degrades on source errors or empty boards.
+    reason:
+      type: string
+      description: >
+        Reasoning: criteria used, sources scanned, and the top matches with
+        their scores and salary ranges (job-hunt), or the tailoring approach
+        (tailor).
+    found:
+      type: integer
+      description: (job-hunt) Postings scanned across job boards.
+    match_count:
+      type: integer
+      description: (job-hunt) Number of matches in the shortlist; 0 for tailor.
+    matches:
+      type: array
+      description: >
+        (job-hunt) Ranked matches, best first. Each item: title, company,
+        location, remote, compMin, compMax, url, source board, score (0-100)
+        and the full per-axis breakdown.
+      items:
+        type: object
+    generatedText:
+      type: string
+      description: (tailor) The complete written deliverable for the prompt.
+    resume:
+      type: string
+      description: (tailor) Tailored resume text.
+    coverLetter:
+      type: string
+      description: (tailor) Tailored cover letter text.
+    emailSubject:
+      type: string
+      description: (tailor) Ready-to-send email subject line.
+    emailBody:
+      type: string
+      description: (tailor) Ready-to-send email body.
+
+semantics:
+  signal_mapping:
+    label_field: label
+    confidence_field: confidence
+    reason_field: reason
+  supported_intents:
+    - WEB_SEARCH
+    - RESEARCH_SYNTHESIS
+    - TEXT_GENERATION
+
+on_chain:
+  transform: direct
+  min_price_usdc: 0.01
+  fields:
+    strings:
+      - index: 0
+        name: label
+        description: Primary answer — match count and top result.
+        source_path: label
+    integers:
+      - index: 0
+        name: matches_count
+        description: Number of matching roles in the shortlist.
+        source_path: match_count
+      - index: 1
+        name: confidence_x10000
+        description: Self-assessed quality, scaled by 10000.
+        source_path: confidence
+        multiplier: 10000
+  request:
+    - endpoint: job-hunt
+      method: POST
+      body:
+        query: { source: strings.0, optional: true }
+    - endpoint: tailor
+      method: POST
+      body:
+        # The on-chain request carries ONE string, and it is the writing task.
+        # This previously mapped `candidate` (an object) from that string and
+        # `posting` from `strings.1` — an index this contract never defines —
+        # so an on-chain tailor call arrived with a malformed candidate and no
+        # task text at all. `query` is the endpoint's own required field.
+        query: { source: strings.0, optional: true }

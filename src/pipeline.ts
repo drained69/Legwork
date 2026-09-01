@@ -3,14 +3,13 @@ import {
   countApplicationsToday,
   createApplication,
   getApplicationByPosting,
-  getProfile,
   now,
   uid,
 } from './db.js';
 import { scanForUser } from './skills/jobScraper.js';
 import { scorePosting } from './skills/matchScorer.js';
 import { tailorApplication } from './skills/applicationTailor.js';
-import type { Application, Draft, Engagement, Posting, ScoreBreakdown } from './types.js';
+import type { Application, Draft, Posting, Profile, ScoreBreakdown } from './types.js';
 
 export interface MatchCard {
   application: Application;
@@ -28,16 +27,12 @@ export interface ScanSummary {
 }
 
 /**
- * One engagement scan cycle: scrape → score → (above threshold) tailor →
+ * One scan cycle for a user: scrape → score → (above threshold) tailor →
  * create pending application. Returns match cards for the notifier
- * (Telegram in production, console in demo) to render.
+ * (Telegram in production) to render.
  */
-export async function runScanCycle(engagement: Engagement): Promise<ScanSummary> {
-  if (!engagement.userId) return { cards: [], found: 0, scoredBelowThreshold: 0, cappedOut: false, sourceErrors: [] };
-  const profile = getProfile(engagement.userId);
-  if (!profile) return { cards: [], found: 0, scoredBelowThreshold: 0, cappedOut: false, sourceErrors: [] };
-
-  const scan = await scanForUser(profile, engagement.id);
+export async function runScanCycle(profile: Profile): Promise<ScanSummary> {
+  const scan = await scanForUser(profile);
   const cards: MatchCard[] = [];
   let below = 0;
   let cappedOut = false;
@@ -57,13 +52,12 @@ export async function runScanCycle(engagement: Engagement): Promise<ScanSummary>
       continue; // below-threshold postings are counted per scan, not persisted
     }
     // Idempotency: never create two applications for the same posting.
-    if (getApplicationByPosting(engagement.id, posting.id)) continue;
+    if (getApplicationByPosting(profile.userId, posting.id)) continue;
 
     const draft = await tailorApplication(profile, posting);
     const application: Application = {
       id: uid(),
       userId: profile.userId,
-      engagementId: engagement.id,
       postingId: posting.id,
       draftId: draft.id,
       status: 'pending_approval',

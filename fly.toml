@@ -5,7 +5,6 @@ primary_region = "iad"
 [build]
 
 [env]
-  OKX_ENDPOINT_PORT = "8402"
   DATABASE_PATH = "/data/legwork.db"
   DATA_DIR = "/data"
 
@@ -16,7 +15,7 @@ primary_region = "iad"
 [http_service]
   internal_port = 8402
   force_https = true
-  auto_stop_machines = false   # bot long-polling + scheduler must stay up
+  auto_stop_machines = false   # bot long-polling + Telegraph miner must stay up
   auto_start_machines = true
   min_machines_running = 1
 

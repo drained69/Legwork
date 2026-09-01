@@ -14,9 +14,10 @@ dist/
 *.db-wal
 *.log
 
-# Runtime artifacts (OKX sessions, deliverables, local agent tooling)
+# Runtime artifacts (wallet sessions, deliverables, local agent tooling)
 wallets/
 deliverables/
 .claude/
-.onchainos/
 data/
+.recovery-backup-*/
+miner.yaml.user-version-*

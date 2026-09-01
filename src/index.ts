@@ -1,90 +1,54 @@
-import { config } from './config.js';
+import { config, activeLlmModel, llmProvider } from './config.js';
 import { createBot } from './telegram/bot.js';
-import { startOkxServer } from './okx/server.js';
-import { settlementStatus } from './okx/x402.js';
-import { pollOnce, startMarketplacePoller } from './okx/poller.js';
-import { startScheduler } from './scheduler.js';
-import { walletCliAvailable } from './wallet/okxWallet.js';
+import { startServer } from './server.js';
+import { walletConfigured } from './wallet/baseWallet.js';
 
 /**
- * Legwork — an ASP for the OKX AI marketplace.
+ * Legwork — a job-search agent with per-call Base Sepolia payments and a
+ * Telegraph miner surface.
  *
  * Process layout:
- *  1. Marketplace poller — PULLS tasks addressed to this agent and claims them
- *  2. OKX A2A endpoint   — inbound task lifecycle + buyer chat (the push side)
- *  3. Telegram bot       — the only user surface (onboarding, cards, approvals)
- *  4. Scheduler          — scans, digests, delivery
+ *  1. Service API — /api/* per-call endpoints + /miner/* Telegraph routes
+ *  2. Telegram bot — the user surface (onboarding, cards, approvals)
  *
- * (1) and (2) are two views of the same state. A push is an optimisation; the
- * poll is what guarantees a task addressed to this agent gets claimed before
- * the marketplace expires it, whether or not an envelope ever arrives.
+ * Deployed publicly, the same API also serves as a Telegraph miner: the
+ * miner.yaml at GET /miner.yaml is what gets registered on-chain.
  */
 async function main(): Promise<void> {
-  console.log('Legwork starting…');
+  console.log('Legwork starting...');
   console.log(`  sources: adzuna=${config.adzuna.enabled} usajobs=${config.usajobs.enabled} (mock fallback when both off)`);
-  console.log(`  llm=${config.llm.enabled} gmail=${config.gmail.enabled}`);
+  // `config.llm.enabled` only covers the Anthropic slot, so the banner read
+  // "llm=false" while Gemini was answering every call — the one line an
+  // operator checks to see whether the model is live, saying the opposite of
+  // the truth.
+  console.log(`  llm=${llmProvider()} (${activeLlmModel()}) gmail=${config.gmail.enabled}`);
 
-  // x402 per-call payments are optional — the marketplace escrow flow is the
-  // primary route — but a half-configured facilitator must never be silent:
-  // buyers would sign authorizations that can never settle.
-  const settlement = settlementStatus();
-  console.log(
-    settlement.available
-      ? `  x402: per-call payments ENABLED${settlement.reason ? ` — ${settlement.reason}` : ''}`
-      : `  x402: per-call payments DISABLED — ${settlement.reason}. Free preview and OKX escrow tasks are unaffected.`,
-  );
-
-  // Surface wallet availability at boot: without the CLI, sign-in reports
-  // itself unavailable in-chat, and that should not be the first time anyone
-  // finds out. Probed in the background — never block startup on it.
-  void walletCliAvailable().then((ok) =>
-    console.log(
-      ok
-        ? '  wallet: onchainos CLI found — OKX sign-in enabled'
-        : '  wallet: onchainos CLI NOT found — OKX sign-in disabled (the Docker build installs it; check that step succeeded). Everything else works.',
-    ),
-  );
+  // Per-call payments are optional (the bot surfaces it when unconfigured) but
+  // a half-configured payment setup must never be silent: callers would sign
+  // transfers that can never verify.
+  console.log(`  chain=Base Sepolia (${config.payments.chainId}) walletVault=${walletConfigured()}`);
+  console.log(`  telegraph consumer: node=${config.telegraph.nodeUrl} wallet=${config.telegraph.enabled ? 'configured' : 'NOT SET (Redflag runs degraded)'} budget=$${config.telegraph.maxSpendUsd}`);
+  console.log(`  miner surface: /miner/job-hunt, /miner/tailor, /miner.yaml${config.server.publicUrl ? ` (public: ${config.server.publicUrl})` : ' (PUBLIC_URL not set!)'}`);
 
   const bot = config.telegram.token ? createBot() : null;
 
-  startOkxServer({
-    onSettled: async (engagement) => {
-      if (bot && engagement.userId) {
-        await bot.api
-          .sendMessage(Number(engagement.userId), `💰 The buyer accepted delivery on OKX — engagement ${engagement.okxJobId} is settled.`)
-          .catch(() => {});
-      }
-    },
-    // A pushed system event means the task list moved. Reconcile immediately
-    // instead of waiting out the poll interval — whatever the event was, the
-    // task list is the authority on what to do about it.
-    onSystemEvent: (event, jobId) => {
-      console.log(`[okx] system event ${event}${jobId ? ` job=${jobId}` : ''} — reconciling task list`);
-      void pollOnce({ bot });
-    },
-  });
-
-  // A marketplace-side failure must never take down the endpoint or the bot.
-  void startMarketplacePoller({ bot }).catch((err) => console.error('[okx-poller] failed to start:', err));
-
-  startScheduler(bot);
+  startServer();
 
   if (bot) {
-    console.log('[telegram] starting long polling…');
-    // The bot must NEVER take down the OKX endpoint. A 409 polling conflict
+    console.log('[telegram] starting long polling...');
+    // The bot must NEVER take down the service API. A 409 polling conflict
     // (two instances sharing a token) or a network blip would otherwise kill
-    // the paid x402 API and the marketplace endpoint with it.
+    // the paid API and the Telegraph miner surface with it.
     bot.start().catch((err) => {
-      console.error('[telegram] polling stopped — OKX endpoint stays up:', err);
+      console.error('[telegram] polling stopped; service API stays up:', err);
     });
   } else {
-    console.log('[telegram] TELEGRAM_BOT_TOKEN not set — bot disabled (OKX endpoint + scheduler still running).');
-    console.log('           Run `npm run demo` for the keyless end-to-end demo.');
+    console.log('[telegram] TELEGRAM_BOT_TOKEN not set; bot disabled (service API still running).');
   }
 }
 
 // Keep the service alive through background faults: a rejected promise in a
-// cron scan or a Telegram call must not kill the paid API.
+// scan or a Telegram call must not kill the paid API or the miner surface.
 process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 process.on('uncaughtException', (err) => console.error('[uncaughtException]', err));
 

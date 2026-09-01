@@ -9,46 +9,9 @@ export const config = {
     token: env('TELEGRAM_BOT_TOKEN'),
     username: env('TELEGRAM_BOT_USERNAME', 'LegworkBot'),
   },
-  okx: {
-    agentId: env('OKX_AGENT_ID', 'legwork-dev'),
-    // Railway/Render/Heroku inject PORT and route public traffic to it; prefer
-    // it, then fall back to an explicit OKX_ENDPOINT_PORT, then the default.
-    endpointPort: Number(env('PORT') || env('OKX_ENDPOINT_PORT', '8402')),
-    inboundSecret: env('OKX_INBOUND_SECRET'),
-    // Public base URL of this deployment (used as the x402 `resource` field).
+  server: {
+    endpointPort: Number(env('PORT') || env('SERVICE_PORT', '8402')),
     publicUrl: env('PUBLIC_URL', ''),
-
-    // ── marketplace polling (the seller side of the task protocol) ─────────
-    // Numeric ERC-8004 agent id of the ASP identity, e.g. "6658". Tasks are
-    // routed to this id; without it the poller cannot act and stays off.
-    aspAgentId: env('OKX_ASP_AGENT_ID', ''),
-    // onchainos home holding the SERVICE's wallet session (not a user's).
-    home: env('OKX_ONCHAINOS_HOME', ''),
-    // How often to pull the task list. Tasks expire on the backend's clock,
-    // so this is the single most important number in this file.
-    pollIntervalMs: Number(env('OKX_POLL_INTERVAL_MS', '30000')),
-    // Apply on-chain to tasks that already designate this agent as provider.
-    // Off → the poller only opens the chat and waits for a human.
-    autoApply: env('OKX_AUTO_APPLY', 'true') !== 'false',
-    // Never auto-apply above this budget — a large task deserves a human look.
-    maxAutoApplyBudget: Number(env('OKX_MAX_AUTO_APPLY_BUDGET', '10')),
-    // Auto-run the hunt and submit the deliverable once escrow is funded.
-    autoDeliver: env('OKX_AUTO_DELIVER', 'true') !== 'false',
-    // Log what the poller WOULD claim without touching the chain. Use this to
-    // verify wiring on a live account before letting it act.
-    dryRun: env('OKX_POLL_DRY_RUN') === 'true',
-    // How long a funded (accepted) task waits for the buyer's criteria before
-    // a best-effort provisional shortlist is delivered instead. Buyers'
-    // pollers abort near their own deadline (~13 min observed), so the wait
-    // must expire well inside that. 0 disables waiting entirely.
-    criteriaWaitMs: Number(env('OKX_CRITERIA_WAIT_MS', '300000')),
-    // X Layer. Used for the online-status heartbeat.
-    chainIndex: Number(env('OKX_CHAIN_INDEX', '196')),
-    // Is a proxy we control terminating connections in front of this process?
-    // Only then may X-Forwarded-For contribute to the rate-limit identity —
-    // otherwise any caller can set the header and mint unlimited free calls.
-    // Railway/Fly/Render all front the container, so this defaults on there.
-    trustProxy: env('TRUST_PROXY', 'false') === 'true',
   },
   adzuna: {
     appId: env('ADZUNA_APP_ID'),
@@ -58,6 +21,14 @@ export const config = {
       return Boolean(this.appId && this.appKey);
     },
   },
+  // Keyless remote-jobs board. No API key exists to expire, so it is the
+  // floor under every search: if Adzuna and USAJOBS credentials both lapse,
+  // a hunt still returns real live postings instead of an empty shortlist.
+  remotive: {
+    get enabled(): boolean {
+      return process.env.REMOTIVE_ENABLED !== 'false';
+    },
+  },
   usajobs: {
     apiKey: env('USAJOBS_API_KEY'),
     userAgent: env('USAJOBS_USER_AGENT', 'legwork@example.com'),
@@ -65,38 +36,94 @@ export const config = {
       return Boolean(this.apiKey);
     },
   },
-  llm: {
-    apiKey: env('ANTHROPIC_API_KEY'),
-    model: env('ANTHROPIC_MODEL', 'claude-sonnet-5'),
-    get enabled() {
+  /**
+   * Google Gemini. Checked FIRST because setting a Gemini key is an explicit
+   * choice of provider — it should win over a stale Anthropic key left in the
+   * environment rather than silently losing to it.
+   *
+   * Gemini is NOT Anthropic-compatible: different path, different request and
+   * response shapes, different auth header. It is a separate branch in llm.ts,
+   * not a base-URL swap.
+   */
+  gemini: {
+    apiKey: env('GEMINI_API_KEY') || env('GOOGLE_API_KEY'),
+    baseUrl: env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').replace(/\/+$/, ''),
+    // gemini-3.5-flash-lite by default, chosen by measurement rather than
+    // by version number. Newer Gemini models spend the OUTPUT budget on
+    // internal "thinking" tokens: gemini-3.6-flash returned finishReason
+    // MAX_TOKENS after 6.2s on a 400-token scoring call — a truncated,
+    // unparseable answer. Flash-lite finished (STOP) in 814ms with complete
+    // JSON. Scoring runs once per posting, so latency here is multiplied by
+    // ~20 on every hunt. `thinkingBudget: 0` is rejected (INVALID_ARGUMENT),
+    // so raising maxOutputTokens is the only lever for the bigger models —
+    // at a latency cost this workload cannot absorb.
+    model: env('GEMINI_MODEL', 'gemini-3.5-flash-lite'),
+    get enabled(): boolean {
       return Boolean(this.apiKey);
     },
   },
-  x402: {
-    // Chain the agent accepts payment on (CAIP-2). X Layer mainnet by default.
-    network: env('X402_NETWORK', 'eip155:196'),
-    // ERC-20 the agent accepts (set the real USDC/USDT contract before listing).
-    asset: env('X402_ASSET_ADDRESS', '0x0000000000000000000000000000000000000000'),
-    assetSymbol: env('X402_ASSET_SYMBOL', 'USDC'),
-    assetDecimals: Number(env('X402_ASSET_DECIMALS', '6')),
-    // EIP-712 domain of the payment token — buyer CLIs need `name` to sign
-    // `exact` + EIP-3009. Must match the token contract's EIP712Domain exactly.
-    assetName: env('X402_ASSET_NAME', 'USD₮0'),
-    assetVersion: env('X402_ASSET_VERSION', '2'),
-    // The agent wallet address payments settle to.
-    payTo: env('X402_PAY_TO', '0x0000000000000000000000000000000000000000'),
-    // x402 facilitator for signature verification + on-chain settlement.
-    // OKX's own is https://web3.okx.com/api/v6/pay/x402 (X Layer, USDT/USDC).
-    facilitatorUrl: env('X402_FACILITATOR_URL', ''),
-    // OKX facilitator credentials. Its /verify and /settle are authenticated
-    // with the standard OKX HMAC scheme, unlike Coinbase-style facilitators
-    // which are open. Leave empty for an unauthenticated facilitator — the
-    // headers are only attached when a key is present.
-    facilitatorApiKey: env('OKX_API_KEY', ''),
-    facilitatorApiSecret: env('OKX_API_SECRET', ''),
-    facilitatorPassphrase: env('OKX_API_PASSPHRASE', ''),
-    // Dev/test ONLY: accept structurally-valid payments without settlement.
-    devAcceptUnverified: env('X402_DEV_ACCEPT_UNVERIFIED') === 'true',
+  llm: {
+    // Anthropic-compatible endpoint. Defaults to Anthropic direct, but any
+    // compatible gateway works by pointing ANTHROPIC_BASE_URL at it (e.g.
+    // https://agentrouter.org). A trailing slash is tolerated — it is
+    // stripped before the /v1/messages path is appended, because
+    // `https://host//v1/messages` 404s on most gateways.
+    baseUrl: env('ANTHROPIC_BASE_URL', 'https://api.anthropic.com').replace(/\/+$/, ''),
+    // Two credential styles, matching the Anthropic SDK / Claude Code
+    // convention. A gateway generally issues a bearer token; Anthropic direct
+    // issues an x-api-key. Whichever is set decides the header (see llm.ts).
+    apiKey: env('ANTHROPIC_API_KEY'),
+    authToken: env('ANTHROPIC_AUTH_TOKEN'),
+    model: env('ANTHROPIC_MODEL', 'claude-sonnet-5'),
+    get enabled(): boolean {
+      return Boolean(this.apiKey || this.authToken);
+    },
+    /** Which credential is in play — surfaced by /health for debugging. */
+    get authStyle(): 'bearer' | 'api-key' | 'none' {
+      if (this.authToken) return 'bearer';
+      if (this.apiKey) return 'api-key';
+      return 'none';
+    },
+  },
+  payments: {
+    network: env('PAYMENT_NETWORK', 'base-sepolia'),
+    chainId: Number(env('PAYMENT_CHAIN_ID', '84532')),
+    rpcUrl: env('BASE_SEPOLIA_RPC_URL', 'https://sepolia.base.org'),
+    asset: env('PAYMENT_ASSET_ADDRESS', ''),
+    assetSymbol: env('PAYMENT_ASSET_SYMBOL', 'USDC'),
+    assetDecimals: Number(env('PAYMENT_ASSET_DECIMALS', '6')),
+    payTo: env('PAYMENT_PAY_TO', ''),
+    confirmations: Number(env('PAYMENT_CONFIRMATIONS', '1')),
+    vaultKey: env('WALLET_ENCRYPTION_KEY', ''),
+  },
+  telegraph: {
+    // The node whose engine we both register with (miner surface) and now
+    // CONSUME (Redflag buys answers from other miners through it).
+    nodeUrl: env('TELEGRAPH_NODE_URL', 'https://devnode.telegraphprotocol.com'),
+    // Dedicated Base Sepolia wallet that pays miner calls via x402. Needs
+    // testnet USDC; x402 signatures are gasless (EIP-3009), so no ETH burn.
+    privateKey: env('TELEGRAPH_PRIVATE_KEY'),
+    chainId: Number(env('TELEGRAPH_CHAIN_ID', '84532')),
+    // Per-report ceiling on miner spend. Each check that would exceed the
+    // remaining budget is skipped BEFORE payment — never mid-flight.
+    maxSpendUsd: Number(env('REDFLAG_MAX_SPEND_USD', '0.08')),
+    // Repeated checks on the same subject reuse the cached signal instead of
+    // paying twice; job news does not go stale in minutes.
+    cacheTtlSec: Number(env('TELEGRAPH_CACHE_TTL_SEC', '300')),
+    // ── standing watches ────────────────────────────────────────────────────
+    // A watch re-checks a company's news on this cadence (hours). One news
+    // check per tick per company.
+    watchIntervalHours: Number(env('REDFLAG_WATCH_INTERVAL_HOURS', '6')),
+    // Most one company's tick may cost (the probed price must fit).
+    watchCheckBudgetUsd: Number(env('REDFLAG_WATCH_CHECK_BUDGET_USD', '0.02')),
+    // Ceiling on TOTAL miner spend per poller tick across all watches — a
+    // hundred subscribers must not drain the wallet in one sweep.
+    watchTickBudgetUsd: Number(env('REDFLAG_WATCH_TICK_BUDGET_USD', '0.20')),
+    // How often the poller wakes to look for due watches.
+    watchPollMinutes: Number(env('REDFLAG_WATCH_POLL_MINUTES', '15')),
+    get enabled() {
+      return Boolean(this.nodeUrl && this.privateKey);
+    },
   },
   gmail: {
     clientId: env('GMAIL_CLIENT_ID'),
@@ -110,4 +137,24 @@ export const config = {
   // Durable working directory. Deliverable artifacts live here rather than in
   // the OS temp dir — they are dispute evidence and must outlive a reboot.
   dataDir: env('DATA_DIR', '.'),
+  trustProxy: env('TRUST_PROXY', 'false') === 'true',
 };
+
+/** Which LLM backend is actually in play. Gemini wins when its key is set. */
+export type LlmProvider = 'gemini' | 'anthropic' | 'none';
+
+export function llmProvider(): LlmProvider {
+  if (config.gemini.enabled) return 'gemini';
+  if (config.llm.enabled) return 'anthropic';
+  return 'none';
+}
+
+/** The model that will actually be requested, whichever provider is active. */
+export function activeLlmModel(): string {
+  return llmProvider() === 'gemini' ? config.gemini.model : config.llm.model;
+}
+
+/** Human-readable endpoint for /health — never includes the credential. */
+export function activeLlmEndpoint(): string {
+  return llmProvider() === 'gemini' ? config.gemini.baseUrl : config.llm.baseUrl;
+}

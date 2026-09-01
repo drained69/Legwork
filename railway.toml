@@ -8,7 +8,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Bot long-polling + cron scheduler must stay resident.
+# Bot long-polling + Telegraph miner must stay resident.
 numReplicas = 1
 healthcheckPath = "/health"
 healthcheckTimeout = 120

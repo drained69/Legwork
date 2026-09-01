@@ -1,4 +1,4 @@
-import type { Engagement, Posting, Profile, ScoreBreakdown } from '../types.js';
+import type { Posting, Profile, ScoreBreakdown } from '../types.js';
 
 /**
  * Shared presentation layer for the Telegram surface.
@@ -82,7 +82,7 @@ export const PROFILE_FIELDS = {
   email: 'Email',
   phone: 'Phone',
   currentLocation: 'Current location',
-  wallet: 'OKX wallet',
+  wallet: 'Base Sepolia wallet',
   // Professional
   currentTitle: 'Current title',
   yearsExperience: 'Years of experience',
@@ -132,7 +132,7 @@ export function fieldValue(p: Profile, field: ProfileField): string {
     case 'email': return p.email ?? '';
     case 'phone': return p.phone ?? '';
     case 'currentLocation': return p.currentLocation ?? '';
-    case 'wallet': return p.wallet ? `${p.wallet}${p.walletEmail ? ` (${p.walletEmail})` : ''}` : '';
+    case 'wallet': return p.wallet ?? '';
     case 'currentTitle': return p.currentTitle ?? '';
     case 'yearsExperience': return p.yearsExperience ? `${p.yearsExperience}` : '';
     case 'seniority': return p.seniority;
@@ -201,7 +201,6 @@ export function profileCompleteness(p: Profile): { done: number; total: number; 
 export interface WelcomeState {
   firstName: string;
   profile?: Profile;
-  engagement?: Engagement;
   agentId: string;
   returning: boolean;
 }
@@ -251,7 +250,7 @@ function renderFirstRunWelcome(s: WelcomeState): string {
     '• <b>/menu</b> — every action in one place',
     '• <b>/help</b> — how scoring and approvals work',
     '',
-    'Optionally link an X Layer wallet to run paid engagements from the OKX marketplace. ' +
+    'Create or import a wallet on <b>Base Sepolia</b> to pay for services directly. ' +
       'A wallet is <b>not</b> required to set up your profile or try a preview.',
   ].join('\n');
 }
@@ -280,13 +279,6 @@ function renderReturningWelcome(s: WelcomeState): string {
     lines.push('Profile · not set up');
   }
 
-  if (s.engagement) {
-    const ends = s.engagement.endsAt ? ` · ends ${s.engagement.endsAt.slice(0, 10)}` : '';
-    lines.push(`Engagement · ${esc(listingLabel(s.engagement.listing))} — ${esc(s.engagement.status)}${ends}`);
-  } else {
-    lines.push('Engagement · none active — free preview still available');
-  }
-
   lines.push('');
   if (!s.profile) {
     lines.push('Set up your profile to begin — about a minute, and you will never enter it again.');
@@ -302,16 +294,63 @@ function renderReturningWelcome(s: WelcomeState): string {
   return lines.join('\n');
 }
 
-export function listingLabel(listing: string): string {
-  const labels: Record<string, string> = {
-    // Kept in step with the on-chain service names a buyer sees on OKX, so the
-    // two surfaces never describe the same purchase differently.
-    'job-hunt': 'Job Hunt Shortlist',
-    'job-hunt-weekly': 'Job Hunt + 7-Day Thread',
-    'tailor-one-application': 'Role-Targeted Shortlist',
-    'job-search-sprint-7d': 'Job Search Sprint (7 Days)',
-  };
-  return labels[listing] ?? listing;
+// ── redflag card ────────────────────────────────────────────────────────────
+
+export interface RedflagCardData {
+  verdict: string;
+  company: string;
+  role?: string;
+  confidence: number;
+  flags: Array<{ severity: string; title: string; detail: string; source: string; costUsd?: number }>;
+  questions: string[];
+  checks: Array<{ label: string; status: string; source: string; miner?: string; costUsd: number }>;
+  spendUsd: number;
+  budgetUsd: number;
+  degraded?: boolean;
+}
+
+const SEVERITY_BADGE: Record<string, string> = { red: '🔴', yellow: '🟡', green: '🟢', info: '⚪' };
+const VERDICT_LINE: Record<string, string> = { clear: '🟢 Clear', caution: '🟡 Caution', avoid: '🔴 Avoid', unknown: '⚪ Unknown' };
+
+/**
+ * The due-diligence verdict card. Every flag names the miner that produced it
+ * and what that answer cost — the whole point of buying verification through
+ * Telegraph is that the provenance is visible.
+ */
+export function renderRedflagCard(r: RedflagCardData): string {
+  const lines: string[] = [];
+  lines.push(`${VERDICT_LINE[r.verdict] ?? '⚪'} <b>Due diligence: ${esc(r.company)}</b>${r.role ? ` — ${esc(r.role)}` : ''}`);
+  lines.push(`<i>confidence ${Math.round(r.confidence * 100)}%</i>`);
+  lines.push(RULE);
+
+  if (r.flags.length) {
+    lines.push('<b>Flags</b>');
+    for (const flag of r.flags.slice(0, 6)) {
+      const cost = flag.costUsd ? ` · ${money(flag.costUsd)}` : '';
+      lines.push(`${SEVERITY_BADGE[flag.severity] ?? '⚪'} <b>${esc(flag.title)}</b>${cost}`);
+      lines.push(`   ${esc(capText(flag.detail, 220))}`);
+      lines.push(`   <i>source: ${esc(flag.source)}</i>`);
+    }
+    lines.push('');
+  }
+
+  if (r.questions.length) {
+    lines.push('<b>Ask them</b>');
+    for (const q of r.questions.slice(0, 4)) lines.push(`• ${esc(capText(q, 200))}`);
+    lines.push('');
+  }
+
+  const okCount = r.checks.filter((c) => c.status === 'ok' || c.status === 'cached').length;
+  lines.push(`<b>Checks</b> · ${okCount}/${r.checks.length} completed`);
+  for (const check of r.checks) {
+    const by = check.source === 'telegraph' && check.miner ? ` · ${esc(check.miner)}` : check.source === 'legwork' ? ' · live boards' : '';
+    const cost = check.costUsd ? ` · ${money(check.costUsd)}` : '';
+    const icon = check.status === 'ok' || check.status === 'cached' ? '✓' : check.status === 'skipped' ? '–' : '✗';
+    lines.push(`${icon} ${esc(check.label)}${by}${cost}`);
+  }
+  lines.push('');
+  lines.push(`Miner spend · ${money(r.spendUsd)} of ${money(r.budgetUsd)} budget${r.degraded ? ' · <i>ran without network checks</i>' : ''}`);
+  return lines.join('\n');
 }
 
 // ── match card ─────────────────────────────────────────────────────────────

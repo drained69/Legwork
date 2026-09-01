@@ -1,12 +1,13 @@
 # Legwork
 
-**Your job search, run from Telegram — powered by OKX AI.**
+**Your job search, run from Telegram — also available as a Telegraph miner.**
 
-Legwork is an Agent Service Provider (ASP) for the OKX AI marketplace, built for
-**Resume & Career Workflows**. It turns high-volume job hunting from a part-time
-job into a five-minute-a-day habit: the agent scans postings, scores each against
-your real profile, drafts a tailored application, and applies the moment you tap
-approve — all inside a Telegram thread.
+Legwork is a job-search agent built for **Resume & Career Workflows**. It turns
+high-volume job hunting from a part-time job into a five-minute-a-day habit: the
+agent scans postings, scores each against your real profile, drafts a tailored
+application, and applies the moment you tap approve — all inside a Telegram
+thread. Its open `/miner/*` routes expose job search and application tailoring
+through the Telegraph Protocol at a uniform $0.01 floor price.
 
 > One-line pitch: an agent that hunts job boards for you, scores every posting
 > against your actual profile, drafts a tailored application, and applies the
@@ -74,7 +75,7 @@ can approve in 30 seconds each"* — not *"it applied while you slept."*
 ## Architecture
 
 ```
-Job source scan (scheduled)
+Job source scan (per request or Telegram action)
         ↓
 Agent scores each new posting (match-scorer)
         ↓
@@ -88,7 +89,7 @@ Agent submits application (apply-executor)
         ↓
 Agent logs submission, tracks status
         ↓
-Weekly: owner digest — applications sent, response rate, top-scoring skips
+Telegraph miner or Telegram response
 ```
 
 Every arrow is a point where the owner can say no or adjust the rubric.
@@ -148,11 +149,52 @@ highly bespoke roles a month.
 - Rubric auto-tuning based on which approved applications actually got responses.
 - (v2) Interview scheduling, salary negotiation drafting, multi-user/team profiles.
 
+## Telegraph Miner
+
+The deployed service exposes two open miner routes:
+
+- `POST /miner/job-hunt` accepts structured criteria or a natural-language query
+  and returns a ranked shortlist with `label`, `confidence` and `reason` fields.
+- `POST /miner/tailor` drafts application materials from supplied candidate facts.
+
+The complete Telegraph registration document is `miner.yaml`. It is served
+verbatim at `GET /miner.yaml`; after deployment, register it with
+`scripts/register-miner.sh` or use the Telegraph integration interface. See
+`RUNNING.md` for the Base Sepolia registration and Fly deployment procedure.
+
+## Redflag — due diligence bought from other miners
+
+Legwork is also a Telegraph **consumer**. Redflag (`POST /api/redflag`, $0.05,
+`/redflag` in Telegram) vets a job posting or offer before you apply, and its
+checks are live miner calls paid through the node's engine in USDC:
+
+| Check | Source | Cost |
+|---|---|---|
+| Recruiting-scam scan | FRAUD_DETECTION miner | ~$0.01 |
+| Company news (layoffs, funding, scandals) | NEWS_SEARCH miner | ~$0.01 |
+| Career-page URL scan | URL_SCAN miner | ~$0.01 |
+| Posting claims fact-check | FACT_CHECK miner | ~$0.01 |
+| Comp benchmark vs live market | Legwork's own job boards | free |
+| Local scam-pattern scan | deterministic heuristics | free |
+
+Every flag in the verdict card names the miner that produced it, its
+confidence, and what that answer cost; the report's total miner spend is
+capped by `REDFLAG_MAX_SPEND_USD` — a check priced above the remaining budget
+is skipped *before* payment, never mid-flight. Skipped or failed checks are
+reported honestly rather than silently dropped. The payer wallet
+(`TELEGRAPH_PRIVATE_KEY`) needs Base Sepolia USDC; x402 signatures are
+gasless. `scripts/redflag-smoke.ts` runs one live paid report end to end.
+
+The flywheel, in one sentence: Legwork earns as a miner on one side of
+Telegraph and spends as a consumer on the other — every Redflag report routes
+demand to other miners on the network.
+
 ## Demo Script
 
 _(~4 minutes, for judges)_
 
 1. **Set the stakes (30s):** Applying at volume is a part-time job — the bottleneck is the repetitive tailoring and form-filling.
 2. **Live flow (2 min):** show the agent pulling 2–3 real postings, the explicit score breakdown for one, the tailored draft, then tap approve on stage and show the application being submitted.
-3. **The payoff (1 min):** pull up the weekly digest — applications sent, postings skipped and why, response tracking — all generated from the same loop.
-4. **Close (30s):** "This isn't a resume optimizer. It's the whole job search, running in the background, with you approving the one decision that actually matters — whether to apply."
+3. **The payoff (1 min):** call `/miner/job-hunt` and show the ranked response, full scoring breakdown and source provenance.
+4. **The flywheel (45s):** run `/redflag` on one posting — show the verdict card with each check's miner, confidence and cost, and the total miner spend. "Legwork earns on this network as a miner and spends on it as a customer."
+5. **Close (15s):** "This isn't a resume optimizer. It's the whole job search, running in the background, with you approving the one decision that actually matters — whether to apply."

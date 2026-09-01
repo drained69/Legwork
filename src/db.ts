@@ -5,13 +5,12 @@ import type {
   Application,
   ApplicationStatus,
   Draft,
-  Engagement,
-  EngagementStatus,
   PaymentEvent,
   Posting,
   Profile,
   ScoreBreakdown,
   UsageRecord,
+  WalletRecord,
 } from './types.js';
 
 const db = new Database(config.dbPath);
@@ -40,22 +39,18 @@ CREATE TABLE IF NOT EXISTS drafts (
 CREATE TABLE IF NOT EXISTS applications (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  engagement_id TEXT NOT NULL,
   posting_id TEXT NOT NULL,
   status TEXT NOT NULL,
   data TEXT NOT NULL,
-  UNIQUE (engagement_id, posting_id)
-);
-CREATE TABLE IF NOT EXISTS engagements (
-  id TEXT PRIMARY KEY,
-  okx_job_id TEXT NOT NULL UNIQUE,
-  task_code TEXT NOT NULL UNIQUE,
-  user_id TEXT,
-  status TEXT NOT NULL,
-  data TEXT NOT NULL
+  UNIQUE (user_id, posting_id)
 );
 CREATE TABLE IF NOT EXISTS payments (
   id TEXT PRIMARY KEY,
+  data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wallets (
+  user_id TEXT PRIMARY KEY,
+  address TEXT NOT NULL UNIQUE,
   data TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -73,21 +68,41 @@ CREATE TABLE IF NOT EXISTS onboarding_state (
 CREATE TABLE IF NOT EXISTS usage_records (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  engagement_id TEXT,
   service TEXT NOT NULL,
   at TEXT NOT NULL,
   data TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS x402_nonces (
+CREATE TABLE IF NOT EXISTS payment_nonces (
   nonce TEXT PRIMARY KEY,
   at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scan_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL,
-  engagement_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
   found INTEGER, new_count INTEGER, duplicates INTEGER
 );
+CREATE TABLE IF NOT EXISTS redflag_reports (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  company TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  spend_usd REAL NOT NULL,
+  at TEXT NOT NULL,
+  data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redflag_reports_user ON redflag_reports (user_id, at);
+CREATE TABLE IF NOT EXISTS redflag_watches (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  company TEXT NOT NULL,
+  chat_id INTEGER,
+  active INTEGER NOT NULL DEFAULT 1,
+  last_alert_signal TEXT,
+  last_check_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redflag_watches_due ON redflag_watches (active, last_check_at);
 `);
 
 export const now = () => new Date().toISOString();
@@ -134,9 +149,8 @@ export function getProfileByWallet(wallet: string): Profile | undefined {
 }
 
 /**
- * Move a profile (and its live engagements) to a new Telegram account.
- * Used when a user connects a wallet that already carries a profile — their
- * saved data follows the wallet.
+ * Move a profile to a new Telegram account. Used when a user connects a wallet
+ * that already carries a profile — their saved data follows the wallet.
  */
 export function transferProfile(fromUserId: string, toUserId: string): void {
   const p = getProfile(fromUserId);
@@ -144,17 +158,8 @@ export function transferProfile(fromUserId: string, toUserId: string): void {
   db.prepare('DELETE FROM profiles WHERE user_id = ?').run(fromUserId);
   p.userId = toUserId;
   saveProfile(p);
-  // Seen-postings history and live engagements follow the profile.
+  // Seen-postings history follows the profile.
   db.prepare('UPDATE OR IGNORE seen_postings SET user_id = ? WHERE user_id = ?').run(toUserId, fromUserId);
-  db.prepare('SELECT id, data FROM engagements WHERE user_id = ?')
-    .all(fromUserId)
-    .forEach((row) => {
-      const e = JSON.parse((row as { data: string }).data) as Engagement;
-      if (!['settled', 'disputed'].includes(e.status)) {
-        e.userId = toUserId;
-        saveEngagement(e);
-      }
-    });
   audit('db', 'PROFILE_TRANSFERRED', `wallet-based transfer ${fromUserId} -> ${toUserId}`);
 }
 
@@ -215,8 +220,8 @@ export function latestDraftVersion(userId: string, postingId: string): number {
 export function createApplication(a: Application): boolean {
   try {
     db.prepare(
-      'INSERT INTO applications (id, user_id, engagement_id, posting_id, status, data) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run(a.id, a.userId, a.engagementId, a.postingId, a.status, JSON.stringify(a));
+      'INSERT INTO applications (id, user_id, posting_id, status, data) VALUES (?, ?, ?, ?, ?)',
+    ).run(a.id, a.userId, a.postingId, a.status, JSON.stringify(a));
     return true;
   } catch {
     return false; // UNIQUE violation → already exists (idempotency)
@@ -229,17 +234,17 @@ export function getApplication(id: string): Application | undefined {
   const row = db.prepare('SELECT data FROM applications WHERE id = ?').get(id) as { data: string } | undefined;
   return row ? (JSON.parse(row.data) as Application) : undefined;
 }
-export function getApplicationByPosting(engagementId: string, postingId: string): Application | undefined {
+export function getApplicationByPosting(userId: string, postingId: string): Application | undefined {
   const row = db
-    .prepare('SELECT data FROM applications WHERE engagement_id = ? AND posting_id = ?')
-    .get(engagementId, postingId) as { data: string } | undefined;
+    .prepare('SELECT data FROM applications WHERE user_id = ? AND posting_id = ?')
+    .get(userId, postingId) as { data: string } | undefined;
   return row ? (JSON.parse(row.data) as Application) : undefined;
 }
-export function listApplications(engagementId: string, status?: ApplicationStatus): Application[] {
+export function listApplications(userId: string, status?: ApplicationStatus): Application[] {
   const rows = (
     status
-      ? db.prepare('SELECT data FROM applications WHERE engagement_id = ? AND status = ?').all(engagementId, status)
-      : db.prepare('SELECT data FROM applications WHERE engagement_id = ?').all(engagementId)
+      ? db.prepare('SELECT data FROM applications WHERE user_id = ? AND status = ?').all(userId, status)
+      : db.prepare('SELECT data FROM applications WHERE user_id = ?').all(userId)
   ) as Array<{ data: string }>;
   return rows.map((r) => JSON.parse(r.data) as Application);
 }
@@ -249,53 +254,32 @@ export function countApplicationsToday(userId: string): number {
   return rows.filter((r) => (JSON.parse(r.data) as Application).createdAt.startsWith(today)).length;
 }
 
-// ── engagements ────────────────────────────────────────────────────────────
-export function saveEngagement(e: Engagement): void {
-  db.prepare(
-    'INSERT OR REPLACE INTO engagements (id, okx_job_id, task_code, user_id, status, data) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(e.id, e.okxJobId, e.taskCode, e.userId ?? null, e.status, JSON.stringify(e));
-}
-export function getEngagementByCode(taskCode: string): Engagement | undefined {
-  const row = db.prepare('SELECT data FROM engagements WHERE task_code = ?').get(taskCode) as
-    | { data: string }
-    | undefined;
-  return row ? (JSON.parse(row.data) as Engagement) : undefined;
-}
-export function getEngagementById(id: string): Engagement | undefined {
-  const row = db.prepare('SELECT data FROM engagements WHERE id = ?').get(id) as { data: string } | undefined;
-  return row ? (JSON.parse(row.data) as Engagement) : undefined;
-}
-export function getEngagementByJob(okxJobId: string): Engagement | undefined {
-  const row = db.prepare('SELECT data FROM engagements WHERE okx_job_id = ?').get(okxJobId) as
-    | { data: string }
-    | undefined;
-  return row ? (JSON.parse(row.data) as Engagement) : undefined;
-}
-export function getEngagementByUser(userId: string): Engagement | undefined {
-  const rows = db.prepare('SELECT data FROM engagements WHERE user_id = ?').all(userId) as Array<{ data: string }>;
-  const live = rows
-    .map((r) => JSON.parse(r.data) as Engagement)
-    .filter((e) => !['settled', 'disputed'].includes(e.status));
-  return live[live.length - 1];
-}
-export function listEngagements(status?: EngagementStatus): Engagement[] {
-  const rows = (
-    status
-      ? db.prepare('SELECT data FROM engagements WHERE status = ?').all(status)
-      : db.prepare('SELECT data FROM engagements').all()
-  ) as Array<{ data: string }>;
-  return rows.map((r) => JSON.parse(r.data) as Engagement);
-}
-
 // ── payments ───────────────────────────────────────────────────────────────
 export function savePayment(p: PaymentEvent): void {
   db.prepare('INSERT OR REPLACE INTO payments (id, data) VALUES (?, ?)').run(p.id, JSON.stringify(p));
 }
 
+export function saveWallet(wallet: WalletRecord): void {
+  db.prepare('INSERT OR REPLACE INTO wallets (user_id, address, data) VALUES (?, ?, ?)').run(
+    wallet.userId,
+    wallet.address.toLowerCase(),
+    JSON.stringify(wallet),
+  );
+}
+
+export function getWallet(userId: string): WalletRecord | undefined {
+  const row = db.prepare('SELECT data FROM wallets WHERE user_id = ?').get(userId) as { data: string } | undefined;
+  return row ? (JSON.parse(row.data) as WalletRecord) : undefined;
+}
+
+export function deleteWallet(userId: string): void {
+  db.prepare('DELETE FROM wallets WHERE user_id = ?').run(userId);
+}
+
 // ── usage ledger ───────────────────────────────────────────────────────────
 export function recordUsage(u: UsageRecord): void {
-  db.prepare('INSERT OR REPLACE INTO usage_records (id, user_id, engagement_id, service, at, data) VALUES (?, ?, ?, ?, ?, ?)').run(
-    u.id, u.userId, u.engagementId ?? null, u.service, u.at, JSON.stringify(u),
+  db.prepare('INSERT OR REPLACE INTO usage_records (id, user_id, service, at, data) VALUES (?, ?, ?, ?, ?)').run(
+    u.id, u.userId, u.service, u.at, JSON.stringify(u),
   );
 }
 export function listUsage(userId: string, limit = 50): UsageRecord[] {
@@ -304,44 +288,122 @@ export function listUsage(userId: string, limit = 50): UsageRecord[] {
     .all(userId, limit) as Array<{ data: string }>;
   return rows.map((r) => JSON.parse(r.data) as UsageRecord);
 }
-export function countUsage(engagementId: string): number {
-  const row = db.prepare('SELECT COUNT(*) as n FROM usage_records WHERE engagement_id = ?').get(engagementId) as { n: number };
-  return row.n;
-}
 
 /**
  * Replay protection: returns true the FIRST time a nonce is seen, false after.
  *
- * This is a RESERVATION, taken before settlement so two concurrent requests
- * carrying one authorization cannot both spend it. A caller that does not go
- * on to settle must `releaseNonce` — see x402.ts step 4.
+ * This is a RESERVATION, taken before a payment is recorded so two concurrent
+ * requests carrying one transaction cannot both spend it.
  */
 export function consumeNonce(nonce: string): boolean {
-  const res = db.prepare('INSERT OR IGNORE INTO x402_nonces (nonce, at) VALUES (?, ?)').run(nonce, now());
+  const res = db.prepare('INSERT OR IGNORE INTO payment_nonces (nonce, at) VALUES (?, ?)').run(nonce, now());
   return res.changes > 0;
 }
 
 /**
  * Undo a reservation that never became a payment.
- *
- * Without this, a transient facilitator outage would permanently brick a valid
- * payment authorization: the buyer's retry hits "replay rejected" and they can
- * never pay for that call. Only safe because it is called exclusively on paths
- * where no settlement occurred.
  */
 export function releaseNonce(nonce: string): void {
-  db.prepare('DELETE FROM x402_nonces WHERE nonce = ?').run(nonce);
+  db.prepare('DELETE FROM payment_nonces WHERE nonce = ?').run(nonce);
 }
 
 // ── scan runs ──────────────────────────────────────────────────────────────
-export function recordScanRun(engagementId: string, found: number, newCount: number, duplicates: number): void {
-  db.prepare('INSERT INTO scan_runs (at, engagement_id, found, new_count, duplicates) VALUES (?, ?, ?, ?, ?)').run(
+export function recordScanRun(userId: string, found: number, newCount: number, duplicates: number): void {
+  db.prepare('INSERT INTO scan_runs (at, user_id, found, new_count, duplicates) VALUES (?, ?, ?, ?, ?)').run(
     now(),
-    engagementId,
+    userId,
     found,
     newCount,
     duplicates,
   );
+}
+
+// ── redflag reports (paid due-diligence history) ───────────────────────────
+
+export interface RedflagReportRecord {
+  id: string;
+  userId: string;
+  company: string;
+  verdict: string;
+  spendUsd: number;
+  at: string;
+  data: unknown;
+}
+
+export function saveRedflagReport(record: RedflagReportRecord): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO redflag_reports (id, user_id, company, verdict, spend_usd, at, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).run(record.id, record.userId, record.company, record.verdict, record.spendUsd, record.at, JSON.stringify(record.data));
+}
+
+export function listRedflagReports(userId: string, limit = 5): RedflagReportRecord[] {
+  const rows = db
+    .prepare('SELECT id, user_id, company, verdict, spend_usd, at, data FROM redflag_reports WHERE user_id = ? ORDER BY at DESC LIMIT ?')
+    .all(userId, limit) as Array<{ id: string; user_id: string; company: string; verdict: string; spend_usd: number; at: string; data: string }>;
+  return rows.map((r) => ({ id: r.id, userId: r.user_id, company: r.company, verdict: r.verdict, spendUsd: r.spend_usd, at: r.at, data: JSON.parse(r.data) }));
+}
+
+// ── redflag watches (standing company news alerts) ─────────────────────────
+
+export interface RedflagWatch {
+  id: string;
+  userId: string;
+  company: string;
+  chatId: number | null;
+  active: boolean;
+  lastAlertSignal: string | null;
+  lastCheckAt: string | null;
+  createdAt: string;
+}
+
+interface WatchRow {
+  id: string; user_id: string; company: string; chat_id: number | null;
+  active: number; last_alert_signal: string | null; last_check_at: string | null; created_at: string;
+}
+
+const watchFromRow = (r: WatchRow): RedflagWatch => ({
+  id: r.id, userId: r.user_id, company: r.company, chatId: r.chat_id,
+  active: r.active === 1, lastAlertSignal: r.last_alert_signal, lastCheckAt: r.last_check_at, createdAt: r.created_at,
+});
+
+export function createWatch(userId: string, company: string, chatId: number | null): RedflagWatch {
+  const watch: RedflagWatch = {
+    id: uid(), userId, company: company.trim().slice(0, 120), chatId,
+    active: true, lastAlertSignal: null, lastCheckAt: null, createdAt: now(),
+  };
+  db.prepare(
+    'INSERT INTO redflag_watches (id, user_id, company, chat_id, active, last_alert_signal, last_check_at, created_at) VALUES (?, ?, ?, ?, 1, NULL, NULL, ?)',
+  ).run(watch.id, watch.userId, watch.company, watch.chatId, watch.createdAt);
+  return watch;
+}
+
+export function listWatches(userId: string): RedflagWatch[] {
+  const rows = db
+    .prepare('SELECT * FROM redflag_watches WHERE user_id = ? AND active = 1 ORDER BY created_at DESC')
+    .all(userId) as WatchRow[];
+  return rows.map(watchFromRow);
+}
+
+export function listActiveWatches(): RedflagWatch[] {
+  const rows = db.prepare('SELECT * FROM redflag_watches WHERE active = 1').all() as WatchRow[];
+  return rows.map(watchFromRow);
+}
+
+export function getWatch(id: string): RedflagWatch | undefined {
+  const row = db.prepare('SELECT * FROM redflag_watches WHERE id = ?').get(id) as WatchRow | undefined;
+  return row ? watchFromRow(row) : undefined;
+}
+
+export function deactivateWatch(id: string): boolean {
+  return db.prepare('UPDATE redflag_watches SET active = 0 WHERE id = ? AND active = 1').run(id).changes > 0;
+}
+
+export function updateWatchCheck(id: string): void {
+  db.prepare('UPDATE redflag_watches SET last_check_at = ? WHERE id = ?').run(now(), id);
+}
+
+export function updateWatchAlert(id: string, signal: string): void {
+  db.prepare('UPDATE redflag_watches SET last_alert_signal = ? WHERE id = ?').run(signal, id);
 }
 
 export type { ScoreBreakdown };

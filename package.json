@@ -1,31 +1,30 @@
 {
   "name": "legwork",
-  "version": "0.1.0",
-  "description": "Your job search, run from Telegram — an ASP for the OKX AI marketplace.",
+  "version": "0.2.0",
+  "description": "Job-search agent: Telegram bot + per-call Base Sepolia payments + Telegraph miner surface.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "demo": "tsx src/demo.ts",
-    "okx:poll": "tsx src/okx/pollCli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/legwork.test.ts tests/x402.test.ts tests/delivery.test.ts tests/telegram.test.ts tests/lifecycle.test.ts"
+    "test": "node --import tsx --test tests/legwork.test.ts tests/telegram.test.ts tests/miner.test.ts tests/scraper.test.ts tests/redflag.test.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@x402/evm": "^2.24.0",
+    "@x402/fetch": "^2.24.0",
     "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.5",
-    "grammy": "^1.30.0",
-    "node-cron": "^3.0.3"
+    "ethers": "^6.17.0",
+    "grammy": "^1.30.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.14.0",
-    "@types/node-cron": "^3.0.11",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
   }

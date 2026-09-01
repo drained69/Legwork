@@ -1,43 +1,30 @@
-# Legwork — Agent Service Catalog
+# Legwork Service Catalog
 
-**Agent:** Legwork · **Category:** Resume & Career Workflows · **Directory:** [okx.ai/agents](https://www.okx.ai/agents)
-**Payment:** x402 (**OKX Agent Payments Protocol**), scheme `exact`, network `eip155:196` (X Layer), USDC
-**Hard cap: every API call costs at most $0.10.** Live machine-readable catalog: `GET /api/services` (free).
+## Telegraph
 
-## Per-call API services (x402-gated)
-
-| # | Service | Endpoint | Price/call | What the caller gets |
-|---|---|---|---|---|
-| 0 | **Free Preview** | `POST /api/hunt/preview` | **Free** (3/hr) | Try before you pay: top 3 ranked matches with scores and headline reasons |
-| 1 | **Job Hunt** | `POST /api/hunt` | **$0.05** | Send criteria (roles, location, qualification, comp floor, skills, priority factors) → up to 10 ranked matches, each with a full per-axis score breakdown (skills 40 / comp 20 / location 15 / qualification 15 / factors 10) |
-| 2 | **Score Posting** | `POST /api/score` | **$0.01** | Score ONE job posting against candidate criteria on the 100-point rubric — every axis gets a one-line explanation, no black-box numbers |
-| 3 | **Tailor Application** | `POST /api/tailor` | **$0.10** | Tailored resume variant + cover letter + application email for one posting — never fabricates skills, employers, or dates |
-| — | Service catalog | `GET /api/services` | Free | Machine-readable catalog: endpoints, prices, input schemas, payment terms |
-| — | Health | `GET /health` | Free | Liveness check |
-
-### How a buyer agent pays (x402 flow)
-
-1. `POST /api/hunt` with no payment → **HTTP 402** with the `PAYMENT-REQUIRED` header (base64 challenge: scheme/network/asset/amount/payTo + input schema) and an `x402Version` v1 body for legacy clients
-2. Buyer signs the payment authorization and replays with the `X-PAYMENT` header
-3. Legwork verifies (recipient, amount, validity window, single-use nonce) and settles via the facilitator
-4. **HTTP 200** with the result + `PAYMENT-RESPONSE` header (settlement receipt: tx, payer, amount)
-
-## Telegram engagement bundles (OKX Task Marketplace)
-
-Multi-day engagements run in a private Telegram thread (hire on the marketplace → deep link binds the chat). Human-in-the-loop: criteria and every application are individually approved.
-
-**Launch pricing** — each bundle sits just above the API-call value of the work it contains, so nobody pays a premium for the same job twice.
-
-| Listing | Price | Duration | What the buyer gets |
+| Capability | Endpoint | Intents | Billing |
 |---|---|---|---|
-| `job-hunt` | $0.25 | 24h | Criteria intake in Telegram → approval → continuous hunt → ranked shortlists |
-| `job-hunt-weekly` | $1.00 | 7 days | Daily hunts, deduped (never the same posting twice) |
-| `tailor-one-application` | $0.25 | 1 day | One tailored resume + cover letter, delivered for approval |
-| `job-search-sprint-7d` | $2.00 | 7 days | The full loop: daily hunts + tailored drafts + approval-gated submission + weekly digest |
+| Live job hunt and ranked synthesis | `POST /miner/job-hunt` | `WEB_SEARCH`, `RESEARCH_SYNTHESIS` | Telegraph, floor $0.01 |
+| Resume and cover-letter tailoring | `POST /miner/tailor` | `TEXT_GENERATION` | Telegraph, floor $0.01 |
+| Miner configuration | `GET /miner.yaml` | — | Free |
+| Health | `GET /health` | — | Free |
 
-## Trust properties (both channels)
+Miner identity: `id: 8402`, `slug: legwork-job-hunter`, protocol `generic`.
 
-- Rubric scoring is fully explained per axis — no unexplained "94% match"
-- Nothing is submitted on a user's behalf without a recorded, timestamped approval
-- Drafts freeze at approval (immutable dispute evidence)
-- Payment authorizations are single-use (nonce replay protection); every charge is audit-logged
+## Direct API
+
+| Capability | Endpoint | Price |
+|---|---|---|
+| Preview top three matches | `POST /api/hunt/preview` | Free, 3/hour |
+| Rank up to ten jobs | `POST /api/hunt` | $0.01 |
+| Score one job | `POST /api/score` | $0.01 |
+| Tailor one application | `POST /api/tailor` | $0.01 |
+| Redflag due diligence on one posting | `POST /api/redflag` | $0.05 |
+| Machine-readable catalog | `GET /api/services` | Free |
+
+Paid direct routes use confirmed Base Sepolia ERC-20 transfers. Telegraph
+routes are open upstreams because network billing happens before dispatch.
+
+Redflag spends part of its price buying live checks from other Telegraph
+miners (scam scan, company news, URL scan, fact check, ~$0.01 each) and
+reports the per-check cost and provenance in every response.

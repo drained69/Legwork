@@ -1,113 +1,184 @@
 # Running Legwork
 
-## Quick start (no keys needed)
+## Local
 
 ```bash
 npm install
-npm test            # 19-test pre-launch suite: approval gate, idempotency,
-                    # OKX lifecycle, scoring rubric, dedupe, daily cap
-npm run demo        # full end-to-end loop with mock data:
-                    # OKX hire → Telegram bind → scan → score → tailor →
-                    # approval gate → submission → digest → OKX settlement
+cp .env.example .env
+npm test
+npm run dev
 ```
 
-## Real deployment
+Without job-source or LLM keys, Legwork uses mock postings and deterministic
+heuristics. The service still exposes its complete API and Telegraph miner
+surface.
 
-```bash
-cp .env.example .env   # fill in what you have — everything degrades gracefully
-npm run dev            # tsx, or: npm run build && npm start
-```
+## Runtime
 
-The process runs four things:
+The process serves:
 
-| Component | Enabled by | Without it |
+| Component | Route / trigger | Purpose |
 |---|---|---|
-| **OKX marketplace poller** (claims tasks every 30s) | `OKX_ASP_AGENT_ID` + a signed-in service wallet | **Tasks addressed to this agent expire unclaimed — buyers see a provider that timed out** |
-| Telegram bot (long polling) | `TELEGRAM_BOT_TOKEN` | Disabled; endpoint + scheduler still run |
-| OKX A2A endpoint (`:8402`, `POST /okx/a2a`) | always on | — |
-| Scheduler (scan 6h / digest Mon / delivery hourly) | always on | — |
+| Health | `GET /health` | Liveness and miner identity |
+| Catalog | `GET /api/services` | Direct per-call service prices |
+| Free preview | `POST /api/hunt/preview` | Top three matches, 3 calls/hour/client |
+| Paid API | `POST /api/hunt`, `/api/score`, `/api/tailor` | Direct Base Sepolia ERC-20 billing |
+| Telegraph YAML | `GET /miner.yaml` | Byte-stable miner configuration |
+| Telegraph miner | `POST /miner/job-hunt`, `/miner/tailor` | Open upstream endpoints called by Telegraph nodes |
+| Telegram | long polling | Profile, wallet, preview and paid-service UI |
 
-## The marketplace poller
+The `/miner/*` endpoints deliberately do not verify a direct payment. Telegraph
+collects USDC from the requester and pays registered miners according to the
+protocol. The direct `/api/*` endpoints retain their own Base Sepolia payment
+verification for Telegram and third-party callers outside Telegraph.
 
-OKX does not guarantee a push for every task that names this agent, and a task
-sitting in `created` is expired by the backend. The provider is expected to
-**pull**. Each cycle the poller reads every task routed to `OKX_ASP_AGENT_ID`
-and moves it forward:
+## Environment
 
-| Task status | Poller action |
-|---|---|
-| `created` | `contact-user` (opens the buyer chat), then `apply` on-chain when the task designates us and the budget is within `OKX_MAX_AUTO_APPLY_BUDGET` |
-| `accepted` | escrow funded → extract criteria from the buyer's brief, run the hunt, `deliver` the ranked shortlist on-chain |
-| `submitted` | nothing — awaiting buyer review |
-| `completed` | mark settled, notify the bound Telegram user |
-| `expired` / `closed` / `refunded` | close the engagement locally |
+See `.env.example` for every variable. Important production settings:
 
-It also heartbeats every 5 minutes (`recommend-task` only matches agents that
-look online) and, once the listing is approved, cold-starts on relevant public
-tasks — contact only, never `apply`, since on a public task the buyer has not
-chosen us yet.
+- `PUBLIC_URL`: public HTTPS origin, currently `https://legwork-production-88e5.up.railway.app`
+- `ADZUNA_APP_ID` / `ADZUNA_APP_KEY`: live general job data
+- `USAJOBS_API_KEY`: live US federal jobs
+- `ANTHROPIC_API_KEY`: LLM scoring, criteria extraction and tailoring
+- `TELEGRAM_BOT_TOKEN`: optional Telegram surface
+- `PAYMENT_ASSET_ADDRESS`, `PAYMENT_PAY_TO`: direct `/api/*` billing
+- `WALLET_ENCRYPTION_KEY`: protects Telegram users' imported wallet keys
+- `DATABASE_PATH`: SQLite path; use a persistent volume in production
 
-Verify it against a live account without touching the chain:
+## Redflag — buying miner answers through Telegraph
 
-```bash
-npm run okx:poll            # readiness + task list + what a live tick would do
-npm run okx:poll -- --live  # actually claim
-```
+Redflag (`POST /api/redflag`, `/redflag` in Telegram) is Legwork's consumer
+side: it pays other miners for scam, news, URL and fact checks via the node
+engine (`POST /engine/v1/ask`, x402).
 
-A healthy dry run looks like:
+- `TELEGRAPH_NODE_URL`: engine base, default `https://devnode.telegraphprotocol.com`
+- `TELEGRAPH_PRIVATE_KEY`: the wallet that pays miners. Fund it with Base
+  Sepolia **USDC** (`0x036CbD53842c5426634e7929541eC2318f3dCF7e`). x402
+  signatures are EIP-3009 — gasless, no ETH burn. Without this key Redflag
+  runs degraded (local scan + comp benchmark only) and says so in the report.
+- `REDFLAG_MAX_SPEND_USD`: per-report miner spend ceiling, default `0.08`.
+  Checks are price-probed before payment; anything over the remaining budget
+  is skipped, never bought.
+- `TELEGRAPH_CACHE_TTL_SEC`: identical queries reuse the cached signal
+  instead of paying again (default 300s).
 
-```
-gate-check: ready=true wallet=true identity=true comms=true signed-in-agent=6658
-8 task(s) routed to this agent:
-  [created] 0x4931…f04d — 2 USDT — "Help find tech job matches"
-  ⚠ 8 task(s) still in "created" — these expire if the agent never claims them.
-```
-
-If `gate-check` reports `ready=false`, the service wallet is not signed in:
-run `onchainos wallet login` with `ONCHAINOS_HOME` pointed at
-`OKX_ONCHAINOS_HOME`, then re-run the poll.
-
-Feature flags by key:
-
-- **Job sources** — `ADZUNA_APP_ID`/`ADZUNA_APP_KEY` and/or `USAJOBS_API_KEY`. With neither set, mock fixtures are used (demo mode).
-- **LLM scoring + tailoring** — `ANTHROPIC_API_KEY`. Without it, deterministic heuristics (keyword-overlap skills score, template drafts).
-- **Real email submission** — `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`/`GMAIL_REFRESH_TOKEN` (scope: `gmail.send` only). Without them, submissions are simulated and receipted as such.
-- **OKX inbound auth** — `OKX_INBOUND_SECRET` (checked against the `x-okx-secret` header) until registry signature verification is wired.
-
-## The flow in production
-
-1. Register Legwork on the OKX ERC-8004 agent registry with your public HTTPS URL for `/okx/a2a`, category *Resume & Career Workflows*.
-2. Buyer hires a listing (`job-search-sprint-7d` or `tailor-one-application`) on the OKX Task Marketplace.
-3. OKX posts `task_assigned` to the endpoint → Legwork replies in the task chat with a one-time deep link `t.me/<bot>?start=<code>`.
-4. Buyer opens the link → `/start <code>` binds their Telegram account → onboarding conversation collects the profile.
-5. Scheduler scans every 6h → match cards with the explicit rubric breakdown land in the thread.
-6. Buyer taps **Approve** → sees the exact email → taps **Send now** → apply-executor submits (hard-gated on the recorded approval; the draft is frozen as dispute evidence).
-7. Weekly digest in Telegram; at engagement end the digest + evidence bundle is delivered through the OKX task lifecycle; `delivery_accepted` settles payment.
-
-## Telegram commands
-
-`/start <code>` `/profile` `/rubric [threshold N | cap N]` `/scan` `/status` `/digest` `/pause` `/resume` `/revoke` `/help`
-
-## Testing the OKX endpoint locally
+One live paid end-to-end check:
 
 ```bash
-curl -s localhost:8402/health
-curl -s -X POST localhost:8402/okx/a2a -H 'content-type: application/json' \
-  -d '{"jobId":"j1","message":{"source":"system","event":"task_assigned","jobId":"j1"}}'
+npx tsx scripts/redflag-smoke.ts "Senior Backend Engineer at Shopify, remote, $170k-$210k"
 ```
 
-## Layout
+## Railway Deployment
 
+The Railway project is named `legwork`; this workspace is linked to its
+production environment.
+
+```bash
+railway variable set \
+  PUBLIC_URL=https://legwork-production-88e5.up.railway.app \
+  ADZUNA_APP_ID=... \
+  ADZUNA_APP_KEY=... \
+  ANTHROPIC_API_KEY=...
+railway up --detach
 ```
-src/
-  index.ts                 process entry (bot + OKX endpoint + scheduler)
-  demo.ts                  keyless end-to-end demo
-  config.ts  types.ts  db.ts  llm.ts  pipeline.ts  digest.ts  scheduler.ts
-  telegram/bot.ts          the ONLY user surface: onboarding, cards, approvals
-  okx/server.ts            A2A endpoint, listings, task lifecycle, payments log
-  skills/
-    jobScraper.ts          Adzuna + USAJOBS + mock, normalize, dedupe
-    matchScorer.ts         rubric 40/20/15/15/10, every sub-score has a reason
-    applicationTailor.ts   resume + cover letter + email (never fabricates)
-    applyExecutor.ts       approval-gated submission, Gmail send, receipts
+
+Add Telegram and direct-payment secrets only if those surfaces are enabled.
+After deployment:
+
+```bash
+curl -fsS https://legwork-production-88e5.up.railway.app/health
+curl -fsS https://legwork-production-88e5.up.railway.app/miner.yaml | shasum -a 256
+shasum -a 256 miner.yaml
 ```
+
+The two hashes must match exactly before registration.
+
+## Telegraph Registration
+
+Legwork's miner identity is:
+
+- ID: `8402`
+- Slug: `legwork-job-hunter`
+- Canonical intents: `WEB_SEARCH`, `RESEARCH_SYNTHESIS`, `TEXT_GENERATION`
+- Floor price: `0.01 USDC` (`10000` in 6-decimal units)
+- Registry Diamond: `0x5a2324aA18613FAD4e44bDF0d6c73Ec1f6D87ff8`
+- Network: Base Sepolia
+- **Current registrationId: `404`** (2026-09-01; supersedes `400`, `399`, `396` and `392`.
+  Committed YAML hash
+  `0x8d04aef3d50f5b28011656d4283c7b3b81cf6d162544da2dd0b49e02fecf04cd`.
+  Each `updateMiner` issues a NEW id — find the latest with the dispatcher:
+  `curl -s https://devnode.telegraphprotocol.com/miner-dispatcher/miners/address/<wallet>/yamls`)
+
+Updating after any `miner.yaml` change (deploy FIRST — the script refuses when the
+served hash differs from local):
+
+```bash
+set -a; source .env; set +a
+scripts/register-miner.sh --update <currentRegistrationId>
+```
+
+Schema gotchas learned the hard way (each is a terminal `rejected` status):
+
+- `accepted_fields` on a param must be an OBJECT in the live schema, not the
+  array shown in some docs examples — omit it and put enum values in the
+  param `description` instead.
+- `input_schema`/`output_schema` are top-level only; anything else inside
+  `endpoints[]` is rejected with "Additional property not allowed".
+
+## Production environment requirements
+
+Railway service `legwork` must carry (without them the miner serves mock
+fixtures and template drafts, which validators score as junk):
+
+- `ADZUNA_APP_ID`, `ADZUNA_APP_KEY`, `ADZUNA_COUNTRY` — live job data
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` — criteria extraction, scoring,
+  and the `/miner/tailor` generation path (verify in logs: a 401 means the
+  key is stale and the keyless fallback is running)
+
+```bash
+railway variables list --service legwork --json
+```
+
+Recommended: paste `miner.yaml` into
+[integrate.telegraphprotocol.com](https://integrate.telegraphprotocol.com),
+sandbox-test both endpoints, connect the registering wallet, pin the YAML and
+register.
+
+CLI alternative:
+
+```bash
+export PUBLIC_URL=https://legwork-production-88e5.up.railway.app
+export MINER_PRIVATE_KEY=0x...   # dedicated Base Sepolia wallet with gas ETH
+export FEE_ADDRESS=0x...         # MACHINA payout address
+scripts/register-miner.sh --dry-run
+scripts/register-miner.sh
+```
+
+The script verifies the live YAML hash and all three canonical intents before
+sending `registerMiner`.
+
+## Verify Activation
+
+Telegraph nodes normally activate a registration within a minute:
+
+```bash
+curl -s https://devnode.telegraphprotocol.com/api/miners \
+  | jq '.[] | select(.slug=="legwork-job-hunter")'
+```
+
+If the miner is absent, query its registration ID directly and inspect
+`activation_status` and `rejection_reason`. A rejected registration is fixed
+with `scripts/register-miner.sh --update <registrationId>` after correcting and
+redeploying `miner.yaml`.
+
+## Verification
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```
+
+The miner tests boot the real HTTP server on an ephemeral port and assert that
+the served YAML is byte-identical, job-hunt responses expose `label`,
+`confidence` and `reason`, and malformed requests return clean 4xx responses.
