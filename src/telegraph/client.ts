@@ -364,8 +364,19 @@ export function buildDirectPayload(miner: MinerSummary, text: string): Record<st
   return null;
 }
 
-/** How many discovered miners a direct fallback will try before giving up. */
-const DIRECT_MINER_ATTEMPTS = 2;
+/**
+ * How many discovered miners a direct fallback will try before giving up.
+ *
+ * Was 2. Each intent has 4-15 active miners, but the top keyword matches are
+ * often unhealthy — dead endpoints (404), miners missing their own API-key
+ * credential, or ones that reject the payment authorization (402). Trying only
+ * two meant the flagship full vetting bought NOTHING when those two were down,
+ * even though a working miner sat at rank 3+. Failed attempts do not settle
+ * payment (x402 charges only on a 2xx) and the loop stops at the first
+ * success, so a higher cap costs reach, not money. Latency is bounded because
+ * the four checks run concurrently and dead miners fail fast.
+ */
+const DIRECT_MINER_ATTEMPTS = 5;
 
 /** Rank discovered miners: keyword hits in slug/name first, price second. */
 function rankMiners(miners: MinerSummary[], keywords: string[]): MinerSummary[] {
