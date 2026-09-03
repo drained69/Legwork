@@ -280,3 +280,41 @@ test('api: /health reports the telegraph consumer side', async () => {
   assert.equal(typeof data.telegraph?.configured, 'boolean');
   assert.ok(data.telegraph?.nodeUrl);
 });
+
+test('redflag: a comfortable budget runs the miner checks in parallel', async () => {
+  // The four checks are independent lookups; running them concurrently cuts
+  // the flagship "full vetting" wait from the sum of four calls to the slowest
+  // single one. Each mock call sleeps 200ms — sequential would be ~800ms.
+  let concurrent = 0;
+  let peak = 0;
+  const engine = async (opts: { maxCostUsd?: number }): Promise<{ ok: boolean; minerName: string; costUsd: number; result: unknown }> => {
+    concurrent += 1;
+    peak = Math.max(peak, concurrent);
+    await new Promise((r) => setTimeout(r, 200));
+    concurrent -= 1;
+    return { ok: true, minerName: 'm', costUsd: opts.maxCostUsd ?? 0.01, result: { label: 'ok', reason: 'fine' } };
+  };
+  const report = await runRedflag(
+    { company: 'Acme Corp', title: 'Engineer', description: 'Great role. https://acme.example/jobs Salary $200k guaranteed.' },
+    { engineAsk: engine as never, budgetUsd: 0.08 },
+  );
+  // Peak concurrency is the direct evidence of parallelism; wall-clock is not,
+  // because runRedflag also runs a comp-benchmark scan and synthesis around
+  // the checks. Sequential execution would never let peak exceed 1.
+  assert.ok(peak >= 2, `checks must overlap, peak concurrency was ${peak}`);
+  // Even if every miner charged its full per-check share, the total is capped.
+  assert.ok(report.spendUsd <= 0.08 + 1e-9, `spend ${report.spendUsd} must never exceed the $0.08 budget`);
+});
+
+test('redflag: the parallel path never exceeds budget even if every miner charges its cap', async () => {
+  // Each miner charges exactly the maxCostUsd it is handed — the worst case
+  // for a fixed budget. The equal-share cap must still keep the total ≤ budget.
+  const engine = async (opts: { maxCostUsd?: number }): Promise<{ ok: boolean; minerName: string; costUsd: number; result: unknown }> =>
+    ({ ok: true, minerName: 'greedy', costUsd: opts.maxCostUsd ?? 0.02, result: { label: 'ok', reason: 'x' } });
+  const report = await runRedflag(
+    { company: 'Acme Corp', title: 'Engineer', description: 'Role. https://acme.example/jobs Claims: remote, $300k, equity.' },
+    { engineAsk: engine as never, budgetUsd: 0.08 },
+  );
+  assert.ok(report.spendUsd <= 0.08 + 1e-9, `spend ${report.spendUsd} exceeded budget`);
+  assert.ok(report.spendUsd > 0, 'checks actually ran and were paid for');
+});

@@ -327,6 +327,14 @@ export function companyNewsQuery(company: string): string {
   return `Latest news about ${company}: layoffs, hiring freezes, funding rounds, bankruptcy, acquisitions, scandals, executive departures`;
 }
 
+/**
+ * Conservative per-check price used to decide whether the report budget can
+ * afford to run every check in parallel. Above the $0.01 floor these utility
+ * miners charge, so the parallel path is taken only when there is genuine
+ * headroom; a tighter budget falls back to sequential greedy spend.
+ */
+const EXPECTED_CHECK_COST_USD = 0.02;
+
 const TELEGRAPH_CHECKS: TelegraphCheck[] = [
   {
     id: 'fraud',
@@ -559,49 +567,96 @@ export async function runRedflag(
   let spendUsd = 0;
   let confidence = 0.5;
 
-  // Free checks run concurrently with nothing to pay for.
-  const [heuristicFlags, comp] = await Promise.all([Promise.resolve(scamHeuristics(input, facts)), compBenchmark(input, facts)]);
+  // The comp benchmark is a live job-board scan (~2-4s) whose result is only
+  // needed at synthesis. It is independent of the paid miner checks, so it
+  // runs CONCURRENTLY with them rather than before — overlapping the two
+  // slowest phases instead of summing them. The scam heuristics are synchronous.
+  const heuristicFlags = scamHeuristics(input, facts);
+  const compPromise = compBenchmark(input, facts);
 
   checks.push({ id: 'heuristics', label: 'Local scam-pattern scan', status: 'ok', source: 'local', costUsd: 0, summary: heuristicFlags.length ? `${heuristicFlags.length} pattern(s) matched` : 'No classic scam patterns matched' });
-  if (comp.flag) {
-    checks.push({ id: 'comp', label: 'Comp benchmark (live boards)', status: 'ok', source: 'legwork', costUsd: 0, summary: comp.flag.title });
-  } else {
-    checks.push({ id: 'comp', label: 'Comp benchmark (live boards)', status: 'skipped', source: 'legwork', costUsd: 0, summary: 'No role identified to benchmark against' });
-  }
 
-  // Paid checks run in priority order, each gated on the REMAINING budget.
   const telegraphEvidence: Array<{ check: TelegraphCheck; result: EngineAskResult }> = [];
+
+  /** Fold one miner result into the running spend, checks and confidence. */
+  const recordResult = (check: TelegraphCheck, result: EngineAskResult): void => {
+    const cost = result.ok ? (result.costUsd ?? 0.01) : 0;
+    spendUsd = Math.round((spendUsd + cost) * 1e6) / 1e6;
+    if (result.ok) {
+      const distilled = distillResult(result.result);
+      const thin = isThinAnswer(distilled);
+      telegraphEvidence.push({ check, result });
+      checks.push({
+        id: check.id, label: check.label, status: result.cached ? 'cached' : 'ok', source: 'telegraph',
+        miner: result.minerName, intent: check.intent, costUsd: cost, signalHash: result.signalHash,
+        summary: distilled.text.slice(0, 300) || 'No content returned',
+      });
+      // A paid-but-thin answer ("out of coverage") does not inflate confidence
+      // the way a real signal does.
+      confidence += result.cached ? 0.05 : thin ? 0 : 0.1;
+    } else {
+      checks.push({ id: check.id, label: check.label, status: result.skipped ? 'skipped' : 'failed', source: 'telegraph', intent: check.intent, costUsd: 0, summary: result.error ?? 'check failed' });
+      confidence -= result.skipped ? 0.05 : 0.15;
+    }
+  };
+
   if (config.telegraph.enabled || opts?.engineAsk) {
-    for (const check of TELEGRAPH_CHECKS) {
-      const query = check.query(facts, input);
-      if (!query) {
-        checks.push({ id: check.id, label: check.label, status: 'skipped', source: 'telegraph', intent: check.intent, costUsd: 0, summary: 'Nothing to check (input lacked the needed fact)' });
-        continue;
+    // Evaluate each check's query once, keeping TELEGRAPH_CHECKS order for a
+    // stable report regardless of which path runs.
+    const evaluated = TELEGRAPH_CHECKS.map((check) => ({ check, query: check.query(facts, input) }));
+    const runnable = evaluated.filter((e): e is { check: TelegraphCheck; query: string } => Boolean(e.query));
+
+    // PARALLEL when the budget comfortably covers every runnable check at a
+    // conservative per-check price, SEQUENTIAL when it is tight.
+    //
+    // The four miner calls used to run one after another — ~27s of a visitor
+    // staring at a spinner on the flagship "Run full vetting" button. They are
+    // independent lookups (fraud, news, URL, fact-check) against different
+    // miners, and x402 pays each with its own random EIP-3009 nonce, so firing
+    // them at once is safe and cuts the wait to the slowest single check.
+    //
+    // The catch is the budget: the greedy sequential model lets ONE check use
+    // the whole remaining budget, so a naive parallel split would change
+    // spending behaviour (and could starve a high-priority check). So parallel
+    // runs only when each check's equal share still clears a realistic price
+    // — i.e. the budget can afford them all. When it cannot, the sequential
+    // path preserves the exact greedy contract (and its tests).
+    const fairShareUsd = runnable.length ? Math.floor((budgetUsd / runnable.length) * 1e6) / 1e6 : 0;
+    const parallel = runnable.length > 0 && fairShareUsd >= EXPECTED_CHECK_COST_USD;
+
+    if (parallel) {
+      // Each call is capped at an equal share, so even if every miner charges
+      // its maximum the total can never exceed the budget.
+      const settled = await Promise.all(
+        runnable.map(({ check, query }) =>
+          ask({ query, intent: check.intent, preferMiner: check.minerKeywords, maxCostUsd: fairShareUsd }).then(
+            (result) => result,
+            (error): EngineAskResult => ({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+          ),
+        ),
+      );
+      const resultById = new Map(runnable.map((e, i) => [e.check.id, settled[i]]));
+      for (const { check, query } of evaluated) {
+        if (!query) {
+          checks.push({ id: check.id, label: check.label, status: 'skipped', source: 'telegraph', intent: check.intent, costUsd: 0, summary: 'Nothing to check (input lacked the needed fact)' });
+          continue;
+        }
+        recordResult(check, resultById.get(check.id) as EngineAskResult);
       }
-      const remaining = Math.round((budgetUsd - spendUsd) * 1e6) / 1e6;
-      if (remaining <= 0) {
-        checks.push({ id: check.id, label: check.label, status: 'skipped', source: 'telegraph', intent: check.intent, costUsd: 0, summary: 'Report budget exhausted' });
-        confidence -= 0.05;
-        continue;
-      }
-      const result = await ask({ query, intent: check.intent, preferMiner: check.minerKeywords, maxCostUsd: remaining });
-      const cost = result.ok ? (result.costUsd ?? 0.01) : 0;
-      spendUsd = Math.round((spendUsd + cost) * 1e6) / 1e6;
-      if (result.ok) {
-        const distilled = distillResult(result.result);
-        const thin = isThinAnswer(distilled);
-        telegraphEvidence.push({ check, result });
-        checks.push({
-          id: check.id, label: check.label, status: result.cached ? 'cached' : 'ok', source: 'telegraph',
-          miner: result.minerName, intent: check.intent, costUsd: cost, signalHash: result.signalHash,
-          summary: distilled.text.slice(0, 300) || 'No content returned',
-        });
-        // A paid-but-thin answer ("out of coverage") does not inflate
-        // confidence the way a real signal does.
-        confidence += result.cached ? 0.05 : thin ? 0 : 0.1;
-      } else {
-        checks.push({ id: check.id, label: check.label, status: result.skipped ? 'skipped' : 'failed', source: 'telegraph', intent: check.intent, costUsd: 0, summary: result.error ?? 'check failed' });
-        confidence -= result.skipped ? 0.05 : 0.15;
+    } else {
+      // Tight budget: greedy priority spend, each check gated on what is left.
+      for (const { check, query } of evaluated) {
+        if (!query) {
+          checks.push({ id: check.id, label: check.label, status: 'skipped', source: 'telegraph', intent: check.intent, costUsd: 0, summary: 'Nothing to check (input lacked the needed fact)' });
+          continue;
+        }
+        const remaining = Math.round((budgetUsd - spendUsd) * 1e6) / 1e6;
+        if (remaining <= 0) {
+          checks.push({ id: check.id, label: check.label, status: 'skipped', source: 'telegraph', intent: check.intent, costUsd: 0, summary: 'Report budget exhausted' });
+          confidence -= 0.05;
+          continue;
+        }
+        recordResult(check, await ask({ query, intent: check.intent, preferMiner: check.minerKeywords, maxCostUsd: remaining }));
       }
     }
   } else {
@@ -610,6 +665,11 @@ export async function runRedflag(
       confidence -= 0.05;
     }
   }
+
+  const comp = await compPromise;
+  checks.splice(1, 0, comp.flag
+    ? { id: 'comp', label: 'Comp benchmark (live boards)', status: 'ok', source: 'legwork', costUsd: 0, summary: comp.flag.title }
+    : { id: 'comp', label: 'Comp benchmark (live boards)', status: 'skipped', source: 'legwork', costUsd: 0, summary: 'No role identified to benchmark against' });
 
   const synthesis = await synthesize(facts, input, telegraphEvidence, heuristicFlags, comp.flag);
   if (synthesis.flags.length && telegraphEvidence.length) confidence += 0.05;

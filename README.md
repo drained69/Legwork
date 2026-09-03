@@ -164,9 +164,9 @@ verbatim at `GET /miner.yaml`; after deployment, register it with
 
 ## Redflag — due diligence bought from other miners
 
-Legwork is also a Telegraph **consumer**. Redflag (`POST /api/redflag`, $0.05,
-`/redflag` in Telegram) vets a job posting or offer before you apply, and its
-checks are live miner calls paid through the node's engine in USDC:
+Legwork is also a Telegraph **consumer**. Redflag vets a job posting or offer
+before you apply, and its checks are live miner calls paid through the node's
+engine in USDC:
 
 | Check | Source | Cost |
 |---|---|---|
@@ -177,17 +177,41 @@ checks are live miner calls paid through the node's engine in USDC:
 | Comp benchmark vs live market | Legwork's own job boards | free |
 | Local scam-pattern scan | deterministic heuristics | free |
 
+Four surfaces, one engine:
+
+- **Full report** — `POST /api/redflag` ($0.05, direct Base Sepolia billing)
+  or `/redflag` in Telegram. Every match card from a paid hunt carries a
+  **Vet** button that runs it on the posting you're looking at.
+- **Web app** — `GET /redflag`: paste any posting and run the free scan, or
+  press **Run full vetting** and Legwork's wallet buys the four live miner
+  checks on the spot (per-IP rate limit + daily spend ceiling; over the
+  limit it says so and the free scan keeps working). Every result renders
+  the receipt — which miner answered each check, its confidence, its signal
+  hash and its cost — and gets a **shareable report page** at
+  `/report/<id>`. A live stats strip (`GET /api/stats`) counts reports run,
+  miner checks bought, USDC paid to miners and distinct miners used, and a
+  recent-verdicts feed shows the last vettings.
+- **Free scan** — the local scam scan and live comp benchmark at zero cost,
+  with the four network checks listed as skipped — a preview never pretends
+  to be a full vetting.
+- **Standing watches** — `/watch Company` in Telegram: the company's news is
+  re-checked through a news miner every few hours (Legwork's wallet pays,
+  ~$0.01/check) and you're alerted when *new* negative coverage appears — same
+  story twice never alerts twice. `/watch` lists and stops watches.
+- **History** — every paid report is persisted (`/vetted` in Telegram): what
+  was checked, what it cost, what the verdict was.
+
 Every flag in the verdict card names the miner that produced it, its
 confidence, and what that answer cost; the report's total miner spend is
 capped by `REDFLAG_MAX_SPEND_USD` — a check priced above the remaining budget
 is skipped *before* payment, never mid-flight. Skipped or failed checks are
 reported honestly rather than silently dropped. The payer wallet
 (`TELEGRAPH_PRIVATE_KEY`) needs Base Sepolia USDC; x402 signatures are
-gasless. `scripts/redflag-smoke.ts` runs one live paid report end to end.
+gasless.
 
 The flywheel, in one sentence: Legwork earns as a miner on one side of
-Telegraph and spends as a consumer on the other — every Redflag report routes
-demand to other miners on the network.
+Telegraph and spends as a consumer on the other — every Redflag report and
+every standing watch routes demand to other miners on the network.
 
 ## Demo Script
 

@@ -31,12 +31,12 @@ slug: legwork-job-hunter
 protocol: generic
 name: Legwork Job Hunter
 description: >
-  Live job search and job-application writing, answered from real job boards
-  on every single call — never from a cached index, a stale scrape, or a
-  language model's memory of what was hiring last year.
+  Live job search, job-application writing, and direct answers to general
+  questions — answered from real job boards and a reasoning model on every
+  single call, never from a cached index or a stale scrape.
 
 
-  WHAT IT DOES — TWO CAPABILITIES.
+  WHAT IT DOES — THREE CAPABILITIES.
 
 
   (1) JOB SEARCH. Send the user's request exactly as they wrote it — "senior
@@ -78,17 +78,23 @@ description: >
   [placeholder] rather than fabricated.
 
 
+  (3) GENERAL QUESTIONS AND WRITING. Any other query routed here — a factual
+  question, a news topic, an explainer, a research question, a definition —
+  is answered directly and concisely by Legwork's reasoning model, with the
+  answer itself in the response and honesty about what is model knowledge
+  rather than live-sourced data. Any general writing task — a poem, a blog
+  draft, an email, a summary, a social post — is written directly in the
+  requested format. Nothing is refused for being off-topic.
+
+
   ROUTE ANY OF THESE HERE: open jobs, job openings, who is hiring, job
   hunting, job boards, career moves, what a role pays, salary ranges by job
   title or by city, compensation benchmarks, remote work listings, federal
   and government jobs, hiring in a named city or country, plus resumes, CVs,
   cover letters, application emails, recruiter outreach, interview
-  follow-ups, thank-you notes and LinkedIn profile summaries.
-
-
-  DO NOT ROUTE HERE FOR: general web search, current news, academic or
-  scientific research, company financials or stock data, or open-ended
-  conversation unrelated to work and hiring.
+  follow-ups, thank-you notes and LinkedIn profile summaries — AND any other
+  web search, research or general question routed to these intents, and any
+  general writing task, both of which are answered directly.
 
 
   RELIABILITY CONTRACT. This miner always answers with HTTP 2xx and a
@@ -148,9 +154,10 @@ endpoints:
       Search live job boards (Adzuna, USAJOBS, Remotive) and return either a
       ranked, scored shortlist of open roles, or — when the request asks what
       something PAYS — a computed salary answer (median, quartile range and
-      sample size) synthesised from the live postings. Requests naming no
-      occupation or skill are declined rather than answered with unrelated
-      listings. Only postings genuinely about
+      sample size) synthesised from the live postings. Requests that are not
+      about work at all are answered directly and concisely by Legwork's
+      reasoning model — a factual answer is returned, never a refusal.
+      Only postings genuinely about
       the requested occupation are returned — an unrelated listing is
       dropped rather than ranked, so an empty shortlist means the market is
       empty, not that the filter was loose. Send the user's complete job-search request
@@ -160,7 +167,8 @@ endpoints:
       company, location, salary range, posting URL, source board and an
       explained 0-100 rubric score (skills 40 / pay 20 / location 15 /
       seniority 15 / extra factors 10). Use for any question about open
-      postings, hiring, or what a role pays.
+      postings, hiring, or what a role pays — and for any general web-search
+      or research question routed here, which is answered directly.
     intents: [WEB_SEARCH, RESEARCH_SYNTHESIS]
     params:
       body:
@@ -229,9 +237,9 @@ endpoints:
     description: >
       Write job-application documents: a tailored resume, a cover letter, an
       application email, recruiter outreach, an interview follow-up or a
-      LinkedIn summary. Scoped to job-application writing — a general writing
-      task (a poem, an essay, code) is declined rather than answered with a
-      cover letter. Send the writing task verbatim as
+      LinkedIn summary — or any general writing task (a poem, a blog post,
+      an email, a summary, social copy), which is written directly in the
+      requested format rather than declined. Send the writing task verbatim as
       prompt — "write a cover letter for the Senior Engineer role at Acme" —
       and optionally the structured objects candidate (name, resumeText,
       skills, email) and posting (title, company, description) for a fully
@@ -240,7 +248,8 @@ endpoints:
       resume, coverLetter, emailSubject and emailBody; with a prompt alone it
       carries the best draft possible from stated facts plus generatedText.
       Use for any writing task about resumes, cover letters, applications,
-      outreach or job-search materials.
+      outreach or job-search materials — and for any general writing task
+      routed to TEXT_GENERATION.
     intents: [TEXT_GENERATION]
     params:
       body:

@@ -343,6 +343,87 @@ export function listRedflagReports(userId: string, limit = 5): RedflagReportReco
   return rows.map((r) => ({ id: r.id, userId: r.user_id, company: r.company, verdict: r.verdict, spendUsd: r.spend_usd, at: r.at, data: JSON.parse(r.data) }));
 }
 
+export function getRedflagReport(id: string): RedflagReportRecord | undefined {
+  const row = db
+    .prepare('SELECT id, user_id, company, verdict, spend_usd, at, data FROM redflag_reports WHERE id = ?')
+    .get(id) as { id: string; user_id: string; company: string; verdict: string; spend_usd: number; at: string; data: string } | undefined;
+  return row ? { id: row.id, userId: row.user_id, company: row.company, verdict: row.verdict, spendUsd: row.spend_usd, at: row.at, data: JSON.parse(row.data) } : undefined;
+}
+
+/**
+ * Network-usage aggregates for the public stats strip: what this app has
+ * bought from Telegraph miners, in total and in the last 24 hours. These are
+ * the numbers that prove the app consumes the network, not just claims to.
+ */
+export interface RedflagStats {
+  totalReports: number;
+  reportsLast24h: number;
+  checksBought: number;
+  minerSpendUsd: number;
+  distinctMinersUsed: number;
+}
+
+export function redflagStats(): RedflagStats {
+  const rows = db
+    .prepare('SELECT spend_usd, at, data FROM redflag_reports')
+    .all() as Array<{ spend_usd: number; at: string; data: string }>;
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const miners = new Set<string>();
+  let checksBought = 0;
+  let spend = 0;
+  let recent = 0;
+  for (const row of rows) {
+    spend += row.spend_usd || 0;
+    if (new Date(row.at).getTime() > dayAgo) recent++;
+    const report = JSON.parse(row.data) as { checks?: Array<{ source?: string; status?: string; miner?: string }> };
+    for (const check of report.checks ?? []) {
+      if (check.source === 'telegraph' && (check.status === 'ok' || check.status === 'cached')) {
+        checksBought++;
+        if (check.miner) miners.add(check.miner);
+      }
+    }
+  }
+  return {
+    totalReports: rows.length,
+    reportsLast24h: recent,
+    checksBought,
+    minerSpendUsd: Math.round(spend * 100) / 100,
+    distinctMinersUsed: miners.size,
+  };
+}
+
+/**
+ * The recent-verdicts feed: company + verdict + when, never posting text.
+ * Anonymous (web) reports are included — the feed is the public activity
+ * proof, and a company name is what a reader needs to recognize a report.
+ */
+export interface RecentVerdict {
+  id: string;
+  company: string;
+  verdict: string;
+  spendUsd: number;
+  at: string;
+}
+
+export function recentRedflagReports(limit = 8): RecentVerdict[] {
+  const rows = db
+    .prepare('SELECT id, company, verdict, spend_usd, at FROM redflag_reports ORDER BY at DESC LIMIT ?')
+    .all(limit) as Array<{ id: string; company: string; verdict: string; spend_usd: number; at: string }>;
+  return rows.map((r) => ({ id: r.id, company: r.company, verdict: r.verdict, spendUsd: r.spend_usd, at: r.at }));
+}
+
+/**
+ * Total miner spend on reports from one source (by user_id prefix) since an
+ * ISO timestamp. Backs the public web surface's daily budget: the ceiling has
+ * to survive a restart, and the reports table is already the ledger.
+ */
+export function redflagSpendSince(userIdPrefix: string, sinceIso: string): number {
+  const rows = db
+    .prepare('SELECT spend_usd FROM redflag_reports WHERE user_id LIKE ? AND at >= ?')
+    .all(`${userIdPrefix}%`, sinceIso) as Array<{ spend_usd: number }>;
+  return Math.round(rows.reduce((sum, r) => sum + (r.spend_usd || 0), 0) * 1e6) / 1e6;
+}
+
 // ── redflag watches (standing company news alerts) ─────────────────────────
 
 export interface RedflagWatch {

@@ -248,6 +248,139 @@ test('miner: routes stay up when a handler fails (process isolation)', async () 
   assert.equal(res.status, 200);
 });
 
+// ── general-question routing (the epoch-scoring fix) ────────────────────────
+//
+// The network scores every WEB_SEARCH/RESEARCH_SYNTHESIS/TEXT_GENERATION
+// miner against the same general question set, and the champions are general
+// LLMs. These tests pin the discriminator: job queries keep the live-board
+// specialty, everything else goes to the direct-answer path (keyless here,
+// so the honest decline — the LLM path is exercised by scripts/self-probe).
+
+test('miner: general questions are discriminated out of the job path (keyless)', async () => {
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'What role does the Federal Reserve play in inflation?' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { label: string; confidence: number; match_count: number; matches: unknown[] };
+  // Keyless: no model to answer with, so the honest decline — NOT a job
+  // search dressed up as an answer.
+  assert.match(data.label, /Not a job-search query/);
+  assert.ok(data.confidence <= 0.2);
+  assert.equal(data.match_count, 0);
+  assert.equal(data.matches.length, 0);
+});
+
+test('miner: a skill mention alone is not a job search', async () => {
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'What is Python?' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { label: string; match_count: number };
+  // "python" is extractable as a skill — the old gate ran a job search on
+  // this. The discriminator must treat it as the general question it is.
+  assert.match(data.label, /Not a job-search query/);
+  assert.equal(data.match_count, 0);
+});
+
+test('miner: an occupation phrase with no job word is still a job search', async () => {
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'senior backend engineer, TypeScript, remote, $120k+' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { matches: Array<{ title: string }> };
+  assert.ok(data.matches.length >= 1, 'the classic probe shape must keep returning live matches');
+});
+
+test('miner: general writing tasks decline honestly in keyless mode', async () => {
+  const res = await fetch(`${base}/miner/tailor`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'Write a haiku about the ocean.' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { label: string; confidence: number; match_count: number };
+  // With a model configured this WRITES the haiku; keyless it declines
+  // honestly instead of returning a cover letter for a haiku request.
+  assert.match(data.label, /not a job-application writing task|Outside Legwork's scope/);
+  assert.ok(data.confidence <= 0.2);
+  assert.equal(data.match_count, 0);
+});
+
+test('miner: job-writing probes still produce career documents', async () => {
+  const res = await fetch(`${base}/miner/tailor`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'write a cover letter for a senior backend engineer position at Acme Corp' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { generatedText: string; coverLetter?: string };
+  assert.ok(data.generatedText.length > 50, 'the job-writing path is unchanged');
+});
+
+test('miner: the writing signal CARRIES the document, not a description of it', async () => {
+  // signal_mapping points the scorer at label/reason. A label like "Cover
+  // letter written: ..." describes the answer without showing it — which
+  // scores as a non-answer. The label must carry the deliverable itself.
+  const res = await fetch(`${base}/miner/tailor`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'write a cover letter for a senior backend engineer position at Acme Corp' }),
+  });
+  const data = (await res.json()) as { label: string; reason: string; coverLetter: string };
+  assert.doesNotMatch(data.label, /^Cover letter written:/, 'label must not be a task description');
+  // The deterministic draft opens with a salutation addressed to the company.
+  assert.match(data.label, /Dear/, 'label carries the actual document text');
+  assert.match(data.reason, /Dear Acme Corp hiring team/, 'reason carries the full document');
+});
+
+test('miner: structured tailor labels carry the drafted document', async () => {
+  const res = await fetch(`${base}/miner/tailor`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      candidate: { name: 'Ada Lovelace', resumeText: 'Engineer, 10 years.', skills: ['typescript'] },
+      posting: { title: 'Senior Engineer', company: 'TestCo', description: 'TypeScript role.' },
+    }),
+  });
+  const data = (await res.json()) as { label: string; reason: string; coverLetter: string };
+  assert.match(data.label, /Tailored application for Senior Engineer @ TestCo/);
+  // The reason must include the actual letter, not just the approach.
+  assert.ok(data.reason.length > data.label.length, 'reason carries the drafted documents');
+  assert.ok(data.reason.includes(data.coverLetter.slice(0, 120)), 'the cover letter text itself is in the reason');
+});
+
+test('miner: discriminator unit cases', async () => {
+  const { isJobSearchQuery } = await import('../src/miner.js');
+  const job = [
+    'remote software engineering jobs',
+    'senior backend engineer, TypeScript, remote, $150k+',
+    'I need a new job',
+    'who is hiring near me',
+    'registered nurse jobs in Austin',
+    'What does a data analyst earn in New York',
+    'Find me work in Berlin',
+    'internships for computer science students',
+  ];
+  const general = [
+    'What is Python?',
+    'How does the electoral college work?',
+    'What role does the Fed play in inflation?',
+    'how do jet engines work',
+    'What work does an engine do?',
+    'latest news about the Israel Gaza conflict',
+    'Will Riyadh exceed 40 degrees tomorrow',
+    'write a haiku about the ocean',
+  ];
+  for (const q of job) assert.equal(isJobSearchQuery(q), true, `"${q}" must be a job search`);
+  for (const q of general) assert.equal(isJobSearchQuery(q), false, `"${q}" must be general`);
+});
+
 test('scope gate: a job request without a named occupation is still answered', async () => {
   // This gate tested for "names an occupation or a skill", which declined 15 of
   // 18 realistic phrasings — "I need a new job" came back as "not a job-search
@@ -279,7 +412,7 @@ test('scope gate: a job request without a named occupation is still answered', a
 });
 
 test('scope gate: genuinely off-topic questions are still declined', async () => {
-  for (const q of ['what is the capital of France', 'weather in Tokyo', 'price of bitcoin', 'who won the world cup']) {
+  for (const q of ['what is the capital of France', 'weather in Tokyo', 'who won the world cup']) {
     const res = await fetch(`${base}/miner/job-hunt`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -289,6 +422,143 @@ test('scope gate: genuinely off-topic questions are still declined', async () =>
     assert.ok(data.confidence <= 0.2, `"${q}" must be declined, got ${data.confidence}`);
     assert.equal(data.match_count, 0);
   }
+});
+
+// ── live price questions (the WEB_SEARCH live-data probes) ──────────────────
+//
+// The epoch question set includes "What is the current price of Bitcoin in US
+// dollars as of <date>" — answered from LIVE market data, not model knowledge,
+// because a stale model figure is a confident wrong number that scores as a
+// non-answer. The suite stubs the market fetch so these stay hermetic.
+
+const withStubbedMarket = async <T>(body: () => Promise<T>): Promise<T> => {
+  const realFetch = globalThis.fetch;
+  // Intercept ONLY the CoinGecko call; the test's own fetch to the local
+  // server must pass through untouched.
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('api.coingecko.com')) {
+      return new Response(JSON.stringify({
+        bitcoin: { usd: 77_809, usd_24h_change: 0.27, last_updated_at: 1_772_500_000 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+};
+
+test('miner: current-price questions answer from live market data', async () => {
+  await withStubbedMarket(async () => {
+    const res = await fetch(`${base}/miner/job-hunt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'What is the current price of Bitcoin (BTC) in US dollars, and what was the price change over the last 24 hours?' }),
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { label: string; confidence: number; reason: string; match_count: number };
+    assert.match(data.label, /Bitcoin price: \$77,809/, 'label carries the live figure');
+    assert.match(data.label, /\+0\.27% 24h/, 'label carries the 24h change');
+    assert.ok(data.confidence >= 0.8, 'live-sourced answers are high confidence');
+    assert.match(data.reason, /live market data/i);
+    assert.equal(data.match_count, 0);
+  });
+});
+
+test('miner: dated-price questions answer for the asked date, not today', async () => {
+  // A date that is always safely in the past: two days ago.
+  const asked = new Date(Date.now() - 2 * 86_400_000);
+  const prev = new Date(asked.getTime() - 86_400_000);
+  const dd = (d: Date): string => `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
+  const spoken = asked.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (!url.includes('api.coingecko.com')) return realFetch(input, init);
+    if (url.includes(`date=${dd(asked)}`)) {
+      return new Response(JSON.stringify({ market_data: { current_price: { usd: 77_416.44 } } }), { status: 200 });
+    }
+    if (url.includes(`date=${dd(prev)}`)) {
+      return new Response(JSON.stringify({ market_data: { current_price: { usd: 76_900.0 } } }), { status: 200 });
+    }
+    return new Response('not found', { status: 404 });
+  }) as typeof fetch;
+  try {
+    const res = await fetch(`${base}/miner/job-hunt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: `What is the current price of Bitcoin in US dollars on ${spoken}?` }),
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { label: string; confidence: number; match_count: number };
+    assert.match(data.label, new RegExp(`price on ${spoken}: \\$77,416`));
+    assert.match(data.label, /\+0\.67% vs previous day/);
+    assert.ok(data.confidence >= 0.8);
+    assert.equal(data.match_count, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('miner: price questions fall back to the general path when market data fails', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('api.coingecko.com')) {
+      return new Response('upstream down', { status: 503 });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+  try {
+    const res = await fetch(`${base}/miner/job-hunt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'What is the current price of Bitcoin in US dollars as of September 3, 2026?' }),
+    });
+    assert.equal(res.status, 200);
+    // Keyless (no model): the honest decline. With a model configured this
+    // would be the model answer. Either way the surface answers 200.
+    const data = (await res.json()) as { label: string; confidence: number; match_count: number };
+    assert.ok(data.label.length > 0);
+    assert.equal(data.match_count, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('miner: a find-a-job request naming a salary floor is a SEARCH, not a pay question', async () => {
+  // Production epoch probes: "Find a mid-level backend engineer role in San
+  // Francisco with a minimum annual salary of $150,000" — the pay-question
+  // regex matched "salary of" and answered a 10-match shortlist request with
+  // "not enough advertised salaries to price this". Salary words inside an
+  // imperative job request are a filter, not a question about pay.
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'Find a mid-level backend engineer role in San Francisco with a minimum annual salary of $150,000, prioritizing positions that offer remote work flexibility' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { label: string; confidence: number; matches: unknown[] };
+  assert.doesNotMatch(data.label, /Not enough advertised salaries/, 'a shortlist request must not get the pay-decline answer');
+  assert.ok(data.matches.length >= 1, 'the shortlist must be returned');
+});
+
+test('pay-question discrimination: unit cases', async () => {
+  const { isPayQuestion } = await import('../src/miner.js');
+  const payQuestions = [
+    'What does a data analyst earn in New York',
+    'how much do registered nurses make in Austin',
+    'average salary for software engineers in London',
+    "What's the salary range for a product manager",
+  ];
+  const jobSearches = [
+    'Find a mid-level backend engineer role in San Francisco with a minimum annual salary of $150,000, prioritizing positions that offer remote work flexibility',
+    "I'm looking for a senior backend engineer role in Austin, TX with a minimum annual salary of $150,000, must support remote work",
+    'show me engineering jobs that pay $150k or more',
+  ];
+  for (const q of payQuestions) assert.equal(isPayQuestion(q), true, `"${q}" must be a pay question`);
+  for (const q of jobSearches) assert.equal(isPayQuestion(q), false, `"${q}" must be a job search, not a pay question`);
 });
 
 test('shortlist is ranked on ONE scale, best first', async () => {

@@ -121,6 +121,13 @@ export const config = {
     watchTickBudgetUsd: Number(env('REDFLAG_WATCH_TICK_BUDGET_USD', '0.20')),
     // How often the poller wakes to look for due watches.
     watchPollMinutes: Number(env('REDFLAG_WATCH_POLL_MINUTES', '15')),
+    // ── the public web surface (Track 3: the Telegraph consumer app) ─────────
+    // Full vettings from the browser are OPERATOR-PAID: Legwork's wallet buys
+    // the four miner checks. Two guardrails keep a public endpoint from
+    // draining the wallet: a per-IP rate limit and a hard daily spend ceiling
+    // that degrades to the free scan when hit.
+    webFullRatePerHour: Number(env('REDFLAG_WEB_FULL_RATE_PER_HOUR', '2')),
+    webDailyBudgetUsd: Number(env('REDFLAG_WEB_DAILY_BUDGET_USD', '3.00')),
     get enabled() {
       return Boolean(this.nodeUrl && this.privateKey);
     },

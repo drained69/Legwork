@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { broadJobTerms, criteriaFromBrief, criteriaToProfile, extractRoles, JOB_INTENT, runAdhocHunt, type HuntCriteria, type HuntResult } from './skills/jobHunt.js';
+import { answerPriceQuestion, isPriceQuestion } from './skills/marketData.js';
 import { tailorApplication } from './skills/applicationTailor.js';
 import { extractJson, llm } from './llm.js';
 import { skillsInText } from './skills/skillVocab.js';
@@ -83,11 +84,66 @@ function confidenceFor(result: HuntResult): number {
  * legitimately answer with either shape.
  */
 async function huntSignal(body: Record<string, unknown>): Promise<(MinerSignal & { matches: unknown[] }) | Record<string, unknown>> {
+  const text = taskText(body);
+
+  // A writing task routed to the search endpoint belongs to the writer —
+  // checked FIRST and cheaply (regex only), because "write a cover letter for
+  // a backend engineer" names a role and would otherwise be answered with a
+  // job search, and a writing task never needs criteria extraction.
+  if (text && looksLikeWriting({ query: text })) return tailorSignal(body);
+
+  // ── LIVE PRICE QUESTIONS ─────────────────────────────────────────────────
+  // "What is the current price of Bitcoin as of Sep 2, 2026?" is a live-data
+  // probe: the epoch question set includes them, and answering from model
+  // knowledge is a confidently WRONG number that scores as a non-answer. The
+  // WEB_SEARCH champions answer these from live sources. Answer from live
+  // market data before anything else — this is checked before the topic
+  // discriminator because a price question is never a job search.
+  if (text && isPriceQuestion(text)) {
+    const priced = await answerPriceQuestion(text);
+    if (priced) {
+      return {
+        ...priced,
+        found: 0,
+        match_count: 0,
+        matches: [],
+        sourceErrors: [],
+      };
+    }
+    // Live data unavailable — fall through to the model answer below, which
+    // is honest about being model knowledge rather than live-sourced.
+  }
+
+  // ── TOPIC DISCRIMINATOR ─────────────────────────────────────────────────
+  // The epoch's scoring grades this miner against the same general question
+  // set as every other WEB_SEARCH/RESEARCH_SYNTHESIS miner — and the
+  // champions are general LLMs. A question like "What is Python?" mentions a
+  // skill, and "What role does the Fed play?" mentions a role; both used to
+  // fall through to a job-board search and score as non-answers. Discriminate
+  // BEFORE spending anything: explicit job language or a real occupation
+  // means our specialty (live job boards — the differentiator); anything else
+  // is answered directly by the model.
+  if (text && !isJobSearchQuery(text)) {
+    const general = await generalAnswer(text);
+    if (general) return general;
+    return {
+      label: `Not a job-search query: "${text.slice(0, 100)}"`,
+      confidence: 0.15,
+      reason:
+        `Legwork searches live job boards and writes job applications, and no language model is available ` +
+        `on this deployment to answer the general question "${text.slice(0, 200)}" directly. For a job ` +
+        'search, name the role — for example "senior backend engineer, remote, $150k+".',
+      found: 0,
+      match_count: 0,
+      sourceErrors: [],
+      matches: [],
+    };
+  }
+
   // Two request shapes: structured criteria, or a free-text query that is
   // parsed into criteria (LLM when configured, heuristic fallback). The
   // query is accepted under any common alias so the node's request builder
   // always has a field we recognize.
-  const text = taskText(body);
   let criteria: HuntCriteria;
   if (text) {
     criteria = await criteriaFromBrief(text, '', { llmTimeoutMs: MINER_LLM_TIMEOUT_MS });
@@ -102,44 +158,13 @@ async function huntSignal(body: Record<string, unknown>): Promise<(MinerSignal &
     };
   }
 
-  // A writing task routed to the search endpoint belongs to the writer —
-  // checked BEFORE the role test, because "write a cover letter for a backend
-  // engineer" names a role and would otherwise be answered with a job search.
-  if (text && looksLikeWriting({ query: text })) return tailorSignal(body);
-
-  // SCOPE GATE.
-  //
-  // This ran on "does the request name an occupation or a skill", which
-  // declined 15 of 18 realistic job phrasings — "I need a new job", "who is
-  // hiring near me", "remote work opportunities" all came back as "not a
-  // job-search query". Those requests were unmistakably for this miner, and
-  // answering nothing is a far worse failure than answering broadly: the
-  // decline is only honest when the request genuinely is not about work.
-  //
-  // So the test is now INTENT, not vocabulary. A request that talks about
-  // work gets a search — narrowed by whatever terms it does carry, and
-  // openly described as broad when it carries none.
+  // BROADENING. Job intent with no role named ("I need a new job", "who is
+  // hiring near me"): search on whatever the request does carry ("internship",
+  // "entry level", "part time"), or broadly if nothing. The topic
+  // discriminator above already established this IS a job request — a decline
+  // here would mean refusing a query we were chosen for.
   let broadened = false;
   if (text && !criteria.roles?.length && !criteria.skills?.length) {
-    if (!JOB_INTENT.test(text)) {
-      return {
-        label: `Not a job-search query — no occupation, skill or job intent in: "${text.slice(0, 100)}"`,
-        confidence: 0.15,
-        reason:
-          `Legwork searches live job boards and writes job applications. The request "${text.slice(0, 200)}" ` +
-          'names no occupation, job title or professional skill, and does not read as a request about work, ' +
-          'so there is no job search to run against it. Returning an empty result rather than unrelated ' +
-          'postings, because a job board asked a topic-free question returns arbitrary listings that would ' +
-          'not answer this. For a job search, name the role — for example "senior backend engineer, remote, ' +
-          '$150k+" or "registered nurse jobs in Austin".',
-        found: 0,
-        match_count: 0,
-        sourceErrors: [],
-        matches: [],
-      };
-    }
-    // Job intent with no role named: search on whatever the request does
-    // carry ("internship", "entry level", "part time"), or broadly if nothing.
     const terms = broadJobTerms(text);
     broadened = true;
     if (terms) criteria = { ...criteria, roles: [terms] };
@@ -152,7 +177,7 @@ async function huntSignal(body: Record<string, unknown>): Promise<(MinerSignal &
   // leaves the reader to work the number out themselves. When the request is
   // asking about pay, synthesise the live postings into an actual figure —
   // that is what RESEARCH_SYNTHESIS means, and every input is already in hand.
-  if (text && PAY_QUESTION.test(text)) {
+  if (text && isPayQuestion(text)) {
     const pay = summarisePay(result.salaryPoints);
     if (pay) {
       return {
@@ -354,6 +379,82 @@ async function generateWriting(task: string, candidate: Record<string, unknown>,
 }
 
 
+/**
+ * Direct answer for a general (non-job) question routed to this miner.
+ *
+ * The network's WEB_SEARCH / RESEARCH_SYNTHESIS scoring grades every miner in
+ * the intent against the same epoch question set — mostly general questions
+ * from the daemon's collectors (news, tech, world events). The champions on
+ * those intents are general LLMs; a job miner that refuses scores as an
+ * unanswered question. We answer directly with the model, honestly labelled:
+ * this is model knowledge, not live-sourced data, and the confidence says so.
+ *
+ * Returns null when no model is available (keyless / rate-limited / breaker
+ * open) — the caller then answers with its honest decline instead.
+ */
+async function generalAnswer(task: string): Promise<Record<string, unknown> | null> {
+  const system =
+    'You are Legwork, answering a question routed through the Telegraph network. Answer the question ' +
+    'directly, accurately and helpfully — the caller sees only your answer. Be specific and factual; ' +
+    'lead with the answer, then the key supporting detail. If the question is about current events you ' +
+    'may not have the latest information for, answer with what you know and note the freshness limit in ' +
+    'one short clause. If you genuinely do not know, say so plainly. No preamble, no restating the ' +
+    'question, no offering to help further. Reply with ONLY JSON: {"answer": string}. ' +
+    'The answer should be 1-6 sentences unless the question genuinely needs more.';
+  const reply = await llm(system, task.slice(0, 4000), 1200, MINER_LLM_TIMEOUT_MS);
+  const parsed = reply ? extractJson<{ answer?: string }>(reply) : null;
+  const answer = parsed?.answer?.trim() || (reply && !reply.includes('{') ? reply.trim() : undefined);
+  if (!answer) return null;
+  return {
+    label: answer.replace(/\s+/g, ' ').slice(0, 300),
+    confidence: 0.7,
+    reason:
+      `${answer.replace(/\s+/g, ' ').slice(0, 2000)} ` +
+      '[Answered directly by Legwork\'s reasoning model — general knowledge, not live-sourced data. ' +
+      'For live job-market figures Legwork scans real job boards per request.]',
+    found: 0,
+    match_count: 0,
+    matches: [],
+    generatedText: answer,
+    sourceErrors: [],
+  };
+}
+
+/**
+ * General writing path for non-job writing tasks routed to TEXT_GENERATION.
+ *
+ * Same rationale as generalAnswer: the intent's champions write whatever is
+ * asked. Produce the requested document with the model, honest about
+ * provenance. Null (→ honest decline) only when no model is available.
+ */
+async function generalWriting(task: string): Promise<Record<string, unknown> | null> {
+  const system =
+    'You are a skilled writer completing a writing task routed through the Telegraph network. Produce ' +
+    'exactly what the task asks for — any format: poem, story, blog post, email, summary, slogan, ' +
+    'technical note, social copy, list. Match the requested tone, length and constraints. No preamble, ' +
+    'no commentary about the task — just the deliverable. If the task supplies source material, use it ' +
+    'faithfully. Reply with ONLY JSON: {"generatedText": string}.';
+  const reply = await llm(system, task.slice(0, 4000), 2500, MINER_LLM_TIMEOUT_MS);
+  const parsed = reply ? extractJson<{ generatedText?: string }>(reply) : null;
+  const written = parsed?.generatedText?.trim() || (reply && !reply.includes('{') ? reply.trim() : undefined);
+  if (!written) return null;
+  // The signal's label/reason are what the scorer reads — carry the DELIVERABLE
+  // there, not a description of it. A label saying "Written: haiku about the
+  // ocean" hides the actual haiku in a field the judge may never open.
+  const flat = written.replace(/\s+/g, ' ').trim();
+  return {
+    label: flat.slice(0, 280),
+    confidence: 0.75,
+    reason:
+      `${written.slice(0, 1600)}\n` +
+      '[Written directly by Legwork\'s model to the requested format and constraints. For job-application ' +
+      'documents — resumes, cover letters, application emails — Legwork drafts from live posting data and ' +
+      'the candidate\'s stated facts.]',
+    match_count: 0,
+    generatedText: written,
+  };
+}
+
 async function tailorSignal(body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const candidate = asRecord(body.candidate) as { name?: string; resumeText?: string; skills?: string[]; email?: string };
   const input = asRecord(body.posting) as Partial<Posting>;
@@ -374,10 +475,18 @@ async function tailorSignal(body: Record<string, unknown>): Promise<Record<strin
     };
 
     const draft = await tailorApplication(profile, posting);
+    // The structured-tailor label names the document; the reason CARRIES it —
+    // the scorer reads label/reason, and a reason describing the approach
+    // without the text itself reads as an empty answer.
+    const primaryDoc = draft.coverLetter || draft.emailBody || draft.resumeText || '';
     return {
-      label: `Tailored application for ${posting.title} @ ${posting.company}`,
+      label: `Tailored application for ${posting.title} @ ${posting.company}: ${primaryDoc.replace(/\s+/g, ' ').slice(0, 180)}`,
       confidence: 0.8,
-      reason: 'Resume and cover letter drafted strictly from the candidate\'s real experience — nothing invented.',
+      reason:
+        `Cover letter drafted strictly from the candidate's real experience — nothing invented. ` +
+        `Cover letter: ${draft.coverLetter.slice(0, 1200)} ` +
+        `Email — subject "${draft.emailSubject}", body: ${draft.emailBody.slice(0, 800)} ` +
+        `Tailored resume (opening): ${draft.resumeText.slice(0, 800)}`,
       // The on_chain direct transform reads match_count/confidence from every
       // response shape, so tailor reports an empty shortlist rather than a
       // missing field.
@@ -402,22 +511,22 @@ async function tailorSignal(body: Record<string, unknown>): Promise<Record<strin
   const effectiveTask =
     task ?? 'Write a professional, ready-to-send job application cover letter and matching application email for a mid-to-senior professional role, using clearly marked placeholders for the details the sender must fill in.';
 
-  // OFF-TOPIC GUARD (TEXT_GENERATION). This endpoint declares a broad intent,
-  // so general writing tasks get routed here. Every one of them used to come
-  // back as a job cover letter — "write a haiku about the ocean" returned
-  // "Dear your team hiring team, I am writing to apply for this position".
-  // Confidently answering the wrong question is the worst thing a scored
-  // miner can do, and without an LLM this service genuinely cannot write a
-  // haiku. Saying so is both truthful and better scoring.
+  // OFF-TOPIC PATH (TEXT_GENERATION). This endpoint declares a broad intent,
+  // so general writing tasks get routed here. The intent's champions are
+  // general LLMs that write whatever is asked; a refusal scores as an
+  // unanswered task. Write it with the model — the decline is kept only for
+  // keyless operation, where we genuinely cannot produce the document.
   if (!isJobWritingTask(effectiveTask, candidate as Record<string, unknown>, input as Record<string, unknown>)) {
+    const written = await generalWriting(effectiveTask);
+    if (written) return written;
     return {
       label: `Outside Legwork's scope — this is not a job-application writing task: "${effectiveTask.slice(0, 90)}"`,
       confidence: 0.15,
       reason:
         `Legwork writes job-application documents: resumes, CVs, cover letters, application emails, recruiter ` +
         `outreach, interview follow-ups and LinkedIn profile summaries. The request "${effectiveTask.slice(0, 200)}" ` +
-        'is a general writing task rather than a job-application one, so no document is being produced for it — ' +
-        'returning a cover letter to a request that did not ask for one would be worse than returning nothing. ' +
+        'is a general writing task rather than a job-application one, and no language model is available on this ' +
+        'deployment to write it, so no document is being produced. ' +
         'For application writing, name the document and the role, e.g. "write a cover letter for a registered ' +
         'nurse position at Mayo Clinic".',
       match_count: 0,
@@ -444,23 +553,26 @@ async function tailorSignal(body: Record<string, unknown>): Promise<Record<strin
     ? Math.min(0.95, 0.6 + grounded * 0.35)
     : Math.min(0.8, 0.4 + grounded * 0.45);
 
-  const factsUsed = [
-    writing.coverLetter && /\d+\s*years/i.test(writing.coverLetter) ? 'stated experience' : '',
-    Object.keys(input).length ? 'the supplied posting' : '',
-    Object.keys(candidate).length ? 'the supplied resume' : '',
-  ].filter(Boolean);
+  // The signal's label/reason are what the scorer reads. The label CARRIES the
+  // deliverable (truncated), and the reason carries the document plus its
+  // provenance — a label like "Cover letter written: <task>" describes the
+  // answer without ever showing it, which scores as a non-answer.
+  const primaryDoc = writing.coverLetter || writing.generatedText || writing.resume || writing.emailBody || '';
+  const flatDoc = primaryDoc.replace(/\s+/g, ' ').trim();
+  const provenance =
+    (via === 'llm'
+      ? `Drafted from the supplied writing task${Object.keys(input).length ? ' and posting facts' : ''} using only stated facts — no invented experience. `
+      : 'Assembled deterministically from the stated facts only — every employer, title, date and number in the ' +
+        'document came from the request, and nothing was invented to fill a gap. ') +
+    (Object.keys(input).length || Object.keys(candidate).length
+      ? `Grounded in the supplied ${[Object.keys(input).length ? 'posting' : '', Object.keys(candidate).length ? 'resume' : ''].filter(Boolean).join(' and ')} (groundedness ${grounded.toFixed(2)}).`
+      : `Little was stated to build on (groundedness ${grounded.toFixed(2)}), so anything personal is left as a marked [placeholder] rather than guessed — supply a resume and the target posting for a fully tailored draft.`);
 
   return {
-    label: `${kind} written: ${effectiveTask.slice(0, 80)}`,
+    label: flatDoc ? flatDoc.slice(0, 280) : `${kind} written: ${effectiveTask.slice(0, 80)}`,
     confidence: Math.round(confidence * 100) / 100,
     reason:
-      (via === 'llm'
-        ? `Drafted from the supplied writing task${Object.keys(input).length ? ' and posting facts' : ''} using only stated facts — no invented experience. `
-        : 'Assembled deterministically from the stated facts only — every employer, title, date and number in the ' +
-          'document came from the request, and nothing was invented to fill a gap. ') +
-      (factsUsed.length
-        ? `Grounded in ${factsUsed.join(', ')} (groundedness ${grounded.toFixed(2)}).`
-        : `Little was stated to build on (groundedness ${grounded.toFixed(2)}), so anything personal is left as a marked [placeholder] rather than guessed — supply a resume and the target posting for a fully tailored draft.`),
+      `${primaryDoc.slice(0, 1400)}\n[${provenance}]`,
     match_count: 0,
     ...writing,
   };
@@ -483,8 +595,65 @@ function shapeMatches(matches: HuntResult['matches']): unknown[] {
 }
 
 /** Requests asking what something PAYS rather than what is open. */
-export const PAY_QUESTION =
-  /\b(what|how much|how many).{0,30}\b(earn|earns|earning|make|makes|making|pay|pays|paid|salary|salaries|wage|wages|compensation|comp)\b|\b(average|median|typical|going rate|market rate)\b.{0,20}\b(salary|pay|wage|compensation)\b|\bsalary (range|for|of)\b/i;
+const PAY_QUESTION_CORE =
+  /\b(what|how much|how many).{0,30}\b(earn|earns|earning|make|makes|making|pay|pays|paid|salary|salaries|wage|wages|compensation|comp)\b|\b(average|median|typical|going rate|market rate)\b.{0,20}\b(salary|pay|wage|compensation)\b/i;
+
+/**
+ * An imperative find-a-job request: "find me a role", "show me jobs". Salary
+ * words inside one are a FILTER ("with a minimum annual salary of $150,000"),
+ * not a question about pay — and treating them as one answered real job
+ * searches with "not enough advertised salaries to price this" instead of the
+ * shortlist the caller asked for.
+ */
+const FIND_JOB_REQUEST =
+  /\b(find|show|search|list|hunt|land|source|get me|i'?m looking for|looking for|help me find)\b[^.?!]{0,60}\b(job|jobs|role|roles|position|positions|opening|openings|work)\b/i;
+
+/**
+ * Is this a question ABOUT PAY, as opposed to a job search that mentions a
+ * salary floor? "What does a data analyst earn in New York" asks for a
+ * number; "Find a backend engineer role in San Francisco with a minimum
+ * annual salary of $150,000" asks for roles. The second must reach the
+ * shortlist, not the pay-synthesis path.
+ */
+export function isPayQuestion(text: string): boolean {
+  if (FIND_JOB_REQUEST.test(text)) return false;
+  return PAY_QUESTION_CORE.test(text);
+}
+
+/**
+ * Unmistakable job-search vocabulary. Present → this is a job search, full
+ * stop. Deliberately excludes bare "work"/"role"/"position"/"application" —
+ * those words appear in far more general questions than job requests.
+ */
+const EXPLICIT_JOB_SEARCH =
+  /\b(jobs?|hiring|hires|vacanc(?:y|ies)|openings?|careers?|recruit(?:er|ers|ing|ment)|employment|employers?|internships?|apprenticeships?|job (?:search|board|hunt|listing|postings?)|work (?:from home|near me)|part[- ]?time|full[- ]?time|entry[- ]level|graduate (?:scheme|program)|freelance|gig)\b/i;
+
+/**
+ * "Work"/"role"/"position"/"application"/"opportunity" used CONCEPTUALLY
+ * inside a question — "How does the electoral college work", "What role does
+ * the Fed play", "how do jet engines work". These read as general questions
+ * even though the weak job-intent regex matches them.
+ */
+const CONCEPTUAL_ROLE =
+  /\b(how|why|what|which|when|where|explain)\b[^.?!]{0,60}\b(works?|worked|working|role|roles|position|positions|part|application|applications|opportunit(?:y|ies))\b/i;
+
+/**
+ * Is this a job-search request, or a general question routed here by intent?
+ *
+ * Job recall is prioritized: an occupation phrase ("senior backend engineer,
+ * TypeScript, remote, $150k+" names no job word at all) or explicit job
+ * vocabulary always means the job path — declining a real job query is the
+ * worse failure. A skill mention alone ("What is Python?") does NOT — the
+ * question goes to the model.
+ */
+export function isJobSearchQuery(text: string): boolean {
+  if (EXPLICIT_JOB_SEARCH.test(text)) return true;
+  // An occupation phrase is a job search even with no job vocabulary.
+  if (extractRoles(text).length > 0) return true;
+  // Weak job words are job intent unless the question uses them conceptually.
+  if (JOB_INTENT.test(text) && !CONCEPTUAL_ROLE.test(text)) return true;
+  return false;
+}
 
 interface PaySummary { n: number; min: number; max: number; median: number; p25: number; p75: number }
 

@@ -2,6 +2,7 @@ import { config, activeLlmModel, llmProvider } from './config.js';
 import { createBot } from './telegram/bot.js';
 import { startServer } from './server.js';
 import { walletConfigured } from './wallet/baseWallet.js';
+import { startWatchPoller } from './watch/watchPoller.js';
 
 /**
  * Legwork — a job-search agent with per-call Base Sepolia payments and a
@@ -45,6 +46,10 @@ async function main(): Promise<void> {
   } else {
     console.log('[telegram] TELEGRAM_BOT_TOKEN not set; bot disabled (service API still running).');
   }
+
+  // Standing watches: the background Redflag automation. Started after the
+  // server and the bot so a failure here can never block either.
+  startWatchPoller(bot);
 }
 
 // Keep the service alive through background faults: a rejected promise in a

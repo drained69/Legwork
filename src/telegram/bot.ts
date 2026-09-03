@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from '../config.js';
 import {
-  createWatch, deactivateWatch, getOnboarding, getPosting, getProfile, getWallet, getWatch, listRedflagReports, listUsage, listWatches, now,
+  createWatch, deactivateWatch, getOnboarding, getPosting, getProfile, getWallet, getWatch, listUsage, listWatches, now,
   savePosting, saveProfile, saveRedflagReport, setOnboarding, clearOnboarding, uid,
 } from '../db.js';
 import { huntViaApi, previewViaApi, redflagPreviewViaApi, redflagViaApi, scoreViaApi, tailorViaApi, type HuntApiResult, type RedflagApiResult } from './apiClient.js';
@@ -90,6 +90,7 @@ export function createBot(): Bot {
     await send(ctx.reply.bind(ctx), `${title('Watch started', company)}\n\nI re-check ${esc(company)}'s news every ${config.telegraph.watchIntervalHours} hours through a live Telegraph news miner (~$${config.telegraph.watchCheckBudgetUsd.toFixed(2)} per check, on me) and alert you here the moment new negative coverage appears — layoffs, investigations, bankruptcy.\n\nUse <b>/redflag</b> any time for the full picture.`, { ...HTML, reply_markup: watchKeyboard(watch.id) });
   });
   bot.command('vetted', async (ctx) => {
+    const { listRedflagReports } = await import('../db.js');
     const reports = listRedflagReports(id(ctx), 5);
     if (!reports.length) return void (await send(ctx.reply.bind(ctx), `${title('Vetting history')}\n\nNo reports yet. Use <b>/redflag</b> to vet a posting, or <b>/redflagfree</b> for the free scan.`, { ...HTML, reply_markup: home() }));
     const lines = reports.map((r) => `${verdictIcon(r.verdict)} <b>${esc(r.company)}</b> · ${esc(r.verdict)} · miner spend $${r.spendUsd.toFixed(2)} · ${esc(r.at.slice(0, 16).replace('T', ' '))} UTC`);

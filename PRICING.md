@@ -26,6 +26,7 @@ on Base Sepolia:
 | Score one posting | `POST /api/score` | $0.01 |
 | Tailor one application | `POST /api/tailor` | $0.01 |
 | Redflag due diligence on one posting | `POST /api/redflag` | $0.05 |
+| Redflag free scam scan | `POST /api/redflag/preview`, `GET /redflag` | Free, 3/hour/client |
 | Top-three preview | `POST /api/hunt/preview` | Free, 3/hour/client |
 
 Direct callers submit `X-Payment-Tx` and `X-User-Wallet`. The server verifies a
@@ -47,3 +48,9 @@ transaction-hash replay.
   it would exceed the remaining budget. Telegraph answers are cached per
   subject (`TELEGRAPH_CACHE_TTL_SEC`, default 300s), so repeat reports on the
   same company do not re-pay for the same signal.
+- Standing watches (`/watch Company` in Telegram) are paid by LEGWORK, not the
+  subscriber: ~$0.01 per news check at the default cadence, capped per check
+  (`REDFLAG_WATCH_CHECK_BUDGET_USD`, $0.02) and per poller sweep
+  (`REDFLAG_WATCH_TICK_BUDGET_USD`, $0.20). A watch alerts only on NEW
+  negative coverage (fingerprint-deduplicated), so the same story never
+  costs twice.
