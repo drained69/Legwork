@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import type { Bot } from 'grammy';
 import { config } from '../config.js';
 import { appendReportUpdate, audit, listActiveWatches, now, updateWatchAlert, updateWatchCheck } from '../db.js';
-import { engineAsk as realEngineAsk, type EngineAskResult } from '../telegraph/client.js';
-import { companyNewsQuery, distillResult, isAlarmingText, NEWS_MINER_KEYWORDS } from '../skills/redflag.js';
+import { engineAsk as realEngineAsk, type EngineAskResult } from './telegraph.js';
+import { companyNewsQuery, distillResult, isAlarmingText, NEWS_MINER_KEYWORDS } from './redflag.js';
 
 /**
  * Standing watches — Redflag's automation layer.

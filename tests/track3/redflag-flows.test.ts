@@ -28,12 +28,12 @@ process.env.USAJOBS_API_KEY = '';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { startServer } = await import('../src/server.js');
+const { startServer } = await import('../../src/server.js');
 const {
   createWatch, deactivateWatch, getWatch, listActiveWatches, listWatches,
   saveRedflagReport, listRedflagReports, updateWatchAlert, updateWatchCheck,
-} = await import('../src/db.js');
-const { runWatchTick, isWatchDue, signalFingerprint, renderWatchAlert } = await import('../src/watch/watchPoller.js');
+} = await import('../../src/db.js');
+const { runWatchTick, isWatchDue, signalFingerprint, renderWatchAlert } = await import('../../src/track3/watchPoller.js');
 
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));
@@ -352,7 +352,7 @@ test('watch: renderWatchAlert carries company, headline and miner provenance', (
 
 /** Clear last_check_at so a watch is immediately due again. */
 async function forceDue(watchId: string): Promise<void> {
-  const { db } = await import('../src/db.js');
+  const { db } = await import('../../src/db.js');
   db.prepare('UPDATE redflag_watches SET last_check_at = NULL WHERE id = ?').run(watchId);
 }
 

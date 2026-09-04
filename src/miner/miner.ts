@@ -2,14 +2,14 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { broadJobTerms, criteriaFromBrief, criteriaToProfile, extractRoles, JOB_INTENT, runAdhocHunt, type HuntCriteria, type HuntResult } from './skills/jobHunt.js';
-import { answerPriceQuestion, isPriceQuestion } from './skills/marketData.js';
-import { tailorApplication } from './skills/applicationTailor.js';
-import { extractJson, llm, llmGrounded } from './llm.js';
-import { skillsInText } from './skills/skillVocab.js';
-import { deterministicWriting } from './skills/deterministicWriter.js';
-import { json, readBodyTruncating } from './http.js';
-import type { Posting, Profile } from './types.js';
+import { broadJobTerms, criteriaFromBrief, criteriaToProfile, extractRoles, JOB_INTENT, runAdhocHunt, type HuntCriteria, type HuntResult } from '../skills/jobHunt.js';
+import { answerPriceQuestion, isPriceQuestion } from './marketData.js';
+import { tailorApplication } from '../skills/applicationTailor.js';
+import { extractJson, llm, llmGrounded } from '../llm.js';
+import { skillsInText } from '../skills/skillVocab.js';
+import { deterministicWriting } from './deterministicWriter.js';
+import { json, readBodyTruncating } from '../http.js';
+import type { Posting, Profile } from '../types.js';
 
 /**
  * Telegraph miner surface (https://docs.telegraphprotocol.com).
@@ -751,7 +751,7 @@ let minerYaml: string | null = null;
 
 export function getMinerYaml(): string {
   if (!minerYaml) {
-    const root = dirname(dirname(fileURLToPath(import.meta.url))); // repo root (or /app in the container)
+    const root = dirname(dirname(dirname(fileURLToPath(import.meta.url)))); // repo root (or /app in the container)
     minerYaml = readFileSync(join(root, 'miner.yaml'), 'utf8');
   }
   return minerYaml;

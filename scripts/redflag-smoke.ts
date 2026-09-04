@@ -13,7 +13,7 @@ import 'dotenv/config';
 
 process.env.TELEGRAPH_PRIVATE_KEY ||= process.env.EVM_PRIVATE_KEY ?? '';
 
-const { runRedflag, formatRedflagCard } = await import('../src/skills/redflag.js');
+const { runRedflag, formatRedflagCard } = await import('../src/track3/redflag.js');
 
 const posting = process.argv[2]
   ?? 'Senior Backend Engineer at Shopify\nRemote-first, $170k–$210k. Apply at https://jobs.shopify.com/careers/senior-backend-engineer';

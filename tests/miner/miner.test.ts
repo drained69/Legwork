@@ -26,8 +26,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
-const { startServer } = await import('../src/server.js');
-const { PRICED_SERVICES } = await import('../src/payments/services.js');
+const { startServer } = await import('../../src/server.js');
+const { PRICED_SERVICES } = await import('../../src/payments/services.js');
 
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));
@@ -59,7 +59,7 @@ test('miner: /miner.yaml serves the registered file verbatim', async () => {
   // The served bytes are what the on-chain SHA-256 commits to — they must be
   // byte-identical to the repo file, not a re-serialization.
   const { readFileSync } = await import('node:fs');
-  const onDisk = readFileSync(new URL('../miner.yaml', import.meta.url), 'utf8');
+  const onDisk = readFileSync(new URL('../../miner.yaml', import.meta.url), 'utf8');
   assert.equal(body, onDisk);
   const hash = createHash('sha256').update(body).digest('hex');
   assert.match(hash, /^[0-9a-f]{64}$/);
@@ -356,7 +356,7 @@ test('miner: structured tailor labels carry the drafted document', async () => {
 });
 
 test('miner: discriminator unit cases', async () => {
-  const { isJobSearchQuery } = await import('../src/miner.js');
+  const { isJobSearchQuery } = await import('../../src/miner/miner.js');
   const job = [
     'remote software engineering jobs',
     'senior backend engineer, TypeScript, remote, $150k+',
@@ -545,7 +545,7 @@ test('miner: a find-a-job request naming a salary floor is a SEARCH, not a pay q
 });
 
 test('pay-question discrimination: unit cases', async () => {
-  const { isPayQuestion } = await import('../src/miner.js');
+  const { isPayQuestion } = await import('../../src/miner/miner.js');
   const payQuestions = [
     'What does a data analyst earn in New York',
     'how much do registered nurses make in Austin',

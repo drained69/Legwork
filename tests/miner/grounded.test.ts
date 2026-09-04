@@ -29,8 +29,8 @@ process.env.REMOTIVE_ENABLED = 'false';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { startServer } = await import('../src/server.js');
-const { resetKeyPoolForTests } = await import('../src/llm.js');
+const { startServer } = await import('../../src/server.js');
+const { resetKeyPoolForTests } = await import('../../src/llm.js');
 
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));

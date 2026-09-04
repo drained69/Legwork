@@ -1,23 +1,34 @@
-# Dependencies & build
+# Dependencies and build output
 node_modules/
 dist/
 
-# Secrets & local env (keep .env.example tracked)
+# TypeScript and tool caches
+*.tsbuildinfo
+.cache/
+.turbo/
+
+# Secrets and local environment (keep .env.example tracked)
 .env
 .env.*
 !.env.example
 
-# SQLite / local data
+# SQLite and local runtime data
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
 *.log
-
-# Runtime artifacts (wallet sessions, deliverables, local agent tooling)
+data/
 wallets/
 deliverables/
-.claude/
-data/
-.recovery-backup-*/
+
+# Local deployment and registration overrides
 miner.yaml.user-version-*
+
+# Editor and operating-system files
+.claude/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

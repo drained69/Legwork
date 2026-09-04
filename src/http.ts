@@ -10,6 +10,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { config } from './config.js';
 
 /** Default ceiling for a single outbound request. */
 export const DEFAULT_TIMEOUT_MS = 20_000;
@@ -95,4 +96,40 @@ export function readBodyTruncating(req: IncomingMessage, limitBytes = 1_000_000)
     req.on('error', finish);
     req.on('aborted', finish);
   });
+}
+
+// ── request identity + per-IP rate limiting ─────────────────────────────────
+// Shared by the core API surfaces and the Track 3 web app: the free tiers are
+// metered per client IP, and the identity behind that IP must be derived the
+// same way everywhere (loopback gets the internal-client attribution, proxies
+// get the last forwarded hop only when trusted).
+
+function isLoopback(address: string): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+export function clientIp(req: IncomingMessage): string {
+  const socketIp = req.socket.remoteAddress ?? 'unknown';
+  if (isLoopback(socketIp)) {
+    const key = req.headers['x-internal-client'];
+    if (typeof key === 'string' && key.length) return `internal:${key.slice(0, 100)}`;
+  }
+  if (!config.trustProxy) return socketIp;
+  const forwarded = req.headers['x-forwarded-for'];
+  const chain = (Array.isArray(forwarded) ? forwarded.join(',') : forwarded ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+  return chain.at(-1) ?? socketIp;
+}
+
+/** Window for the per-IP free-tier rate limits (one hour). */
+export const PREVIEW_WINDOW_MS = 60 * 60 * 1000;
+/** Default free-tier allowance per window. */
+export const PREVIEW_LIMIT = 3;
+
+export function rateAllowed(hits: Map<string, number[]>, ip: string, limit = PREVIEW_LIMIT): { ok: boolean; remaining: number; retryAfterSec: number } {
+  const cutoff = Date.now() - PREVIEW_WINDOW_MS;
+  const list = (hits.get(ip) ?? []).filter((time) => time > cutoff);
+  if (list.length >= limit) return { ok: false, remaining: 0, retryAfterSec: Math.ceil((list[0] + PREVIEW_WINDOW_MS - Date.now()) / 1000) };
+  list.push(Date.now());
+  hits.set(ip, list);
+  return { ok: true, remaining: limit - list.length, retryAfterSec: 0 };
 }

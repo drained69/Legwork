@@ -55,8 +55,8 @@ function startStubNode(): Promise<Server> {
 const stubNode = await startStubNode();
 process.env.TELEGRAPH_NODE_URL = `http://127.0.0.1:${(stubNode.address() as { port: number }).port}`;
 
-const { startServer } = await import('../src/server.js');
-const { runWatchTick } = await import('../src/watch/watchPoller.js');
+const { startServer } = await import('../../src/server.js');
+const { runWatchTick } = await import('../../src/track3/watchPoller.js');
 
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));

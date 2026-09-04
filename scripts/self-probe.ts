@@ -7,7 +7,7 @@
 import 'dotenv/config';
 process.env.TELEGRAPH_PRIVATE_KEY ||= process.env.EVM_PRIVATE_KEY ?? '';
 
-const { engineAsk, telegraphNodeUrl } = await import('../src/telegraph/client.js');
+const { engineAsk, telegraphNodeUrl } = await import('../src/track3/telegraph.js');
 
 const probes = {
   websearch: { query: 'remote software engineering jobs paying over 150k', intent: 'WEB_SEARCH' },

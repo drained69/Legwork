@@ -2,7 +2,7 @@ import { config, activeLlmModel, llmProvider } from './config.js';
 import { createBot } from './telegram/bot.js';
 import { startServer } from './server.js';
 import { walletConfigured } from './wallet/baseWallet.js';
-import { startWatchPoller } from './watch/watchPoller.js';
+import { startWatchPoller } from './track3/watchPoller.js';
 
 /**
  * Legwork — a job-search agent with per-call Base Sepolia payments and a

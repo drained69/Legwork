@@ -84,7 +84,7 @@ ok('miner job-hunt: q alias accepted', alias.status === 200 && Array.isArray(ali
 // ── 3. the free surfaces ────────────────────────────────────────────────────
 const page = await fetch(`${base}/redflag`);
 const pageHtml = await page.text();
-ok('GET /redflag serves the app', page.status === 200 && pageHtml.includes('Run full vetting') && pageHtml.includes('/api/stats'));
+ok('GET /redflag serves the app', page.status === 200 && pageHtml.includes('Run verification') && pageHtml.includes('/api/stats'));
 
 const huntPreview = await post('/api/hunt/preview', { roles: ['backend engineer'], locations: ['remote'] }, client('preview'));
 ok('POST /api/hunt/preview (free, live)', huntPreview.status === 200 && huntPreview.data.ok === true, `${huntPreview.data.totalMatches} matches`);

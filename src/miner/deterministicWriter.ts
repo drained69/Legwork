@@ -1,5 +1,5 @@
-import { skillsInText } from './skillVocab.js';
-import { extractRoles } from './jobHunt.js';
+import { skillsInText } from '../skills/skillVocab.js';
+import { extractRoles } from '../skills/jobHunt.js';
 
 /** Everything the writer is allowed to state, derived only from real input. */
 interface Facts {

@@ -18,7 +18,7 @@ process.env.PORT = '0';
 
 const { config } = await import('../src/config.js');
 const { startServer } = await import('../src/server.js');
-const { startWatchPoller } = await import('../src/watch/watchPoller.js');
+const { startWatchPoller } = await import('../src/track3/watchPoller.js');
 
 // 1. Bot handlers register without a network (grammy constructor is offline).
 const { createBot } = await import('../src/telegram/bot.js');

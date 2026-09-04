@@ -17,7 +17,7 @@ process.env.USAJOBS_API_KEY = '';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { scamHeuristics, extractFacts, runRedflag, verdictFromFlags, distillResult, formatRedflagCard } = await import('../src/skills/redflag.js');
+const { scamHeuristics, extractFacts, runRedflag, verdictFromFlags, distillResult, formatRedflagCard } = await import('../../src/track3/redflag.js');
 
 const SCAM_POSTING = {
   title: 'Data Entry Specialist',
@@ -218,7 +218,7 @@ test('redflag: distillResult unwraps search-shaped miner results', () => {
 });
 
 test('telegraph: direct-fallback payload lands the query in the field the miner reads', async () => {
-  const { buildDirectPayload } = await import('../src/telegraph/client.js');
+  const { buildDirectPayload } = await import('../../src/track3/telegraph.js');
   // Tavily-shape: query field, alias match.
   const tavily = buildDirectPayload(
     { id: '202', slug: 'tavily', name: 'Tavily', input_schema: { properties: { query: { type: 'string' }, max_results: { type: 'integer' } } } },
@@ -247,7 +247,7 @@ test('telegraph: direct-fallback payload lands the query in the field the miner 
 
 // ── HTTP surface ────────────────────────────────────────────────────────────
 
-const { startServer } = await import('../src/server.js');
+const { startServer } = await import('../../src/server.js');
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;

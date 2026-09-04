@@ -1,7 +1,7 @@
 import { audit } from '../db.js';
 import { INJECTION_GUARD, extractJson, llm, untrusted } from '../llm.js';
-import { engineAsk as realEngineAsk, type EngineAskResult } from '../telegraph/client.js';
-import { runAdhocHunt } from './jobHunt.js';
+import { engineAsk as realEngineAsk, type EngineAskResult } from './telegraph.js';
+import { runAdhocHunt } from '../skills/jobHunt.js';
 import { config } from '../config.js';
 
 /**

@@ -28,7 +28,7 @@ import { rmSync } from 'node:fs';
 
 const { config } = await import('../src/config.js');
 const { startServer } = await import('../src/server.js');
-const { runWatchTick } = await import('../src/watch/watchPoller.js');
+const { runWatchTick } = await import('../src/track3/watchPoller.js');
 const { createWatch, deactivateWatch, listRedflagReports } = await import('../src/db.js');
 const { renderRedflagCard } = await import('../src/telegram/ui.js');
 
@@ -47,7 +47,7 @@ console.log(`  telegraph wallet: ${config.telegraph.enabled ? 'configured' : 'MI
 
 // ── 1. the web page ─────────────────────────────────────────────────────────
 const page = await fetch(`${base}/redflag`);
-ok('GET /redflag serves the demo page', page.status === 200 && (await page.text()).includes('Run free scan'));
+ok('GET /redflag serves the demo page', page.status === 200 && (await page.text()).includes('Free scan'));
 
 // ── 2. the free preview (live boards) ───────────────────────────────────────
 const preview = await fetch(`${base}/api/redflag/preview`, {

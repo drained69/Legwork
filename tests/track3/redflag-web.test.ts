@@ -69,8 +69,8 @@ function startStubNode(): Promise<Server> {
 const stubNode = await startStubNode();
 process.env.TELEGRAPH_NODE_URL = `http://127.0.0.1:${(stubNode.address() as { port: number }).port}`;
 
-const { startServer } = await import('../src/server.js');
-const { saveRedflagReport } = await import('../src/db.js');
+const { startServer } = await import('../../src/server.js');
+const { saveRedflagReport } = await import('../../src/db.js');
 
 const server = startServer(0);
 await new Promise<void>((resolve) => server.once('listening', resolve));
@@ -188,7 +188,7 @@ test('web full: without a Telegraph wallet the endpoint degrades honestly', asyn
     server.close();
   `;
   const out = execFileSync('node', ['--import', 'tsx', '--input-type=module', '-e', script], {
-    cwd: new URL('.', import.meta.url).pathname.replace(/tests\/$/, ''),
+    cwd: process.cwd(),
     encoding: 'utf8',
   });
   const parsed = JSON.parse(out.slice(out.indexOf('{'))) as { status: number; body: { ok: boolean; error: string } };
