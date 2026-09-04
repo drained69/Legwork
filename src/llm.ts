@@ -96,6 +96,46 @@ function pickGeminiKey(): GeminiKeyState | undefined {
   return healthy[rrIndex];
 }
 
+/**
+ * Model-health pool — the model-level twin of the key pool.
+ *
+ * Gemini's free tier overloads per MODEL: probing live, gemini-3.5-flash-lite
+ * returned 503/timeout on every key while gemini-flash-latest answered 4/4.
+ * Without this, every request wasted its whole time budget timing out on the
+ * dead primary before the fallback was reached. A model that fails its slice
+ * is benched for a cooldown so subsequent requests skip straight to the
+ * healthy one; it is revived on the next success (or when the cooldown ends).
+ */
+const MODEL_COOLDOWN_MS = 60_000;
+interface GeminiModelState { model: string; unhealthyUntil: number }
+let modelPool: GeminiModelState[] | null = null;
+
+function geminiModelPool(): GeminiModelState[] {
+  const configured = config.gemini.models;
+  // Rebuild if the configured list changed (tests swap env between runs).
+  if (!modelPool || modelPool.length !== configured.length || modelPool.some((m, i) => m.model !== configured[i])) {
+    modelPool = configured.map((model) => ({ model, unhealthyUntil: 0 }));
+  }
+  return modelPool;
+}
+
+/** Healthy models first; if all are benched, return the full list (try anyway). */
+function orderedModels(): GeminiModelState[] {
+  const pool = geminiModelPool();
+  const healthy = pool.filter((m) => Date.now() >= m.unhealthyUntil);
+  return healthy.length ? healthy : pool;
+}
+
+function benchModel(model: string): void {
+  const st = geminiModelPool().find((m) => m.model === model);
+  if (st) st.unhealthyUntil = Date.now() + MODEL_COOLDOWN_MS;
+}
+
+function reviveModel(model: string): void {
+  const st = geminiModelPool().find((m) => m.model === model);
+  if (st) st.unhealthyUntil = 0;
+}
+
 function breakerIsOpen(): boolean {
   if (!breaker.openedAt) return false;
   if (Date.now() - breaker.openedAt < AUTH_BREAKER_COOLDOWN_MS) return true;
@@ -123,6 +163,7 @@ function noteAuthFailure(): void {
  */
 export function resetKeyPoolForTests(): void {
   geminiPool = null;
+  modelPool = null;
   rrIndex = -1;
   breaker.consecutiveAuthFailures = 0;
   breaker.openedAt = 0;
@@ -308,25 +349,30 @@ function sleep(ms: number): Promise<void> {
 
 async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: string) => void): Promise<GeminiSendOutcome> {
   const { baseUrl } = config.gemini;
-  const models = config.gemini.models;
+  const models = orderedModels();
   const bodyStr = JSON.stringify(body);
   const deadline = Date.now() + MAX_TOTAL_MS;
   let lastErr = 'no answer';
 
-  // Try each model in turn. Within a model: rotate keys on 429, back off and
-  // retry transient 503/timeout. If a model is transiently unavailable for the
-  // whole attempt budget (its free tier overloaded), fall through to the next
-  // model — a per-model outage no number of keys can fix. Non-transient 4xx
-  // returns immediately so the caller (e.g. the grounded tool-fallback) can
-  // handle it. All keys benched → capacity, stop.
+  // Try healthy models in turn. Each model gets a FAIR SHARE of the remaining
+  // time budget, so a timing-out primary can't starve the fallback (the bug
+  // that made every request decline while gemini-flash-latest sat healthy).
+  // Within a model: rotate keys on 429, retry transient 503/timeout. A model
+  // that spends its whole slice failing is benched so the NEXT request skips
+  // straight to a healthy one; a success revives it.
   for (let mi = 0; mi < models.length; mi++) {
-    const model = models[mi];
+    const model = models[mi].model;
     const url = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const globalRemaining = deadline - Date.now();
+    if (globalRemaining < 600) break;
+    // Fair share of what's left, split across the models not yet tried.
+    const modelDeadline = Date.now() + globalRemaining / (models.length - mi);
+
     for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
       const state = pickGeminiKey();
-      if (!state) return { kind: 'no-key' }; // every key rate-limited/auth-dead — models share keys
-      const remaining = deadline - Date.now();
-      if (remaining < 800) return { kind: 'error', message: lastErr }; // out of budget
+      if (!state) return { kind: 'no-key' }; // every key benched — capacity, models share keys
+      const remaining = Math.min(deadline, modelDeadline) - Date.now();
+      if (remaining < 600) break; // this model's slice is up — move to the next
       try {
         const res = await fetchWithTimeout(
           url,
@@ -336,19 +382,17 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         if (res.status === 429) {
           state.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
           console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
-          continue; // next key, same model — no backoff (a different key is ready now)
+          continue; // next key, same model — no backoff
         }
         if (res.status === 401 || res.status === 403 || res.status === 400) {
           const text = (await res.text()).slice(0, 400);
-          // 400 with an invalid-key message is an auth failure — bench THIS
-          // key and rotate. Other 4xx are request-shape problems the caller
-          // must see (e.g. the grounded path retries without the tool), so
-          // return them rather than masking with a model fallback.
           if (/API[_ ]KEY|api key|API key not valid/i.test(text)) {
             state.authDeadUntil = Date.now() + KEY_AUTH_COOLDOWN_MS;
             onAuthDead(state.key);
             continue;
           }
+          // Non-auth 4xx: request-shape problem the caller must see (e.g. the
+          // grounded path retries without its tool). Do not mask with fallback.
           console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
           llmState.lastAt = Date.now();
           llmState.lastStatus = 'error';
@@ -356,8 +400,6 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
           return { kind: 'error', message: `API error ${res.status}` };
         }
         if (isTransientStatus(res.status)) {
-          // This model is overloaded right now. Back off and retry it; when its
-          // whole budget is spent we fall through to the next model below.
           lastErr = `API error ${res.status}`;
           console.error(`[llm] gemini ${model} returned ${res.status} (overloaded) — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
           await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
@@ -371,9 +413,9 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
           llmState.lastError = `API error ${res.status}`;
           return { kind: 'error', message: `API error ${res.status}` };
         }
+        reviveModel(model); // a working model clears any prior bench
         return { kind: 'response', res, key: state.key };
       } catch (err) {
-        // Timeout or network drop — transient; back off and retry this model.
         lastErr = err instanceof Error ? err.message : String(err);
         console.error(`[llm] gemini ${model} request failed: ${lastErr} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
         llmState.lastAt = Date.now();
@@ -383,10 +425,11 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         continue;
       }
     }
-    // This model spent its whole attempt budget on transient failures.
-    if (mi < models.length - 1) console.error(`[llm] gemini ${model} unavailable — falling back to ${models[mi + 1]}`);
+    // This model spent its slice on transient failures — bench it so the next
+    // request skips it, and fall through to the next model now.
+    benchModel(model);
+    if (mi < models.length - 1) console.error(`[llm] gemini ${model} unavailable — benched, falling back to ${models[mi + 1].model}`);
   }
-  // Distinguish "no capacity" (all keys benched) from "kept failing".
   return pickGeminiKey() ? { kind: 'error', message: lastErr } : { kind: 'no-key' };
 }
 

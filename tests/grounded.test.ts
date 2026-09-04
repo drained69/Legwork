@@ -258,3 +258,23 @@ test('models: a model-level 503 falls back to the next model, not a decline', as
   assert.match(data.label, /Paris/, 'the fallback model answered');
   assert.ok(data.confidence > 0.2, `real answer, not a 0.15 decline (got ${data.confidence})`);
 });
+
+test('models: a benched model is skipped on the next request', async () => {
+  // Once a model fails its slice it is benched, so subsequent requests must go
+  // STRAIGHT to the healthy model — not waste time on the dead one every time
+  // (the bug that let a timing-out primary starve the fallback per request).
+  await freshPool();
+  const primaryCalls: number[] = [];
+  stubGemini((call) => {
+    const m = call.url.match(/models\/([^:]+):/)?.[1] ?? '';
+    if (m === 'gemini-3.5-flash-lite') { primaryCalls.push(Date.now()); return new Response(JSON.stringify({ error: { code: 503, message: 'overloaded' } }), { status: 503 }); }
+    return new Response(PLAIN_REPLY('Answer from the healthy fallback model.'), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const ask = () => fetch(`${base}/miner/job-hunt`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'what is the capital of France' }) }).then((r) => r.json());
+  const first = (await ask()) as { confidence: number };
+  const primaryAfterFirst = primaryCalls.length;
+  const second = (await ask()) as { confidence: number };
+  assert.ok(first.confidence > 0.2 && second.confidence > 0.2, 'both requests answered via the fallback');
+  assert.ok(primaryAfterFirst > 0, 'the first request did try (and bench) the primary');
+  assert.equal(primaryCalls.length, primaryAfterFirst, 'the SECOND request skipped the benched primary entirely');
+});
