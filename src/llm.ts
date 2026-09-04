@@ -69,7 +69,29 @@ const breaker = { consecutiveAuthFailures: 0, openedAt: 0 };
  * the next key in the pool immediately; the caller only loses when every key
  * is limited at once.
  */
-const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const RATE_LIMIT_COOLDOWN_MS = 30_000; // fallback when Gemini gives no retry hint
+const RATE_LIMIT_COOLDOWN_MAX_MS = 90_000; // never bench a key longer than this
+
+/**
+ * Read Gemini's RetryInfo from a 429 body ("retryDelay": "17s") and turn it
+ * into a cooldown. A per-minute quota usually frees up well before the flat
+ * fallback, so honouring the hint returns a benched key to service sooner —
+ * real capacity on a shared free-tier quota. Clamped so a malformed or huge
+ * value cannot park a key indefinitely.
+ */
+async function parse429Cooldown(res: Response): Promise<number> {
+  try {
+    const body = (await res.text()).slice(0, 2000);
+    const m = body.match(/"retryDelay"\s*:\s*"?(\d+(?:\.\d+)?)s"?/i);
+    if (m) {
+      const secs = Number(m[1]);
+      if (Number.isFinite(secs) && secs > 0) return Math.min(RATE_LIMIT_COOLDOWN_MAX_MS, Math.ceil(secs * 1000) + 500);
+    }
+  } catch {
+    // fall through to the default
+  }
+  return RATE_LIMIT_COOLDOWN_MS;
+}
 /** How long a key that failed auth stays out of the pool. */
 const KEY_AUTH_COOLDOWN_MS = 5 * 60_000;
 
@@ -366,7 +388,9 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
     const globalRemaining = deadline - Date.now();
     if (globalRemaining < 600) break;
     // Fair share of what's left, split across the models not yet tried.
-    const modelDeadline = Date.now() + globalRemaining / (models.length - mi);
+    // setTimeout and AbortSignal require integer millisecond values. The fair
+    // share is often fractional when several models remain.
+    const modelDeadline = Date.now() + Math.floor(globalRemaining / (models.length - mi));
 
     for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
       const state = pickGeminiKey();
@@ -377,11 +401,15 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         const res = await fetchWithTimeout(
           url,
           { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': state.key }, body: bodyStr },
-          Math.min(timeoutMs, remaining),
+           Math.floor(Math.min(timeoutMs, remaining)),
         );
         if (res.status === 429) {
-          state.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-          console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
+          // Honour Gemini's own retry hint — a per-minute limit often frees up
+          // in far less than the flat cooldown, and a benched key is capacity
+          // we are not using. Fall back to the default only when absent.
+          const cooldown = await parse429Cooldown(res);
+          state.rateLimitedUntil = Date.now() + cooldown;
+          console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — back in ${Math.round(cooldown / 1000)}s, rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
           continue; // next key, same model — no backoff
         }
         if (res.status === 401 || res.status === 403 || res.status === 400) {
@@ -402,7 +430,7 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         if (isTransientStatus(res.status)) {
           lastErr = `API error ${res.status}`;
           console.error(`[llm] gemini ${model} returned ${res.status} (overloaded) — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
-          await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+           await sleep(Math.floor(TRANSIENT_BACKOFF_MS * (attempt + 1)));
           continue;
         }
         if (!res.ok) {
@@ -421,7 +449,7 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         llmState.lastAt = Date.now();
         llmState.lastStatus = 'error';
         llmState.lastError = lastErr;
-        await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+         await sleep(Math.floor(TRANSIENT_BACKOFF_MS * (attempt + 1)));
         continue;
       }
     }

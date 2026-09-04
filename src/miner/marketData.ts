@@ -16,6 +16,8 @@ import { fetchWithTimeout } from '../http.js';
  */
 
 const COINGECKO_TIMEOUT_MS = 4_000;
+const COINGECKO_RETRIES = 2;
+const COINGECKO_RETRY_MS = 750;
 
 /** Assets we can price, by the names and tickers people actually use. */
 const ASSETS: Record<string, { id: string; name: string }> = {
@@ -93,6 +95,23 @@ function findAsset(text: string): { id: string; name: string } | undefined {
 
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
+/** Retry transient CoinGecko throttling without delaying normal responses. */
+async function coingeckoFetch(url: string): Promise<Response | null> {
+  for (let attempt = 0; attempt <= COINGECKO_RETRIES; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, {}, COINGECKO_TIMEOUT_MS);
+      if (response.status !== 429 || attempt === COINGECKO_RETRIES) return response;
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const waitMs = Number.isFinite(retryAfter) ? Math.min(Math.max(retryAfter * 1000, COINGECKO_RETRY_MS), 4_000) : COINGECKO_RETRY_MS * (attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, Math.floor(waitMs)));
+    } catch {
+      if (attempt === COINGECKO_RETRIES) return null;
+      await new Promise((resolve) => setTimeout(resolve, COINGECKO_RETRY_MS * (attempt + 1)));
+    }
+  }
+  return null;
+}
+
 /** "September 2, 2026" / "Sep 2 2026" / "2026-09-02" → Date, or undefined. */
 function findDate(text: string): Date | undefined {
   const iso = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
@@ -135,16 +154,10 @@ export async function answerPriceQuestion(text: string): Promise<PriceAnswer | n
       // The question usually asks for the price CHANGE too — fetch the prior
       // day and compute it. One extra free call; skipped silently if it fails.
       const [hist, histPrev] = await Promise.all([
-        fetchWithTimeout(
-          `https://api.coingecko.com/api/v3/coins/${asset.id}/history?date=${ddMmYyyy(when)}&localization=false`,
-          {},
-          COINGECKO_TIMEOUT_MS,
-        ).then((r) => (r.ok ? (r.json() as Promise<{ market_data?: { current_price?: { usd?: number } } }>) : null)),
-        fetchWithTimeout(
-          `https://api.coingecko.com/api/v3/coins/${asset.id}/history?date=${ddMmYyyy(prev)}&localization=false`,
-          {},
-          COINGECKO_TIMEOUT_MS,
-        ).then((r) => (r.ok ? (r.json() as Promise<{ market_data?: { current_price?: { usd?: number } } }>) : null)).catch(() => null),
+        coingeckoFetch(`https://api.coingecko.com/api/v3/coins/${asset.id}/history?date=${ddMmYyyy(when)}&localization=false`)
+          .then((r) => (r?.ok ? (r.json() as Promise<{ market_data?: { current_price?: { usd?: number } } }>) : null)),
+        coingeckoFetch(`https://api.coingecko.com/api/v3/coins/${asset.id}/history?date=${ddMmYyyy(prev)}&localization=false`)
+          .then((r) => (r?.ok ? (r.json() as Promise<{ market_data?: { current_price?: { usd?: number } } }>) : null)),
       ]);
       if (!hist) return null;
       const price = hist.market_data?.current_price?.usd;
@@ -166,12 +179,8 @@ export async function answerPriceQuestion(text: string): Promise<PriceAnswer | n
     }
 
     // Live: current price plus the 24h change the question typically asks about.
-    const res = await fetchWithTimeout(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${asset.id}&vs_currencies=usd&include_24hr_change=true&include_last_updated_at=true`,
-      {},
-      COINGECKO_TIMEOUT_MS,
-    );
-    if (!res.ok) return null;
+    const res = await coingeckoFetch(`https://api.coingecko.com/api/v3/simple/price?ids=${asset.id}&vs_currencies=usd&include_24hr_change=true&include_last_updated_at=true`);
+    if (!res || !res.ok) return null;
     const data = (await res.json()) as {
       [id: string]: { usd?: number; usd_24h_change?: number; last_updated_at?: number };
     };
