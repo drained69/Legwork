@@ -307,73 +307,84 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: string) => void): Promise<GeminiSendOutcome> {
-  const { baseUrl, model } = config.gemini;
-  const url = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const { baseUrl } = config.gemini;
+  const models = config.gemini.models;
   const bodyStr = JSON.stringify(body);
   const deadline = Date.now() + MAX_TOTAL_MS;
   let lastErr = 'no answer';
-  // A 429'd key rotates to the next; a 503/timeout backs off and retries (the
-  // same key when it is the only one — a server-side overload is not the key's
-  // fault). Bounded by MAX_SEND_ATTEMPTS so latency can't run away.
-  for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
-    const state = pickGeminiKey();
-    if (!state) break; // every key rate-limited or auth-dead → capacity, not transience
-    const remaining = deadline - Date.now();
-    if (remaining < 800) break; // no time left for a useful attempt
-    try {
-      const res = await fetchWithTimeout(
-        url,
-        { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': state.key }, body: bodyStr },
-        Math.min(timeoutMs, remaining),
-      );
-      if (res.status === 429) {
-        state.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-        console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
-        continue; // next key, same request — no backoff (a different key is ready now)
-      }
-      if (res.status === 401 || res.status === 403 || res.status === 400) {
-        const text = (await res.text()).slice(0, 400);
-        // 400 with an invalid-key message is an auth failure in Gemini's
-        // vocabulary — bench THIS key, not the whole pool. Other 400s are
-        // request-shape problems the caller must see, not retryable.
-        if (/API[_ ]KEY|api key|API key not valid/i.test(text)) {
-          state.authDeadUntil = Date.now() + KEY_AUTH_COOLDOWN_MS;
-          onAuthDead(state.key);
+
+  // Try each model in turn. Within a model: rotate keys on 429, back off and
+  // retry transient 503/timeout. If a model is transiently unavailable for the
+  // whole attempt budget (its free tier overloaded), fall through to the next
+  // model — a per-model outage no number of keys can fix. Non-transient 4xx
+  // returns immediately so the caller (e.g. the grounded tool-fallback) can
+  // handle it. All keys benched → capacity, stop.
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    const url = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
+      const state = pickGeminiKey();
+      if (!state) return { kind: 'no-key' }; // every key rate-limited/auth-dead — models share keys
+      const remaining = deadline - Date.now();
+      if (remaining < 800) return { kind: 'error', message: lastErr }; // out of budget
+      try {
+        const res = await fetchWithTimeout(
+          url,
+          { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': state.key }, body: bodyStr },
+          Math.min(timeoutMs, remaining),
+        );
+        if (res.status === 429) {
+          state.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
+          continue; // next key, same model — no backoff (a different key is ready now)
+        }
+        if (res.status === 401 || res.status === 403 || res.status === 400) {
+          const text = (await res.text()).slice(0, 400);
+          // 400 with an invalid-key message is an auth failure — bench THIS
+          // key and rotate. Other 4xx are request-shape problems the caller
+          // must see (e.g. the grounded path retries without the tool), so
+          // return them rather than masking with a model fallback.
+          if (/API[_ ]KEY|api key|API key not valid/i.test(text)) {
+            state.authDeadUntil = Date.now() + KEY_AUTH_COOLDOWN_MS;
+            onAuthDead(state.key);
+            continue;
+          }
+          console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
+          llmState.lastAt = Date.now();
+          llmState.lastStatus = 'error';
+          llmState.lastError = `API error ${res.status}`;
+          return { kind: 'error', message: `API error ${res.status}` };
+        }
+        if (isTransientStatus(res.status)) {
+          // This model is overloaded right now. Back off and retry it; when its
+          // whole budget is spent we fall through to the next model below.
+          lastErr = `API error ${res.status}`;
+          console.error(`[llm] gemini ${model} returned ${res.status} (overloaded) — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
+          await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
           continue;
         }
-        console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
+        if (!res.ok) {
+          const text = (await res.text()).slice(0, 400);
+          console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
+          llmState.lastAt = Date.now();
+          llmState.lastStatus = 'error';
+          llmState.lastError = `API error ${res.status}`;
+          return { kind: 'error', message: `API error ${res.status}` };
+        }
+        return { kind: 'response', res, key: state.key };
+      } catch (err) {
+        // Timeout or network drop — transient; back off and retry this model.
+        lastErr = err instanceof Error ? err.message : String(err);
+        console.error(`[llm] gemini ${model} request failed: ${lastErr} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
         llmState.lastAt = Date.now();
         llmState.lastStatus = 'error';
-        llmState.lastError = `API error ${res.status}`;
-        return { kind: 'error', message: `API error ${res.status}` };
-      }
-      if (isTransientStatus(res.status)) {
-        // Gemini overloaded — its fault, not the key's. Back off and retry;
-        // a good answer a second later beats a 0.15 decline now.
-        lastErr = `API error ${res.status}`;
-        console.error(`[llm] gemini ${model} returned ${res.status} (overloaded) — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
+        llmState.lastError = lastErr;
         await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
         continue;
       }
-      if (!res.ok) {
-        const text = (await res.text()).slice(0, 400);
-        console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
-        llmState.lastAt = Date.now();
-        llmState.lastStatus = 'error';
-        llmState.lastError = `API error ${res.status}`;
-        return { kind: 'error', message: `API error ${res.status}` };
-      }
-      return { kind: 'response', res, key: state.key };
-    } catch (err) {
-      // A timeout or network drop is transient too — back off and retry.
-      lastErr = err instanceof Error ? err.message : String(err);
-      console.error(`[llm] gemini request failed: ${lastErr} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
-      llmState.lastAt = Date.now();
-      llmState.lastStatus = 'error';
-      llmState.lastError = lastErr;
-      await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
-      continue;
     }
+    // This model spent its whole attempt budget on transient failures.
+    if (mi < models.length - 1) console.error(`[llm] gemini ${model} unavailable — falling back to ${models[mi + 1]}`);
   }
   // Distinguish "no capacity" (all keys benched) from "kept failing".
   return pickGeminiKey() ? { kind: 'error', message: lastErr } : { kind: 'no-key' };

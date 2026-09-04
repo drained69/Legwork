@@ -73,6 +73,25 @@ export const config = {
     // so raising maxOutputTokens is the only lever for the bigger models —
     // at a latency cost this workload cannot absorb.
     model: env('GEMINI_MODEL', 'gemini-3.5-flash-lite'),
+    /**
+     * An ordered FALLBACK LIST of models, not just one.
+     *
+     * The free tier overloads at the MODEL level: gemini-3.5-flash-lite (fast,
+     * high rate limit, no thinking-truncation) is the right primary, but it
+     * intermittently returns 503 "experiencing high demand" for every key at
+     * once — a per-model outage no number of keys can fix. When that happens
+     * llm.ts falls through to the next model here (currently available), so a
+     * general question still gets answered instead of declined. gemini-flash-
+     * latest / gemini-3.5-flash are "thinking" models (slower, can truncate on
+     * a tiny token budget) — acceptable as a fallback: a slower, complete
+     * answer beats a 0.15 decline.
+     */
+    get models(): string[] {
+      const primary = env('GEMINI_MODEL', 'gemini-3.5-flash-lite');
+      const fallbacks = (env('GEMINI_FALLBACK_MODELS', 'gemini-flash-latest,gemini-3.5-flash')
+        .split(',').map((m) => m.trim()).filter(Boolean));
+      return [...new Set([primary, ...fallbacks])];
+    },
     get enabled(): boolean {
       return Boolean(this.apiKey);
     },

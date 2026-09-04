@@ -13,6 +13,10 @@ process.env.DATABASE_PATH = ':memory:';
 // A fake pool of two keys — real .env keys must never leak into this suite.
 process.env.GEMINI_API_KEY = 'test-key-AAAA1111';
 process.env.GEMINI_API_KEY_2 = 'test-key-BBBB2222';
+// Clear any real pool keys dotenv loaded from .env, or this two-key suite
+// silently becomes a three/four-key one and the rotation assertions drift.
+process.env.GEMINI_API_KEY_3 = '';
+process.env.GEMINI_API_KEY_4 = '';
 process.env.ANTHROPIC_API_KEY = '';
 process.env.ANTHROPIC_AUTH_TOKEN = '';
 process.env.ANTHROPIC_BASE_URL = '';
@@ -229,4 +233,28 @@ test('pool: a 503 (overloaded) is retried, not surrendered to a decline', async 
   assert.ok(calls.length >= 2, `503 must be retried, saw ${calls.length} call(s)`);
   assert.match(data.label, /Tokyo/, 'the retried answer is returned, not a decline');
   assert.ok(data.confidence > 0.2, `a real answer, not a 0.15 decline (got ${data.confidence})`);
+});
+
+test('models: a model-level 503 falls back to the next model, not a decline', async () => {
+  // The free tier overloads at the MODEL level (503 for every key at once) —
+  // no number of keys fixes that. The primary model here 503s on every attempt;
+  // the answer must come from the fallback model instead of declining.
+  await freshPool();
+  const models = new Set<string>();
+  stubGemini((call) => {
+    const m = call.url.match(/models\/([^:]+):/)?.[1] ?? '';
+    models.add(m);
+    if (m === 'gemini-3.5-flash-lite') {
+      return new Response(JSON.stringify({ error: { code: 503, message: 'The model is overloaded.' } }), { status: 503 });
+    }
+    return new Response(PLAIN_REPLY('Paris is the capital of France.'), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'what is the capital of France' }),
+  });
+  const data = (await res.json()) as { label: string; confidence: number };
+  assert.ok(models.has('gemini-3.5-flash-lite'), 'the primary model was tried');
+  assert.ok([...models].some((m) => m !== 'gemini-3.5-flash-lite'), 'a fallback model was tried after the 503');
+  assert.match(data.label, /Paris/, 'the fallback model answered');
+  assert.ok(data.confidence > 0.2, `real answer, not a 0.15 decline (got ${data.confidence})`);
 });
