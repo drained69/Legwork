@@ -16,3 +16,11 @@
 - [x] Confirm activation in `https://devnode.telegraphprotocol.com/api/miners`
 - [x] Monitor first-week grace-period traffic, errors and validator scores
 - [x] E2E verified 2026-09-03: local suite (123 tests) + `scripts/e2e-check.ts` (live boards, Gemini, CoinGecko, real USDC engine spend) + production (miner surface, web vetting, report pages, stats)
+- [x] LLM hardening 2026-09-03 (epoch-306 postmortem): Gemini key POOL with 429 rotation inside the same request (`GEMINI_API_KEY_2..4`), per-key benching (no more global 60s stand-down that degraded whole validator bursts), live googleSearch grounding for general WEB_SEARCH answers with sources in the signal — 133 tests, deployed
+- [ ] Add 2-3 more free Gemini API keys on Railway (aistudio.google.com/apikey → `GEMINI_API_KEY_2/3/4`) — single key 429s under validator bursts
+- [ ] After quota reset (~07:00 UTC): verify a grounded answer on production carries sources
+- [x] Track 3 expansion 2026-09-04: web hunt tool (`POST /api/hunt/web` — the miner's signal, free), web watches (report page is the inbox, `POST /api/report/:id/watch`), OG/Twitter cards + share buttons on reports, per-miner network panel, visit counting, progress feedback, app served at `/` — 145 tests, deployed
+- [x] Production persistence: Railway volume attached at /data (reports, stats, watches survive redeploys — verified by redeploy)
+- [x] Submission hardening 2026-09-04: full E2E re-run (147 tests, typecheck, build, live surface checks). Honesty gate — a report with ZERO completed network checks can no longer verdict "clear" (capped at caution + explanatory flag, src/skills/redflag.ts); failed-check receipts on public report pages now say "network would not accept payment — nothing was charged" instead of leaking engine jargon ("routing failed: engine returned 402…"); report-page watch buttons fixed for trailing-slash URLs. Deployed.
+- [ ] USER: fund the consumer wallet (0x8C6eE34413f0c7D472Ab157fbED84De1234EF54F) with Base Sepolia USDC via https://faucet.circle.com/ — BLOCKER for the flagship demo: with it empty, the paid checks in "Run full vetting" fail (now degrades honestly to caution, but judges should see all four checks buy live)
+- [ ] Commit the Track 3 expansion (working tree carries it uncommitted)

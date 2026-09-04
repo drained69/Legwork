@@ -51,10 +51,11 @@ test('web: GET /redflag serves the app page', async () => {
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type') ?? '', /text\/html/);
   const html = await res.text();
-  // The page must reference its own endpoint and the full-vetting upgrade.
+  // The page must reference its own endpoints and both tools.
   assert.match(html, /\/api\/redflag\/preview/);
-  assert.match(html, /Run free scan/);
-  assert.match(html, /\/api\/redflag\/web/);
+  assert.match(html, /Free scan/);
+  assert.match(html, /Find jobs worth applying to/);
+  assert.match(html, /\/api\/hunt\/web/);
   // No unescaped script injection risk: the page is a static string.
   assert.ok(html.length > 2000);
 });

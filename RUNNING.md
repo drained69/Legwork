@@ -21,18 +21,20 @@ The process serves:
 |---|---|---|
 | Health | `GET /health` | Liveness and miner identity |
 | Catalog | `GET /api/services` | Direct per-call service prices |
+| The web app | `GET /` (also `/redflag`) | Both flywheel sides: free hunt tool + vetting, stats, network panel, recent verdicts |
+| Hunt the market | `POST /api/hunt/web` | The miner's signal pipeline, free, 6/hour/client |
 | Free preview | `POST /api/hunt/preview` | Top three matches, 3 calls/hour/client |
-| Redflag web app | `GET /redflag` | Paste-box vetting: free scan + operator-paid full vetting, stats, recent verdicts |
 | Redflag free scan | `POST /api/redflag/preview` | Local scam scan + comp benchmark, 3 calls/hour/client |
 | Redflag full vetting | `POST /api/redflag/web` | Operator-paid miner checks, 2/hour/client + daily budget |
-| Shareable report | `GET /report/:id`, `GET /api/report/:id` | A vetting's receipt by unguessable id |
-| Public stats | `GET /api/stats` | Reports run, checks bought, USDC paid to miners |
+| Shareable report | `GET /report/:id`, `GET /api/report/:id` | A vetting's receipt by unguessable id, with OG cards + web watch |
+| Web watches | `POST /api/report/:id/watch`, `/unwatch` | Standing news checks delivered onto the report page |
+| Public stats | `GET /api/stats` | Visitors, reports run, checks bought, USDC paid, per-miner panel |
 | Paid API | `POST /api/hunt`, `/api/score`, `/api/tailor` | Direct Base Sepolia ERC-20 billing |
 | Redflag report | `POST /api/redflag` | $0.05 — buys 4 live miner checks, persists the report |
 | Telegraph YAML | `GET /miner.yaml` | Byte-stable miner configuration |
 | Telegraph miner | `POST /miner/job-hunt`, `/miner/tailor` | Open upstream endpoints called by Telegraph nodes |
 | Telegram | long polling | Profile, wallet, preview and paid-service UI |
-| Watch poller | every REDFLAG_WATCH_POLL_MINUTES | Standing company-news watches → Telegram alerts |
+| Watch poller | every REDFLAG_WATCH_POLL_MINUTES | Standing watches → Telegram alerts OR report-page updates (web watches) |
 
 The `/miner/*` endpoints deliberately do not verify a direct payment. Telegraph
 collects USDC from the requester and pays registered miners according to the
@@ -163,6 +165,13 @@ fixtures and template drafts, which validators score as junk):
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` — criteria extraction, scoring,
   and the `/miner/tailor` generation path (verify in logs: a 401 means the
   key is stale and the keyless fallback is running)
+- `GEMINI_API_KEY` — the active provider on production. Add
+  `GEMINI_API_KEY_2`…`_4` too: the free tier is 15 requests/minute PER KEY,
+  validators probe in bursts, and the pool rotates keys on 429 within the
+  same request (each key adds 15 RPM). General questions are answered with
+  live Google-Search grounding (`googleSearch` tool) and carry their sources
+  in the signal — `/health` reports `llm.keyCount` and how many keys are
+  rate-limited or benched.
 
 ```bash
 railway variables list --service legwork --json

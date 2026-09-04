@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/legwork.test.ts tests/telegram.test.ts tests/miner.test.ts tests/scraper.test.ts tests/redflag.test.ts tests/redflag-flows.test.ts tests/redflag-web.test.ts tests/lifecycle.test.ts"
+    "test": "node --import tsx --test tests/legwork.test.ts tests/telegram.test.ts tests/miner.test.ts tests/scraper.test.ts tests/redflag.test.ts tests/redflag-flows.test.ts tests/redflag-web.test.ts tests/web-app.test.ts tests/grounded.test.ts tests/lifecycle.test.ts"
   },
   "engines": {
     "node": ">=20"

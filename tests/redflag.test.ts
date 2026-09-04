@@ -318,3 +318,32 @@ test('redflag: the parallel path never exceeds budget even if every miner charge
   assert.ok(report.spendUsd <= 0.08 + 1e-9, `spend ${report.spendUsd} exceeded budget`);
   assert.ok(report.spendUsd > 0, 'checks actually ran and were paid for');
 });
+
+test('redflag: every paid check failing yields honest caution, never an invented clear', async () => {
+  // The exact production failure mode of an unfunded consumer wallet: the
+  // engine answers 402 after payment on every check. The report must not
+  // headline CLEAR while its receipt is a row of ✗ marks.
+  const engine = async (): Promise<{ ok: false; error: string }> => ({
+    ok: false,
+    error: 'routing failed: engine returned 402 after payment (miner txlens)',
+  });
+  const report = await runRedflag(
+    { company: 'Acme Corp', title: 'Backend Engineer', description: 'TypeScript role at https://acme.example/careers', compMin: 130000 },
+    { engineAsk: engine as never, budgetUsd: 0.08 },
+  );
+  assert.notEqual(report.verdict, 'clear', 'a clear would claim verification that never ran');
+  const gate = report.flags.find((f) => f.title === 'Independent verification did not run');
+  assert.ok(gate, 'a flag explains the degraded verdict');
+  assert.equal(gate!.severity, 'yellow');
+  for (const check of report.checks.filter((c) => c.source === 'telegraph' && c.status === 'failed')) {
+    assert.doesNotMatch(check.summary, /routing failed|402|txlens/i, `public summary must not leak engine jargon: ${check.summary}`);
+    assert.match(check.summary, /nothing was charged/i, 'a failed check promises no charge');
+  }
+  assert.equal(report.spendUsd, 0, 'nothing was paid');
+});
+
+test('redflag: an avoid verdict survives total check failure — local scam evidence still counts', async () => {
+  const engine = async (): Promise<{ ok: false; error: string }> => ({ ok: false, error: 'engine returned 402 after payment' });
+  const report = await runRedflag(SCAM_POSTING, { engineAsk: engine as never, budgetUsd: 0.08 });
+  assert.equal(report.verdict, 'avoid', 'hard scam patterns drive the verdict even when the network is down');
+});

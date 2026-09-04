@@ -15,10 +15,13 @@ Miner identity: `id: 8402`, `slug: legwork-job-hunter`, protocol `generic`.
 
 | Capability | Endpoint | Price |
 |---|---|---|
+| The web app (hunt + vet) | `GET /` · `GET /redflag` | Free |
+| Hunt the market (the miner's signal) | `POST /api/hunt/web` | Free, 6/hour |
 | Preview top three matches | `POST /api/hunt/preview` | Free, 3/hour |
 | Redflag free scam scan | `POST /api/redflag/preview` | Free, 3/hour |
-| Redflag web app (free scan + full vetting) | `GET /redflag` · `POST /api/redflag/web` | Free / operator-paid, 2/hour + daily budget |
-| Shareable report page | `GET /report/:id` · `GET /api/report/:id` | Free |
+| Redflag full vetting (operator-paid) | `POST /api/redflag/web` | Free to visitor, 2/hour + daily budget |
+| Shareable report page (OG cards, web watch) | `GET /report/:id` · `GET /api/report/:id` | Free |
+| Start / stop a web watch | `POST /api/report/:id/watch` · `/unwatch` | Free (~$0.01/check to operate) |
 | Public network-usage stats | `GET /api/stats` | Free |
 | Rank up to ten jobs | `POST /api/hunt` | $0.01 |
 | Score one job | `POST /api/score` | $0.01 |

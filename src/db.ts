@@ -103,7 +103,21 @@ CREATE TABLE IF NOT EXISTS redflag_watches (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_redflag_watches_due ON redflag_watches (active, last_check_at);
+CREATE TABLE IF NOT EXISTS app_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_app_events_kind ON app_events (kind, at);
 `);
+
+// ── additive migrations for pre-existing databases ─────────────────────────
+// CREATE TABLE IF NOT EXISTS cannot add a column to an existing table, so
+// columns introduced after first deploy are appended here, guarded by PRAGMA.
+const watchColumns = db.prepare('PRAGMA table_info(redflag_watches)').all() as Array<{ name: string }>;
+if (!watchColumns.some((c) => c.name === 'report_id')) {
+  db.exec('ALTER TABLE redflag_watches ADD COLUMN report_id TEXT');
+}
 
 export const now = () => new Date().toISOString();
 export const uid = () => randomUUID();
@@ -351,16 +365,63 @@ export function getRedflagReport(id: string): RedflagReportRecord | undefined {
 }
 
 /**
+ * A standing watch's new-negative-coverage finding, shown on the report page.
+ * Web watches deliver HERE instead of Telegram — the page is the inbox.
+ */
+export interface ReportUpdate {
+  company: string;
+  text: string;
+  miner?: string;
+  costUsd?: number;
+  at: string;
+}
+
+/**
+ * Append a watch finding to a persisted report. Returns false when the report
+ * no longer exists — a deleted report must not break the poller tick.
+ */
+export function appendReportUpdate(reportId: string, update: ReportUpdate): boolean {
+  const record = getRedflagReport(reportId);
+  if (!record) return false;
+  const data = record.data as { updates?: ReportUpdate[] };
+  const updates = [...(data.updates ?? []), { ...update, text: update.text.slice(0, 500) }].slice(-5);
+  db.prepare('UPDATE redflag_reports SET data = ? WHERE id = ?').run(JSON.stringify({ ...data, updates }), reportId);
+  return true;
+}
+
+// ── public app activity (visits) ────────────────────────────────────────────
+
+export function recordAppEvent(kind: 'visit' | string): void {
+  db.prepare('INSERT INTO app_events (kind, at) VALUES (?, ?)').run(kind, now());
+}
+
+export function countAppEvents(kind: string): { total: number; last24h: number } {
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const total = (db.prepare('SELECT COUNT(*) AS n FROM app_events WHERE kind = ?').get(kind) as { n: number }).n;
+  const last24h = (db.prepare('SELECT COUNT(*) AS n FROM app_events WHERE kind = ? AND at >= ?').get(kind, dayAgo) as { n: number }).n;
+  return { total, last24h };
+}
+
+/**
  * Network-usage aggregates for the public stats strip: what this app has
  * bought from Telegraph miners, in total and in the last 24 hours. These are
  * the numbers that prove the app consumes the network, not just claims to.
  */
+export interface MinerUsage {
+  miner: string;
+  checks: number;
+  costUsd: number;
+}
+
 export interface RedflagStats {
   totalReports: number;
   reportsLast24h: number;
   checksBought: number;
   minerSpendUsd: number;
   distinctMinersUsed: number;
+  /** Which miners served this app and how many answers each — the network panel. */
+  perMiner: MinerUsage[];
+  visits: { total: number; last24h: number };
 }
 
 export function redflagStats(): RedflagStats {
@@ -368,27 +429,34 @@ export function redflagStats(): RedflagStats {
     .prepare('SELECT spend_usd, at, data FROM redflag_reports')
     .all() as Array<{ spend_usd: number; at: string; data: string }>;
   const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  const miners = new Set<string>();
+  const miners = new Map<string, MinerUsage>();
   let checksBought = 0;
   let spend = 0;
   let recent = 0;
   for (const row of rows) {
     spend += row.spend_usd || 0;
     if (new Date(row.at).getTime() > dayAgo) recent++;
-    const report = JSON.parse(row.data) as { checks?: Array<{ source?: string; status?: string; miner?: string }> };
+    const report = JSON.parse(row.data) as { checks?: Array<{ source?: string; status?: string; miner?: string; costUsd?: number }> };
     for (const check of report.checks ?? []) {
       if (check.source === 'telegraph' && (check.status === 'ok' || check.status === 'cached')) {
         checksBought++;
-        if (check.miner) miners.add(check.miner);
+        const name = check.miner ?? 'unknown miner';
+        const usage = miners.get(name) ?? { miner: name, checks: 0, costUsd: 0 };
+        usage.checks += 1;
+        usage.costUsd += check.costUsd ?? 0;
+        miners.set(name, usage);
       }
     }
   }
+  const perMiner = [...miners.values()].map((m) => ({ ...m, costUsd: Math.round(m.costUsd * 100) / 100 })).sort((a, b) => b.checks - a.checks);
   return {
     totalReports: rows.length,
     reportsLast24h: recent,
     checksBought,
     minerSpendUsd: Math.round(spend * 100) / 100,
-    distinctMinersUsed: miners.size,
+    distinctMinersUsed: perMiner.length,
+    perMiner,
+    visits: countAppEvents('visit'),
   };
 }
 
@@ -435,26 +503,31 @@ export interface RedflagWatch {
   lastAlertSignal: string | null;
   lastCheckAt: string | null;
   createdAt: string;
+  /** Web watches: the shareable report page alerts are appended to. */
+  reportId: string | null;
 }
 
 interface WatchRow {
   id: string; user_id: string; company: string; chat_id: number | null;
   active: number; last_alert_signal: string | null; last_check_at: string | null; created_at: string;
+  report_id?: string | null;
 }
 
 const watchFromRow = (r: WatchRow): RedflagWatch => ({
   id: r.id, userId: r.user_id, company: r.company, chatId: r.chat_id,
   active: r.active === 1, lastAlertSignal: r.last_alert_signal, lastCheckAt: r.last_check_at, createdAt: r.created_at,
+  reportId: r.report_id ?? null,
 });
 
-export function createWatch(userId: string, company: string, chatId: number | null): RedflagWatch {
+export function createWatch(userId: string, company: string, chatId: number | null, reportId?: string): RedflagWatch {
   const watch: RedflagWatch = {
     id: uid(), userId, company: company.trim().slice(0, 120), chatId,
     active: true, lastAlertSignal: null, lastCheckAt: null, createdAt: now(),
+    reportId: reportId ?? null,
   };
   db.prepare(
-    'INSERT INTO redflag_watches (id, user_id, company, chat_id, active, last_alert_signal, last_check_at, created_at) VALUES (?, ?, ?, ?, 1, NULL, NULL, ?)',
-  ).run(watch.id, watch.userId, watch.company, watch.chatId, watch.createdAt);
+    'INSERT INTO redflag_watches (id, user_id, company, chat_id, active, last_alert_signal, last_check_at, created_at, report_id) VALUES (?, ?, ?, ?, 1, NULL, NULL, ?, ?)',
+  ).run(watch.id, watch.userId, watch.company, watch.chatId, watch.createdAt, watch.reportId);
   return watch;
 }
 
@@ -472,6 +545,14 @@ export function listActiveWatches(): RedflagWatch[] {
 
 export function getWatch(id: string): RedflagWatch | undefined {
   const row = db.prepare('SELECT * FROM redflag_watches WHERE id = ?').get(id) as WatchRow | undefined;
+  return row ? watchFromRow(row) : undefined;
+}
+
+/** The active web watch attached to a report page, if any. */
+export function getWatchByReport(reportId: string): RedflagWatch | undefined {
+  const row = db
+    .prepare('SELECT * FROM redflag_watches WHERE report_id = ? AND active = 1 ORDER BY created_at DESC LIMIT 1')
+    .get(reportId) as WatchRow | undefined;
   return row ? watchFromRow(row) : undefined;
 }
 

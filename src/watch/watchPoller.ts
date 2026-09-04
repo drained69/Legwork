@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Bot } from 'grammy';
 import { config } from '../config.js';
-import { audit, listActiveWatches, updateWatchAlert, updateWatchCheck } from '../db.js';
+import { appendReportUpdate, audit, listActiveWatches, now, updateWatchAlert, updateWatchCheck } from '../db.js';
 import { engineAsk as realEngineAsk, type EngineAskResult } from '../telegraph/client.js';
 import { companyNewsQuery, distillResult, isAlarmingText, NEWS_MINER_KEYWORDS } from '../skills/redflag.js';
 
@@ -117,6 +117,20 @@ export async function runWatchTick(deps?: {
       } catch (err) {
         result.errors.push(`${watch.company}: alert delivery failed (${err instanceof Error ? err.message : String(err)})`);
       }
+    } else if (watch.reportId) {
+      // WEB WATCH: the shareable report page is the inbox. A web watch has no
+      // Telegram chat, so the finding is appended to the report itself and
+      // appears when the reader returns. A missing report (deleted row) must
+      // not break the tick — the watch simply has nowhere left to deliver.
+      const delivered = appendReportUpdate(watch.reportId, {
+        company: watch.company,
+        text: distilled.text,
+        miner: res.minerName ?? 'telegraph miner',
+        costUsd: res.costUsd ?? 0.01,
+        at: now(),
+      });
+      if (delivered) result.alerted += 1;
+      else result.errors.push(`${watch.company}: report for web watch no longer exists`);
     }
   }
 

@@ -258,13 +258,16 @@ test('homepage: serves the app with full-vetting wiring and stats hooks', async 
   assert.equal(res.status, 200);
   const html = await res.text();
   // The two actions and their endpoints.
-  assert.match(html, /Run free scan/);
-  assert.match(html, /Run full vetting/);
+  assert.match(html, /Free scan/);
+  assert.match(html, /Run verification/);
+  assert.match(html, /Find jobs worth applying to/);
   assert.match(html, /\/api\/redflag\/preview/);
   assert.match(html, /\/api\/redflag\/web/);
-  // The live stats strip and the recent-verdicts feed.
+  assert.match(html, /\/api\/hunt\/web/);
+  // The live stats strip, the network panel and the recent-verdicts feed.
   assert.match(html, /\/api\/stats/);
-  assert.match(html, /miner checks bought/);
+  assert.match(html, /checks bought/);
+  assert.match(html, /Miners we've bought from/);
   assert.match(html, /Recent verdicts/);
   // The four Telegraph intents are named in the explainer.
   assert.match(html, /FRAUD_DETECTION/);

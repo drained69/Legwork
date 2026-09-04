@@ -179,25 +179,33 @@ engine in USDC:
 
 Four surfaces, one engine:
 
+- **Web app** — `GET /` (also `/redflag`): both sides of the flywheel on one
+  page. **Hunt the market** runs the exact signal the Telegraph miner serves
+  (live boards, explained 0–100 scores, live pay synthesis) free for any
+  visitor; **Vet an offer** runs the free scan or the operator-paid full
+  vetting (per-IP rate limit + daily spend ceiling; over the limit it says so
+  and the free scan keeps working). The stats strip counts visitors, vettings,
+  miner checks bought and USDC paid; a **network panel** lists every miner the
+  app has bought answers from with per-miner counts. Every result renders the
+  receipt — which miner answered each check, its confidence, its signal hash
+  and its cost.
+- **Shareable report pages** — `/report/<id>`: the receipt as a standalone
+  document with OG/Twitter cards (a shared link previews the verdict), share
+  buttons, and a **web watch** — the page itself is the inbox: one click
+  starts a standing news check that re-runs every few hours and appends NEW
+  negative coverage to the report on return, ~$0.01/check paid by the
+  operator.
 - **Full report** — `POST /api/redflag` ($0.05, direct Base Sepolia billing)
   or `/redflag` in Telegram. Every match card from a paid hunt carries a
   **Vet** button that runs it on the posting you're looking at.
-- **Web app** — `GET /redflag`: paste any posting and run the free scan, or
-  press **Run full vetting** and Legwork's wallet buys the four live miner
-  checks on the spot (per-IP rate limit + daily spend ceiling; over the
-  limit it says so and the free scan keeps working). Every result renders
-  the receipt — which miner answered each check, its confidence, its signal
-  hash and its cost — and gets a **shareable report page** at
-  `/report/<id>`. A live stats strip (`GET /api/stats`) counts reports run,
-  miner checks bought, USDC paid to miners and distinct miners used, and a
-  recent-verdicts feed shows the last vettings.
 - **Free scan** — the local scam scan and live comp benchmark at zero cost,
   with the four network checks listed as skipped — a preview never pretends
   to be a full vetting.
-- **Standing watches** — `/watch Company` in Telegram: the company's news is
-  re-checked through a news miner every few hours (Legwork's wallet pays,
-  ~$0.01/check) and you're alerted when *new* negative coverage appears — same
-  story twice never alerts twice. `/watch` lists and stops watches.
+- **Standing watches** — `/watch Company` in Telegram (or the web watch
+  above): the company's news is re-checked through a news miner every few
+  hours (Legwork's wallet pays, ~$0.01/check) and you're alerted when *new*
+  negative coverage appears — same story twice never alerts twice. `/watch`
+  lists and stops watches.
 - **History** — every paid report is persisted (`/vetted` in Telegram): what
   was checked, what it cost, what the verdict was.
 

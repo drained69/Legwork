@@ -434,7 +434,7 @@ async function synthesize(
   const evidence = telegraph
     .map(({ check, result }) => {
       const d = distillResult(result.result);
-      return `[${check.label} via ${result.minerName ?? 'miner'} (${check.intent}) confidence=${d.confidence ?? result.costUsd !== undefined ? d.confidence ?? 'n/a' : 'n/a'}] ${d.text}`;
+      return `[${check.label} via ${result.minerName ?? 'miner'} (${check.intent}) confidence=${d.confidence ?? 'n/a'}] ${d.text}`;
     })
     .join('\n');
 
@@ -578,6 +578,21 @@ export async function runRedflag(
 
   const telegraphEvidence: Array<{ check: TelegraphCheck; result: EngineAskResult }> = [];
 
+  /**
+   * Visitor-facing text for a failed paid check. The raw engine error
+   * ("routing failed: engine returned 402 after payment (miner txlens)") is
+   * internal jargon a consumer cannot act on — and it lands on PUBLIC report
+   * pages. Translate the failure classes a visitor can understand, keep the
+   * exact wording for the audit log.
+   */
+  const publicFailureSummary = (error: string | undefined): string => {
+    const raw = (error ?? '').toLowerCase();
+    if (raw.includes('402') || raw.includes('payment')) return 'Check not completed — the network would not accept payment for this check. Nothing was charged.';
+    if (raw.includes('unreachable') || raw.includes('timeout') || raw.includes('econnrefused')) return 'Check not completed — the verification network was unreachable. Nothing was charged.';
+    if (raw.includes('not configured')) return 'Check not run — the Telegraph consumer wallet is not configured on this deployment.';
+    return error ? `Check not completed — ${error.slice(0, 160)}` : 'Check failed. Nothing was charged.';
+  };
+
   /** Fold one miner result into the running spend, checks and confidence. */
   const recordResult = (check: TelegraphCheck, result: EngineAskResult): void => {
     const cost = result.ok ? (result.costUsd ?? 0.01) : 0;
@@ -595,7 +610,8 @@ export async function runRedflag(
       // the way a real signal does.
       confidence += result.cached ? 0.05 : thin ? 0 : 0.1;
     } else {
-      checks.push({ id: check.id, label: check.label, status: result.skipped ? 'skipped' : 'failed', source: 'telegraph', intent: check.intent, costUsd: 0, summary: result.error ?? 'check failed' });
+      if (!result.skipped) audit('redflag', 'CHECK_FAILED', `${check.id}: ${result.error ?? 'check failed'}`);
+      checks.push({ id: check.id, label: check.label, status: result.skipped ? 'skipped' : 'failed', source: 'telegraph', intent: check.intent, costUsd: 0, summary: result.skipped ? (result.error ?? 'check skipped') : publicFailureSummary(result.error) });
       confidence -= result.skipped ? 0.05 : 0.15;
     }
   };
@@ -674,6 +690,30 @@ export async function runRedflag(
   const synthesis = await synthesize(facts, input, telegraphEvidence, heuristicFlags, comp.flag);
   if (synthesis.flags.length && telegraphEvidence.length) confidence += 0.05;
   confidence = Math.max(0.1, Math.min(0.95, confidence));
+
+  // THE HONESTY GATE. When the Telegraph side was in play but NOT ONE paid
+  // check came back, the report's only evidence is local — a "clear" verdict
+  // would claim independent verification that never happened (every check
+  // failed, or every check was skipped for budget). Cap it at "caution" and
+  // say why, so a public report never reads as a vetted CLEAR while its
+  // receipt is four ✗ marks. ("avoid" survives: local scam patterns are
+  // evidence FOR a risk, not a claim of verification.)
+  const networkChecks = checks.filter((c) => c.source === 'telegraph');
+  const networkOk = networkChecks.filter((c) => c.status === 'ok' || c.status === 'cached').length;
+  if (synthesis.verdict === 'clear' && networkChecks.length > 0 && networkOk === 0) {
+    const failed = networkChecks.filter((c) => c.status === 'failed').length;
+    synthesis.verdict = 'caution';
+    synthesis.flags.unshift({
+      severity: 'yellow',
+      title: 'Independent verification did not run',
+      detail: failed > 0
+        ? `${failed} of ${networkChecks.length} network checks were attempted and none completed (payment or routing failures). This verdict rests on local checks only — nothing was charged.`
+        : `None of the ${networkChecks.length} network checks could be bought (budget or input limits). This verdict rests on local checks only — nothing was charged.`,
+      source: 'legwork:network-status',
+      confidence: 0.95,
+    });
+    synthesis.summary = `${synthesis.summary} 0 of ${networkChecks.length} network checks completed — verdict capped at caution (local checks only).`.trim();
+  }
 
   // A flag sourced from a telegraph miner carries what that miner's answer
   // cost — the buyer sees what their money bought, flag by flag.

@@ -47,6 +47,21 @@ export const config = {
    */
   gemini: {
     apiKey: env('GEMINI_API_KEY') || env('GOOGLE_API_KEY'),
+    /**
+     * A POOL of keys, not one. Validators probe this miner in bursts, and
+     * Gemini's free tier allows 15 requests/minute PER KEY — one burst
+     * exhausts a single key and every 429 degrades an answer the epoch
+     * scorer is about to grade. Each additional key adds 15 RPM of burst
+     * headroom; llm.ts rotates on 429 within the same request.
+     */
+    get apiKeys(): string[] {
+      return [
+        env('GEMINI_API_KEY') || env('GOOGLE_API_KEY'),
+        env('GEMINI_API_KEY_2'),
+        env('GEMINI_API_KEY_3'),
+        env('GEMINI_API_KEY_4'),
+      ].filter((k): k is string => Boolean(k));
+    },
     baseUrl: env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').replace(/\/+$/, ''),
     // gemini-3.5-flash-lite by default, chosen by measurement rather than
     // by version number. Newer Gemini models spend the OUTPUT budget on

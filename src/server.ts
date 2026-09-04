@@ -6,10 +6,11 @@ import { tailorApplication } from './skills/applicationTailor.js';
 import { runRedflag, runRedflagPreview, type RedflagInput, type RedflagReport } from './skills/redflag.js';
 import { findService, serviceCatalog, type PricedService } from './payments/services.js';
 import { verifyServicePayment } from './payments/verify.js';
-import { handleMinerRoute, isMinerRoute } from './miner.js';
+import { handleMinerRoute, huntSignal, isMinerRoute } from './miner.js';
 import { llmHealth } from './llm.js';
 import { telegraphHealth } from './telegraph/client.js';
-import { getRedflagReport, now, recentRedflagReports, redflagSpendSince, redflagStats, saveRedflagReport, uid } from './db.js';
+import { getRedflagReport, getWatchByReport, now, recentRedflagReports, recordAppEvent, redflagSpendSince, redflagStats, saveRedflagReport, uid } from './db.js';
+import { createWatch, deactivateWatch } from './db.js';
 import { REDFLAG_PAGE_HTML } from './web/redflagPage.js';
 import { renderReportPage } from './web/reportPage.js';
 import { json, readBody } from './http.js';
@@ -35,8 +36,11 @@ function clientIp(req: IncomingMessage): string {
 const previewHits = new Map<string, number[]>();
 const redflagPreviewHits = new Map<string, number[]>();
 const redflagWebHits = new Map<string, number[]>();
+const huntWebHits = new Map<string, number[]>();
 const PREVIEW_LIMIT = 3;
 const PREVIEW_WINDOW_MS = 60 * 60 * 1000;
+/** The free hunt tool is the chatty demo surface — more headroom than vetting. */
+const HUNT_WEB_LIMIT = 6;
 
 function rateAllowed(hits: Map<string, number[]>, ip: string, limit = PREVIEW_LIMIT): { ok: boolean; remaining: number; retryAfterSec: number } {
   const cutoff = Date.now() - PREVIEW_WINDOW_MS;
@@ -212,6 +216,61 @@ async function handleRedflagWeb(req: IncomingMessage, res: ServerResponse): Prom
   }
 }
 
+/**
+ * The FREE job-hunt tool behind the homepage — the EARN side of the flywheel,
+ * on the web. It runs the exact same signal pipeline the Telegraph miner
+ * serves (`huntSignal`): free-text criteria parsing, live boards, pay-question
+ * synthesis, general answers. A visitor experiences precisely what the
+ * network's buyers get, which is the demo that matters for a miner that is
+ * also an app.
+ */
+async function handleHuntWeb(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const gate = rateAllowed(huntWebHits, clientIp(req), HUNT_WEB_LIMIT);
+  if (!gate.ok) return json(res, 429, { ok: false, error: `Hunt limit reached (${HUNT_WEB_LIMIT}/hour) — back in a few minutes.`, retryAfterSeconds: gate.retryAfterSec });
+  const raw = await readBody(req, res);
+  if (raw === null) return;
+  let body: Record<string, unknown>;
+  try {
+    body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+  } catch (error) {
+    return json(res, 400, { ok: false, error: `request body is not valid JSON: ${String(error)}` });
+  }
+  const query = typeof body.query === 'string' ? body.query.trim() : '';
+  if (!query) return json(res, 400, { ok: false, error: 'type a job search — e.g. "senior backend engineer, TypeScript, remote, $150k+" or "what does a data analyst earn in New York"' });
+  if (query.length > 2000) return json(res, 400, { ok: false, error: 'query too long — keep it under 2000 characters' });
+  try {
+    const signal = await huntSignal({ query });
+    return json(res, 200, { ok: true, query, huntsRemainingThisHour: gate.remaining, signal });
+  } catch (error) {
+    console.error('[server] hunt/web failed:', error);
+    return json(res, 500, { ok: false, error: 'hunt failed — try again in a moment' });
+  }
+}
+
+/**
+ * Start (or stop) a WEB watch from a report page: no Telegram chat, the page
+ * itself is the inbox. The poller appends new-negative-coverage findings to
+ * the report, and the reader sees them on return.
+ */
+async function handleReportWatch(req: IncomingMessage, res: ServerResponse, reportId: string, start: boolean): Promise<void> {
+  const record = getRedflagReport(reportId);
+  if (!record) return json(res, 404, { ok: false, error: 'no such report' });
+  if (start) {
+    if (!config.telegraph.enabled) {
+      return json(res, 503, { ok: false, error: 'Network checks are not configured on this deployment — standing watches unavailable.' });
+    }
+    if (getWatchByReport(reportId)) {
+      return json(res, 200, { ok: true, alreadyWatching: true, intervalHours: config.telegraph.watchIntervalHours });
+    }
+    const watch = createWatch(`web:report:${reportId}`, record.company, null, reportId);
+    return json(res, 200, { ok: true, watchId: watch.id, intervalHours: config.telegraph.watchIntervalHours, firstCheckWithinMin: config.telegraph.watchPollMinutes });
+  }
+  const watch = getWatchByReport(reportId);
+  if (!watch) return json(res, 404, { ok: false, error: 'this report has no active watch' });
+  deactivateWatch(watch.id);
+  return json(res, 200, { ok: true, stopped: true });
+}
+
 async function handlePaidRoute(service: PricedService, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const transactionHash = req.headers['x-payment-tx'];
   const payer = req.headers['x-user-wallet'];
@@ -254,14 +313,17 @@ export function startServer(port: number = config.server.endpointPort): Server {
           sources: { adzuna: config.adzuna.enabled, usajobs: config.usajobs.enabled },
         });
       if (req.method === 'GET' && path === '/api/services') return json(res, 200, serviceCatalog());
-      // The Redflag web app — paste a posting; free scan and operator-paid
-      // full vetting, one page. The Track 3 consumer surface.
-      if (req.method === 'GET' && (path === '/redflag' || path === '/redflag/')) {
+      // The Legwork web app — paste a posting; free scan and operator-paid
+      // full vetting, one page. Served at BOTH / and /redflag.
+      if (req.method === 'GET' && (path === '/' || path === '/redflag' || path === '/redflag/')) {
+        recordAppEvent('visit');
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(REDFLAG_PAGE_HTML);
         return;
       }
       if (req.method === 'POST' && path === '/api/hunt/preview') return handlePreview(req, res);
+      // The free job-hunt tool — the miner's own skill, on the web.
+      if (req.method === 'POST' && path === '/api/hunt/web') return handleHuntWeb(req, res);
       if (req.method === 'POST' && path === '/api/redflag/preview') return handleRedflagPreview(req, res);
       if (req.method === 'POST' && path === '/api/redflag/web') return handleRedflagWeb(req, res);
       // Public network-usage stats + the recent-verdicts feed: what this app
@@ -271,22 +333,32 @@ export function startServer(port: number = config.server.endpointPort): Server {
       }
       // Shareable report pages — the receipt for a vetting, by unguessable id.
       if (req.method === 'GET' && path.startsWith('/report/')) {
+        recordAppEvent('visit');
         const id = path.slice('/report/'.length).replace(/\/+$/, '');
         const record = /^[0-9a-f-]{36}$/i.test(id) ? getRedflagReport(id) : undefined;
         if (!record) {
           res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' });
-          res.end('<!doctype html><meta charset="utf-8"><body style="background:#0c0f14;color:#e6e9ef;font:16px ui-sans-serif;padding:3rem"><h1>404 — no such report</h1><p><a href="/redflag" style="color:#7fb0ff">← back to Redflag</a></p></body>');
+          res.end('<!doctype html><meta charset="utf-8"><body style="background:#0c0f14;color:#e6e9ef;font:16px ui-sans-serif;padding:3rem"><h1>404 — no such report</h1><p><a href="/redflag" style="color:#7fb0ff">← back to Legwork</a></p></body>');
           return;
         }
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(renderReportPage(record, publicOrigin(req)));
+        res.end(renderReportPage(record, publicOrigin(req), getWatchByReport(record.id)));
         return;
       }
       if (req.method === 'GET' && path.startsWith('/api/report/')) {
         const id = path.slice('/api/report/'.length).replace(/\/+$/, '');
         const record = /^[0-9a-f-]{36}$/i.test(id) ? getRedflagReport(id) : undefined;
         if (!record) return json(res, 404, { ok: false, error: 'no such report' });
-        return json(res, 200, { ok: true, report: record });
+        return json(res, 200, { ok: true, report: record, watch: getWatchByReport(record.id) ? { active: true } : undefined });
+      }
+      // Web watches: start / stop from the report page.
+      if (req.method === 'POST' && path.startsWith('/api/report/') && path.endsWith('/watch')) {
+        const id = path.slice('/api/report/'.length, -'/watch'.length);
+        return handleReportWatch(req, res, /^[0-9a-f-]{36}$/i.test(id) ? id : '', true);
+      }
+      if (req.method === 'POST' && path.startsWith('/api/report/') && path.endsWith('/unwatch')) {
+        const id = path.slice('/api/report/'.length, -'/unwatch'.length);
+        return handleReportWatch(req, res, /^[0-9a-f-]{36}$/i.test(id) ? id : '', false);
       }
       if (isMinerRoute(req.method, path)) return handleMinerRoute(req, res, path);
       const service = findService(req.method, path);
