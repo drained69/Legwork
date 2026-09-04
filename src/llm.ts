@@ -278,25 +278,58 @@ type GeminiSendOutcome =
   | { kind: 'no-key' }
   | { kind: 'error'; message: string };
 
+/**
+ * Total request attempts across keys AND transient retries.
+ *
+ * Gemini's free tier does not just rate-limit — under load it returns 503
+ * (overloaded) and stalls past the timeout. Production logs showed those
+ * transient failures giving up on the FIRST try, and every one became a 0.15
+ * decline on a general-knowledge question — the single biggest drag on the
+ * WEB_SEARCH / RESEARCH_SYNTHESIS / TEXT_GENERATION intents, where a decline
+ * scores ~0. Ranking rewards a good answer far more than a fast one, so a
+ * transient 503/timeout now backs off briefly and RETRIES instead of
+ * surrendering the score. A 429 still rotates keys; genuine auth/4xx errors
+ * still fail fast. The cap bounds worst-case latency.
+ */
+const MAX_SEND_ATTEMPTS = 3;
+const TRANSIENT_BACKOFF_MS = 350;
+/**
+ * Wall-clock ceiling across ALL retries. Retrying is worth latency (a good
+ * answer beats a decline), but not unboundedly — the epoch scorer has its own
+ * timeout, and blowing past it scores 0, which is worse than a fast decline.
+ * Per-attempt timeout is shrunk to whatever budget remains.
+ */
+const MAX_TOTAL_MS = 15_000;
+const isTransientStatus = (st: number): boolean => st === 500 || st === 502 || st === 503 || st === 504 || st === 408;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: string) => void): Promise<GeminiSendOutcome> {
   const { baseUrl, model } = config.gemini;
   const url = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const keys = geminiKeys();
-  // Try every key in the pool before giving up: a 429'd key rotates to the
-  // next INSIDE this loop, so the caller still gets its answer.
-  for (let attempt = 0; attempt < keys.length; attempt++) {
+  const bodyStr = JSON.stringify(body);
+  const deadline = Date.now() + MAX_TOTAL_MS;
+  let lastErr = 'no answer';
+  // A 429'd key rotates to the next; a 503/timeout backs off and retries (the
+  // same key when it is the only one — a server-side overload is not the key's
+  // fault). Bounded by MAX_SEND_ATTEMPTS so latency can't run away.
+  for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
     const state = pickGeminiKey();
-    if (!state) break;
+    if (!state) break; // every key rate-limited or auth-dead → capacity, not transience
+    const remaining = deadline - Date.now();
+    if (remaining < 800) break; // no time left for a useful attempt
     try {
       const res = await fetchWithTimeout(
         url,
-        { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': state.key }, body: JSON.stringify(body) },
-        timeoutMs,
+        { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': state.key }, body: bodyStr },
+        Math.min(timeoutMs, remaining),
       );
       if (res.status === 429) {
         state.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-        console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${keys.filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
-        continue; // next key, same request
+        console.error(`[llm] gemini key …${state.key.slice(-4)} rate-limited — rotating (${geminiKeys().filter((k) => Date.now() >= k.rateLimitedUntil).length} healthy left)`);
+        continue; // next key, same request — no backoff (a different key is ready now)
       }
       if (res.status === 401 || res.status === 403 || res.status === 400) {
         const text = (await res.text()).slice(0, 400);
@@ -314,6 +347,14 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
         llmState.lastError = `API error ${res.status}`;
         return { kind: 'error', message: `API error ${res.status}` };
       }
+      if (isTransientStatus(res.status)) {
+        // Gemini overloaded — its fault, not the key's. Back off and retry;
+        // a good answer a second later beats a 0.15 decline now.
+        lastErr = `API error ${res.status}`;
+        console.error(`[llm] gemini ${model} returned ${res.status} (overloaded) — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
+        await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+        continue;
+      }
       if (!res.ok) {
         const text = (await res.text()).slice(0, 400);
         console.error(`[llm] gemini ${model} returned ${res.status}: ${text}`);
@@ -324,15 +365,18 @@ async function geminiSend(body: unknown, timeoutMs: number, onAuthDead: (key: st
       }
       return { kind: 'response', res, key: state.key };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('[llm] gemini request failed:', message);
+      // A timeout or network drop is transient too — back off and retry.
+      lastErr = err instanceof Error ? err.message : String(err);
+      console.error(`[llm] gemini request failed: ${lastErr} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
       llmState.lastAt = Date.now();
       llmState.lastStatus = 'error';
-      llmState.lastError = message;
-      return { kind: 'error', message };
+      llmState.lastError = lastErr;
+      await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+      continue;
     }
   }
-  return { kind: 'no-key' };
+  // Distinguish "no capacity" (all keys benched) from "kept failing".
+  return pickGeminiKey() ? { kind: 'error', message: lastErr } : { kind: 'no-key' };
 }
 
 /** Response shape for both plain and grounded calls. */

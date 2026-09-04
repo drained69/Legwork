@@ -44,12 +44,19 @@ import type { Posting, Profile } from './types.js';
  */
 
 /** Total LLM budget for parsing one routed hunt request. */
-const MINER_LLM_TIMEOUT_MS = 10_000;
+// Sized so a stuck call fails fast enough to leave the retry budget room for
+// a second attempt within the LLM client's 15s wall-clock ceiling. flash-lite
+// answers in ~1-2s; a call still open at 7s is stuck, not slow.
+const MINER_LLM_TIMEOUT_MS = 7_000;
 /**
  * Grounded answers run a live web search server-side before generation, so
  * they need a wider budget than a plain completion — typically 3-8s.
  */
-const GROUNDED_LLM_TIMEOUT_MS = 15_000;
+// Grounded (google-search) calls run a touch longer than plain ones, but 10s
+// still leaves the retry client room for a second attempt inside its 15s
+// budget — so a transient 503/timeout on the most ranking-critical path
+// (general WEB_SEARCH / RESEARCH answers) recovers instead of declining.
+const GROUNDED_LLM_TIMEOUT_MS = 10_000;
 /** Per-posting scoring budget (runs concurrently across postings). */
 const SCORING_LLM_TIMEOUT_MS = 8_000;
 

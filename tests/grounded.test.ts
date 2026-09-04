@@ -204,3 +204,29 @@ test('health: reports the key pool', async () => {
   assert.equal(health.llm.keyCount, 2);
   assert.ok(typeof health.llm.keysRateLimited === 'number');
 });
+
+test('pool: a 503 (overloaded) is retried, not surrendered to a decline', async () => {
+  // Gemini free tier returns 503 under load. Production logs showed those
+  // giving up on the first try and declining the question at 0.15 — the single
+  // biggest drag on the general-answer intents. A transient 503 must back off
+  // and retry into a real answer.
+  await freshPool();
+  const calls: StubCall[] = [];
+  let served = false;
+  stubGemini((call) => {
+    calls.push(call);
+    if (!served) {
+      served = true;
+      return new Response(JSON.stringify({ error: { code: 503, message: 'The model is overloaded. Please try again later.' } }), { status: 503 });
+    }
+    return new Response(PLAIN_REPLY('Tokyo is the capital of Japan.'), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  const res = await fetch(`${base}/miner/job-hunt`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'what is the capital of Japan' }),
+  });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { label: string; confidence: number };
+  assert.ok(calls.length >= 2, `503 must be retried, saw ${calls.length} call(s)`);
+  assert.match(data.label, /Tokyo/, 'the retried answer is returned, not a decline');
+  assert.ok(data.confidence > 0.2, `a real answer, not a 0.15 decline (got ${data.confidence})`);
+});
