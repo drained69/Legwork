@@ -226,7 +226,7 @@ export function llmHealth(): LlmHealth {
     rateLimited: keys.length > 0 && limited === keys.length,
     authBreakerOpen: Boolean(breaker.openedAt),
     endpoint: activeLlmEndpoint(),
-    authStyle: llmProvider() === 'gemini' ? 'api-key' : config.llm.authStyle,
+    authStyle: (() => { const p = llmProvider(); return p === 'gemini' ? 'api-key' : p === 'groq' ? 'bearer' : config.llm.authStyle; })(),
     model: activeLlmModel(),
     lastStatus: llmState.lastStatus,
     lastError: llmState.lastError,
@@ -241,6 +241,7 @@ export async function llm(system: string, user: string, maxTokens = 1500, timeou
   const provider = llmProvider();
   if (provider === 'none') return null;
   if (breakerIsOpen()) return null; // credential is known-bad; do not pay the round-trip
+  if (provider === 'groq') return groqCall(system, user, maxTokens, timeoutMs);
   if (provider === 'gemini') return geminiCall(system, user, maxTokens, timeoutMs);
   try {
     // Scoring calls this once per posting, so a stalled API must fail fast and
@@ -504,6 +505,77 @@ function parseGeminiText(data: GeminiResponse): string | null {
     );
   }
   return text || null;
+}
+
+/**
+ * Groq (OpenAI-compatible chat/completions).
+ *
+ * A separate branch: Groq speaks the OpenAI schema (messages[], choices[0]
+ * .message.content, `max_tokens`), not Gemini's or Anthropic's, and uses
+ * bearer auth. Groq is reliable enough that it needs no model-health pool, but
+ * it keeps the same transient retry (5xx/timeout/429 back off and retry within
+ * the shared time budget) so a blip never becomes a decline. A revoked key
+ * trips the shared auth breaker.
+ */
+async function groqCall(system: string, user: string, maxTokens: number, timeoutMs: number): Promise<string | null> {
+  const { baseUrl, model, apiKey } = config.groq;
+  const url = `${baseUrl}/chat/completions`;
+  const bodyStr = JSON.stringify({
+    model,
+    max_tokens: maxTokens,
+    temperature: 0,
+    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+  });
+  const deadline = Date.now() + MAX_TOTAL_MS;
+  for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining < 600) break;
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` }, body: bodyStr },
+        Math.min(timeoutMs, remaining),
+      );
+      if (res.status === 401 || res.status === 403) {
+        console.error(`[llm] groq ${model} returned ${res.status} (bad credential)`);
+        llmState.lastAt = Date.now();
+        llmState.lastStatus = 'error';
+        llmState.lastError = `API error ${res.status}`;
+        noteAuthFailure();
+        return null;
+      }
+      if (res.status === 429 || isTransientStatus(res.status)) {
+        console.error(`[llm] groq ${model} returned ${res.status} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
+        llmState.lastAt = Date.now();
+        llmState.lastStatus = 'error';
+        llmState.lastError = `API error ${res.status}`;
+        await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+        continue;
+      }
+      if (!res.ok) {
+        console.error(`[llm] groq ${model} returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
+        llmState.lastAt = Date.now();
+        llmState.lastStatus = 'error';
+        llmState.lastError = `API error ${res.status}`;
+        return null;
+      }
+      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      llmState.lastAt = Date.now();
+      llmState.lastStatus = 'ok';
+      llmState.lastError = null;
+      breaker.consecutiveAuthFailures = 0;
+      breaker.openedAt = 0;
+      return data.choices?.[0]?.message?.content?.trim() || null;
+    } catch (err) {
+      console.error(`[llm] groq request failed: ${err instanceof Error ? err.message : String(err)} — retry ${attempt + 1}/${MAX_SEND_ATTEMPTS}`);
+      llmState.lastAt = Date.now();
+      llmState.lastStatus = 'error';
+      llmState.lastError = err instanceof Error ? err.message : String(err);
+      await sleep(TRANSIENT_BACKOFF_MS * (attempt + 1));
+      continue;
+    }
+  }
+  return null;
 }
 
 async function geminiCall(system: string, user: string, maxTokens: number, timeoutMs: number): Promise<string | null> {

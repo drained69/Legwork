@@ -37,6 +37,24 @@ export const config = {
     },
   },
   /**
+   * Groq — checked FIRST when a key is present. Its free tier has higher rate
+   * limits than Gemini's, is much faster (sub-second), and is far more
+   * reliable (Gemini free 503s at the model level). OpenAI-compatible API, so
+   * a different request/response shape from both Gemini and Anthropic — a
+   * separate branch in llm.ts. Bearer auth.
+   */
+  groq: {
+    apiKey: env('GROQ_API_KEY'),
+    baseUrl: env('GROQ_BASE_URL', 'https://api.groq.com/openai/v1').replace(/\/+$/, ''),
+    // llama-3.3-70b-versatile: strong general-knowledge quality (what the
+    // WEB_SEARCH/RESEARCH/TEXT intents are scored on) and still ~1s on Groq.
+    // Override with GROQ_MODEL if Groq renames it.
+    model: env('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+    get enabled(): boolean {
+      return Boolean(this.apiKey);
+    },
+  },
+  /**
    * Google Gemini. Checked FIRST because setting a Gemini key is an explicit
    * choice of provider — it should win over a stale Anthropic key left in the
    * environment rather than silently losing to it.
@@ -182,9 +200,10 @@ export const config = {
 };
 
 /** Which LLM backend is actually in play. Gemini wins when its key is set. */
-export type LlmProvider = 'gemini' | 'anthropic' | 'none';
+export type LlmProvider = 'groq' | 'gemini' | 'anthropic' | 'none';
 
 export function llmProvider(): LlmProvider {
+  if (config.groq.enabled) return 'groq';
   if (config.gemini.enabled) return 'gemini';
   if (config.llm.enabled) return 'anthropic';
   return 'none';
@@ -192,10 +211,12 @@ export function llmProvider(): LlmProvider {
 
 /** The model that will actually be requested, whichever provider is active. */
 export function activeLlmModel(): string {
-  return llmProvider() === 'gemini' ? config.gemini.model : config.llm.model;
+  const p = llmProvider();
+  return p === 'groq' ? config.groq.model : p === 'gemini' ? config.gemini.model : config.llm.model;
 }
 
 /** Human-readable endpoint for /health — never includes the credential. */
 export function activeLlmEndpoint(): string {
-  return llmProvider() === 'gemini' ? config.gemini.baseUrl : config.llm.baseUrl;
+  const p = llmProvider();
+  return p === 'groq' ? config.groq.baseUrl : p === 'gemini' ? config.gemini.baseUrl : config.llm.baseUrl;
 }
