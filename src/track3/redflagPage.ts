@@ -1,7 +1,7 @@
 /**
  * The Legwork web app — GET / and GET /redflag.
  *
- * A single-page premium workspace over BOTH sides of the Telegraph flywheel:
+ * A single-page editorial workspace over BOTH sides of the Telegraph flywheel:
  *   · HUNT — the earn side: the exact signal pipeline our registered miner
  *     serves, free for any visitor (live boards, explained scores, live pay
  *     synthesis).
@@ -9,11 +9,13 @@
  *     Telegraph miners (operator-paid, rate- and budget-capped) and renders
  *     the receipt as a live verification pipeline.
  *
- * Design system is inline on purpose — no build tooling, no CDN assets, one
- * HTML string served straight from memory. The client JS uses string
+ * Theme: warm paper canvas, forest-green accent, high-contrast editorial serif
+ * (Fraunces) for display, sans (Inter) for body, mono (IBM Plex Mono) for
+ * labels, numbers and technical identifiers. The client JS uses string
  * concatenation (never template literals) so nothing collides with the outer
- * TS template literal. Every fetch targets an existing endpoint with an
- * unchanged payload; this file is UI only.
+ * TS template literal, and it references the same CSS custom-property NAMES
+ * (--accent, --pos, --warn, …) so a re-theme never touches the logic. Every
+ * fetch targets an existing endpoint with an unchanged payload; UI only.
  */
 
 export const REDFLAG_PAGE_HTML = `<!doctype html>
@@ -29,111 +31,122 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Legwork — job search, independently verified">
 <meta name="twitter:description" content="Search live boards with explained scores; vet offers with checks bought from independent Telegraph miners.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500;1,9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    color-scheme: dark;
-    /* ── surfaces ── */
-    --bg: #08090c;
-    --bg-soft: #0b0d12;
-    --surface: #0f1218;
-    --surface-2: #12161e;
-    --surface-3: #161b25;
-    --border: #1c2230;
-    --border-strong: #29313f;
-    /* ── text ── */
-    --text: #e9ecf2;
-    --text-2: #b7bfce;
-    --muted: #8a93a4;
-    --faint: #626b7d;
-    /* ── accent + semantic ── */
-    --accent: #5b84ff;
-    --accent-soft: #5b84ff1f;
-    --accent-line: #5b84ff44;
-    --pos: #35d29a;
-    --pos-soft: #35d29a1c;
-    --warn: #f2b04e;
-    --warn-soft: #f2b04e1c;
-    --danger: #f26565;
-    --danger-soft: #f265651c;
+    color-scheme: light;
+    /* ── surfaces (warm paper) ── */
+    --bg: #f3eee4;
+    --bg-soft: #ece5d7;
+    --surface: #fbf8f1;
+    --surface-2: #f1ebdf;
+    --surface-3: #ebe4d5;
+    --border: #e2dccc;
+    --border-strong: #cdc6b3;
+    /* ── ink ── */
+    --text: #1c1b16;
+    --text-2: #57554b;
+    --ink-2: #726f62;         /* muted display ink (the italic line) */
+    --muted: #8a887c;
+    --faint: #a9a695;
+    /* ── accent + semantic (earthy) ── */
+    --accent: #33421f;         /* forest green — primary */
+    --accent-hover: #3f5127;
+    --accent-soft: #33421f14;
+    --accent-line: #33421f33;
+    --pos: #3f6b39;            /* muted positive green */
+    --pos-soft: #3f6b3916;
+    --warn: #9a6b1f;           /* ochre */
+    --warn-soft: #9a6b1f16;
+    --danger: #a23b2c;         /* brick */
+    --danger-soft: #a23b2c16;
+    --lilac: #6d5bd0;          /* rare secondary accent */
     /* ── type ── */
-    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-    /* ── spacing scale (8pt) ── */
+    --serif: "Fraunces", Georgia, "Times New Roman", serif;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    /* ── spacing (8pt) ── */
     --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px; --s9: 96px;
-    --radius: 10px; --radius-sm: 8px; --radius-lg: 14px;
+    --radius: 10px; --radius-sm: 8px; --radius-lg: 12px;
     --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
-    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 30px rgba(0,0,0,.28);
-    --maxw: 1080px;
+    --maxw: 1200px;
   }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
-    font: 400 16px/1.6 var(--sans); letter-spacing: -0.006em;
-    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    font: 400 16px/1.62 var(--sans); letter-spacing: -0.004em;
+    font-optical-sizing: auto; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }
   ::selection { background: var(--accent-soft); }
   a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.02em; line-height: 1.15; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
   p { margin: 0; }
   button { font-family: inherit; }
   :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--radius-sm); }
   .mono { font-family: var(--mono); font-feature-settings: "tnum" 1; letter-spacing: 0; }
-  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--s5); }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--s6); }
   [hidden] { display: none !important; }
 
+  /* ── display serif ──────────────────────────────────────────────────── */
+  .display { font-family: var(--serif); font-optical-sizing: auto; font-weight: 600; letter-spacing: -0.025em; line-height: 0.99; color: var(--text); margin: 0; }
+  .display .ital { font-style: italic; font-weight: 500; color: var(--ink-2); }
+  .eyebrow { display: inline-block; font-family: var(--mono); font-size: .72rem; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin-bottom: var(--s5); }
+  .model-label { font-family: var(--mono); font-size: .7rem; letter-spacing: .18em; text-transform: uppercase; color: var(--faint); }
+  .lede { color: var(--text-2); font-size: 1.06rem; line-height: 1.65; max-width: 52ch; }
+  .mnum { font-family: var(--mono); font-size: .8rem; color: var(--faint); flex: 0 0 auto; }
+
   /* ── header ─────────────────────────────────────────────────────────── */
-  .appbar {
-    position: sticky; top: 0; z-index: 50;
-    background: color-mix(in srgb, var(--bg) 86%, transparent);
-    backdrop-filter: saturate(140%) blur(10px);
-    border-bottom: 1px solid var(--border);
-  }
-  .appbar .row { display: flex; align-items: center; gap: var(--s5); height: 60px; }
-  .brand { display: inline-flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.02em; font-size: 1.06rem; color: var(--text); }
+  .appbar { position: sticky; top: 0; z-index: 50; background: color-mix(in srgb, var(--bg) 90%, transparent); backdrop-filter: saturate(120%) blur(6px); border-bottom: 1px solid var(--border); }
+  .appbar .row { display: flex; align-items: center; gap: var(--s5); height: 66px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; font-size: .95rem; letter-spacing: .16em; text-transform: uppercase; color: var(--text); }
   .brand:hover { text-decoration: none; }
-  .brand .dot { width: 10px; height: 10px; border-radius: 3px; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-  .nav { display: flex; gap: var(--s2); margin-left: auto; align-items: center; }
-  .nav a { color: var(--muted); font-size: .9rem; padding: 7px 11px; border-radius: 7px; }
-  .nav a:hover { color: var(--text); background: var(--surface-2); text-decoration: none; }
-  .live { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: .78rem; padding: 6px 11px; border: 1px solid var(--border); border-radius: 999px; }
-  .live .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--pos); box-shadow: 0 0 0 0 var(--pos); animation: pulse 2.4s infinite; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 var(--pos-soft); } 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
-  .menu-btn { display: none; margin-left: auto; background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; width: 40px; height: 40px; cursor: pointer; font-size: 1.1rem; }
+  .brand .mark { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--accent); flex: 0 0 auto; }
+  .nav { display: flex; gap: var(--s4); margin-left: auto; align-items: center; }
+  .nav a { color: var(--text-2); font-size: .9rem; font-weight: 500; padding: 4px 0; border-bottom: 2px solid transparent; }
+  .nav a:hover { color: var(--text); text-decoration: none; border-color: var(--border-strong); }
+  .nav a.active { color: var(--text); border-color: var(--text); }
+  .hpills { display: flex; gap: var(--s2); align-items: center; }
+  .hpill { display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: .74rem; color: var(--text-2); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; }
+  .hpill:hover { text-decoration: none; border-color: var(--border-strong); }
+  .hpill .ldot { width: 7px; height: 7px; border-radius: 50%; background: var(--pos); box-shadow: 0 0 0 0 var(--pos); animation: pulse 2.6s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 var(--pos-soft); } 70% { box-shadow: 0 0 0 5px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  .menu-btn { display: none; margin-left: auto; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 8px; width: 42px; height: 42px; cursor: pointer; font-size: 1.15rem; }
 
   /* ── hero ───────────────────────────────────────────────────────────── */
-  .hero { padding: var(--s9) 0 var(--s7); position: relative; overflow: hidden; }
-  .hero::before {
-    content: ""; position: absolute; inset: -40% 0 auto 0; height: 520px; z-index: -1;
-    background: radial-gradient(60% 60% at 50% 0%, #5b84ff14, transparent 70%);
-    pointer-events: none;
-  }
-  .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: .74rem; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: var(--s4); }
-  .eyebrow .tick { color: var(--pos); }
-  .hero h1 { font-size: clamp(2.1rem, 5.4vw, 3.5rem); max-width: 16ch; }
-  .hero .lede { color: var(--text-2); font-size: clamp(1rem, 1.6vw, 1.18rem); max-width: 54ch; margin-top: var(--s4); }
+  .hero { padding: var(--s9) 0 var(--s8); }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: var(--s8); align-items: start; }
+  .hero .display { font-size: clamp(2.7rem, 6.4vw, 5rem); max-width: 15ch; }
+  .hero .lede { margin-top: var(--s5); }
+  .hero-model { border-left: 1px solid var(--border-strong); padding-left: var(--s5); padding-top: var(--s1); }
+  .model-list { list-style: none; margin: var(--s4) 0 0; padding: 0; }
+  .model-list li { display: flex; gap: var(--s3); padding: var(--s4) 0; border-top: 1px solid var(--border); }
+  .model-list li:first-child { border-top: 0; }
+  .model-list b { display: block; font-weight: 600; font-size: .95rem; }
+  .model-list span.d { display: block; color: var(--muted); font-size: .86rem; margin-top: 3px; line-height: 1.5; }
 
   /* ── search ─────────────────────────────────────────────────────────── */
-  .searchbar { margin-top: var(--s6); max-width: 720px; }
-  .searchfield { display: flex; gap: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; padding: 7px 7px 7px var(--s4); align-items: center; transition: border-color .15s, box-shadow .15s; }
-  .searchfield:focus-within { border-color: var(--accent-line); box-shadow: 0 0 0 4px var(--accent-soft); }
+  .searchbar { margin-top: var(--s6); max-width: 640px; }
+  .searchfield { display: flex; gap: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 6px 6px 6px var(--s4); align-items: center; transition: border-color .15s, box-shadow .15s; }
+  .searchfield:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
   .searchfield svg { flex: 0 0 auto; color: var(--muted); }
   .searchfield input { flex: 1; min-width: 0; background: transparent; border: 0; color: var(--text); font: 400 1.02rem var(--sans); padding: 12px 0; }
   .searchfield input::placeholder { color: var(--faint); }
   .searchfield input:focus { outline: none; }
-  .btn { border: 1px solid transparent; border-radius: 9px; padding: 12px 18px; font-weight: 600; font-size: .95rem; cursor: pointer; transition: background .15s, border-color .15s, transform .06s, opacity .15s; white-space: nowrap; }
+  .btn { border: 1px solid transparent; border-radius: 8px; padding: 12px 18px; font-weight: 600; font-size: .92rem; cursor: pointer; transition: background .15s, border-color .15s, color .15s, transform .06s, opacity .15s; white-space: nowrap; display: inline-flex; align-items: center; gap: 8px; }
   .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: .55; cursor: progress; }
-  .btn-primary { background: var(--accent); color: #fff; }
-  .btn-primary:hover:not(:disabled) { background: #6f93ff; }
-  .btn-ghost { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
-  .btn-ghost:hover:not(:disabled) { border-color: var(--accent-line); color: #fff; }
+  .btn-primary { background: var(--accent); color: #f6f2e6; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   .btn-quiet { background: transparent; color: var(--accent); border-color: transparent; padding: 10px 12px; }
   .btn-quiet:hover:not(:disabled) { background: var(--accent-soft); }
   .examples { margin-top: var(--s4); display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
-  .examples .label { color: var(--faint); font-size: .82rem; margin-right: var(--s1); }
-  .chip { background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); font-size: .82rem; padding: 6px 11px; border-radius: 999px; cursor: pointer; transition: border-color .15s, color .15s; }
+  .examples .label { color: var(--faint); font-family: var(--mono); font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; margin-right: var(--s1); }
+  .chip { background: var(--surface); border: 1px solid var(--border); color: var(--text-2); font-size: .82rem; padding: 6px 11px; border-radius: 999px; cursor: pointer; transition: border-color .15s, color .15s; }
   .chip:hover { border-color: var(--accent-line); color: var(--text); }
   .secondary-cta { margin-top: var(--s5); color: var(--muted); font-size: .92rem; }
   .secondary-cta a { font-weight: 550; }
@@ -141,76 +154,70 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
   .inline-status.err { color: var(--danger); }
 
   /* ── section scaffolding ────────────────────────────────────────────── */
-  section { padding: var(--s8) 0; border-top: 1px solid var(--border); scroll-margin-top: 72px; }
+  section { padding: var(--s9) 0; border-top: 1px solid var(--border); scroll-margin-top: 74px; }
   section.flush { border-top: 0; padding-top: 0; }
-  .section-head { max-width: 62ch; margin-bottom: var(--s6); }
-  .section-head .kicker { font-family: var(--mono); font-size: .74rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
-  .section-head h2 { font-size: clamp(1.5rem, 3vw, 2rem); margin-top: var(--s3); }
-  .section-head p { color: var(--text-2); margin-top: var(--s3); font-size: 1.02rem; }
+  .section-head { max-width: 60ch; margin-bottom: var(--s7); }
+  .section-head .kicker, .section-head .model-label { display: block; margin-bottom: var(--s4); }
+  .section-head h2 { font-size: clamp(1.9rem, 3.4vw, 2.9rem); }
+  .section-head p { color: var(--text-2); margin-top: var(--s4); font-size: 1.02rem; }
 
   /* ── job result cards ───────────────────────────────────────────────── */
-  .results-meta { display: flex; align-items: center; gap: var(--s3); color: var(--muted); font-size: .86rem; margin-bottom: var(--s4); }
-  .results-grid { display: grid; gap: var(--s3); }
-  .job {
-    display: grid; grid-template-columns: 72px 1fr auto; gap: var(--s5); align-items: start;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: var(--s5); transition: border-color .15s, background .15s, transform .12s;
-  }
-  .job:hover { border-color: var(--border-strong); background: var(--surface-2); }
+  #hunt-result { margin-top: var(--s8); }
+  .results-meta { display: flex; align-items: baseline; gap: var(--s2); color: var(--muted); font-family: var(--mono); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; margin-bottom: var(--s5); padding-bottom: var(--s4); border-bottom: 1px solid var(--border); }
+  .results-grid { display: grid; gap: 0; }
+  .job { display: grid; grid-template-columns: 72px 1fr auto; gap: var(--s5); align-items: start; padding: var(--s6) 0; border-top: 1px solid var(--border); transition: background .15s; }
+  .job:first-child { border-top: 0; }
+  .job:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
   .ring { position: relative; width: 64px; height: 64px; }
   .ring svg { transform: rotate(-90deg); display: block; }
-  .ring .val { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-weight: 600; font-size: 1.18rem; }
-  .job .title { font-size: 1.06rem; font-weight: 600; letter-spacing: -0.01em; }
-  .job .company { color: var(--text-2); font-size: .92rem; margin-top: 2px; }
+  .ring .val { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-weight: 500; font-size: 1.2rem; color: var(--text); }
+  .job .title { font-size: 1.18rem; font-weight: 600; letter-spacing: -0.01em; font-family: var(--serif); }
+  .job .company { color: var(--text-2); font-size: .92rem; margin-top: 3px; }
   .job .facts { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); margin-top: var(--s3); color: var(--muted); font-size: .85rem; }
   .job .facts .pay { color: var(--text); font-family: var(--mono); font-size: .82rem; }
-  .signals { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
-  .sig { display: inline-flex; align-items: center; gap: 6px; font-size: .78rem; padding: 4px 9px; border-radius: 7px; border: 1px solid var(--border); color: var(--text-2); background: var(--surface-2); }
+  .signals { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s4); }
+  .sig { display: inline-flex; align-items: center; gap: 6px; font-size: .78rem; padding: 4px 9px; border-radius: 6px; border: 1px solid var(--border); color: var(--text-2); background: var(--surface); }
   .sig .g { color: var(--pos); } .sig .b { color: var(--accent); } .sig .a { color: var(--warn); }
   .sig .sc { font-family: var(--mono); color: var(--muted); }
-  .job .why { color: var(--text-2); font-size: .88rem; margin-top: var(--s3); max-width: 62ch; }
-  .job .side { display: flex; flex-direction: column; gap: var(--s2); align-items: stretch; text-align: right; min-width: 128px; }
-  .job .band { font-size: .8rem; font-weight: 600; }
+  .job .why { color: var(--text-2); font-size: .9rem; margin-top: var(--s4); max-width: 64ch; }
+  .job .side { display: flex; flex-direction: column; gap: var(--s2); align-items: flex-end; text-align: right; min-width: 132px; }
+  .job .band { font-family: var(--mono); font-size: .74rem; letter-spacing: .06em; text-transform: uppercase; font-weight: 500; }
   .band.hi { color: var(--pos); } .band.mid { color: var(--accent); } .band.lo { color: var(--warn); } .band.min { color: var(--muted); }
-  .answer-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s5) var(--s6); }
-  .answer-card .a-label { font-size: 1.12rem; font-weight: 600; }
-  .answer-card .a-body { color: var(--text-2); margin-top: var(--s3); }
+  .answer-card { border-left: 2px solid var(--accent); padding: var(--s2) 0 var(--s2) var(--s5); }
+  .answer-card .a-label { font-size: 1.3rem; font-weight: 600; font-family: var(--serif); letter-spacing: -0.01em; }
+  .answer-card .a-body { color: var(--text-2); margin-top: var(--s3); max-width: 66ch; }
 
-  /* ── trust pipeline ─────────────────────────────────────────────────── */
-  .pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; position: relative; }
-  .pnode { position: relative; padding: var(--s5) var(--s4); border: 1px solid var(--border); background: var(--surface); }
-  .pnode:not(:last-child) { border-right: 0; }
-  .pnode:first-child { border-radius: var(--radius) 0 0 var(--radius); }
-  .pnode:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
-  .pnode .idx { font-family: var(--mono); font-size: .72rem; color: var(--faint); }
-  .pnode .pname { font-weight: 600; font-size: .95rem; margin-top: var(--s2); }
-  .pnode .pdesc { color: var(--muted); font-size: .84rem; margin-top: var(--s2); line-height: 1.5; }
-  .pnode .intent { display: inline-block; margin-top: var(--s3); font-family: var(--mono); font-size: .72rem; color: var(--accent); background: var(--accent-soft); padding: 2px 7px; border-radius: 5px; }
-  .pnode .arrow { position: absolute; right: -9px; top: 50%; transform: translateY(-50%); z-index: 2; width: 18px; height: 18px; border-radius: 50%; background: var(--bg); color: var(--faint); display: grid; place-items: center; font-size: .7rem; }
-  .pnode.final { background: linear-gradient(180deg, var(--accent-soft), transparent); border-color: var(--accent-line); }
-  .pnode.final .pname { color: #fff; }
+  /* ── trust network (editorial layers) ───────────────────────────────── */
+  .layers { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: var(--s8); align-items: start; }
+  .layers-head { position: sticky; top: 90px; }
+  .layers-head .display { font-size: clamp(1.9rem, 3.6vw, 3rem); margin-top: var(--s4); }
+  .layers-head .lede { margin-top: var(--s4); font-size: .98rem; }
+  .layer-rows { list-style: none; margin: 0; padding: 0; }
+  .layer-rows li { display: grid; grid-template-columns: 40px 1fr; gap: var(--s4); padding: var(--s6) 0; border-top: 1px solid var(--border); }
+  .layer-rows li:first-child { border-top: 0; padding-top: 0; }
+  .lr .lr-k { font-family: var(--mono); font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .lr .lr-t { display: block; font-family: var(--serif); font-weight: 600; font-size: 1.3rem; letter-spacing: -0.01em; margin-top: 4px; }
+  .lr p { color: var(--text-2); margin-top: var(--s2); font-size: .95rem; max-width: 52ch; }
+  .intent { display: inline-block; margin-top: var(--s3); font-family: var(--mono); font-size: .72rem; color: var(--accent); border: 1px solid var(--accent-line); background: var(--accent-soft); padding: 2px 8px; border-radius: 5px; }
+  .lr.final .lr-t { color: var(--accent); }
 
   /* ── vet workspace ──────────────────────────────────────────────────── */
-  .vet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s5); align-items: start; }
+  .vet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s6); align-items: start; }
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--s6); }
-  .vet textarea {
-    width: 100%; min-height: 200px; resize: vertical; background: var(--bg-soft);
-    border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text);
-    padding: var(--s4); font: 400 .9rem/1.6 var(--mono); transition: border-color .15s, box-shadow .15s;
-  }
-  .vet textarea:focus { outline: none; border-color: var(--accent-line); box-shadow: 0 0 0 4px var(--accent-soft); }
+  .vet textarea { width: 100%; min-height: 220px; resize: vertical; background: var(--bg); border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text); padding: var(--s4); font: 400 .9rem/1.6 var(--mono); transition: border-color .15s, box-shadow .15s; }
+  .vet textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
   .vet textarea::placeholder { color: var(--faint); }
   .vet .btnrow { display: flex; gap: var(--s2); margin-top: var(--s4); align-items: center; flex-wrap: wrap; }
   .vet .hint { color: var(--faint); font-size: .82rem; margin-top: var(--s3); }
   .vet .hint a { cursor: pointer; }
-  .vet-out .placeholder { color: var(--faint); font-size: .92rem; text-align: center; padding: var(--s7) var(--s4); }
+  .vet-out .placeholder { color: var(--faint); font-size: .92rem; text-align: center; padding: var(--s8) var(--s4); }
 
-  /* verification progress pipeline (live) */
+  /* verification progress (live) */
   .vsteps { list-style: none; padding: 0; margin: 0; }
   .vstep { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s3) 0; border-bottom: 1px solid var(--border); opacity: .4; transition: opacity .3s; }
   .vstep:last-child { border-bottom: 0; }
   .vstep.on { opacity: 1; }
-  .vstep .ic { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: .72rem; font-weight: 700; border: 1px solid var(--border-strong); color: var(--muted); margin-top: 1px; }
+  .vstep .ic { flex: 0 0 auto; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-family: var(--mono); font-size: .72rem; font-weight: 500; border: 1px solid var(--border-strong); color: var(--muted); margin-top: 1px; }
   .vstep.done .ic { background: var(--pos-soft); border-color: transparent; color: var(--pos); }
   .vstep.run .ic { border-color: var(--accent); color: var(--accent); }
   .vstep.skip .ic { color: var(--warn); border-color: var(--warn); }
@@ -222,68 +229,66 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
   .vstep .tags { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
 
   /* verdict */
-  .verdict-head { display: flex; align-items: center; gap: var(--s5); }
-  .verdict-ring { flex: 0 0 auto; position: relative; width: 96px; height: 96px; }
+  .verdict-head { display: flex; align-items: center; gap: var(--s5); padding-bottom: var(--s5); border-bottom: 1px solid var(--border); }
+  .verdict-ring { flex: 0 0 auto; position: relative; width: 92px; height: 92px; }
   .verdict-ring svg { transform: rotate(-90deg); }
-  .verdict-ring .num { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-weight: 650; font-size: 1.6rem; }
-  .verdict-ring .den { font-size: .8rem; color: var(--faint); }
-  .verdict-label { font-size: 1.35rem; font-weight: 650; letter-spacing: -0.02em; }
+  .verdict-ring .num { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--mono); font-weight: 500; font-size: 1.6rem; color: var(--text); }
+  .verdict-label { font-size: 1.5rem; font-weight: 600; font-family: var(--serif); letter-spacing: -0.02em; }
   .verdict-label.clear { color: var(--pos); } .verdict-label.caution { color: var(--warn); }
   .verdict-label.avoid { color: var(--danger); } .verdict-label.unknown { color: var(--muted); }
-  .verdict-sub { color: var(--muted); font-size: .86rem; margin-top: 4px; }
+  .verdict-sub { color: var(--muted); font-size: .86rem; margin-top: 5px; }
   .badge { display: inline-flex; align-items: center; font-family: var(--mono); font-size: .72rem; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; }
   .badge.miner { color: var(--accent); border-color: var(--accent-line); }
   .badge.cost { color: var(--pos); border-color: var(--pos-soft); }
-  .finding { border-left: 2px solid var(--border-strong); padding: var(--s2) 0 var(--s2) var(--s4); margin: var(--s3) 0; }
+  .finding { border-left: 2px solid var(--border-strong); padding: var(--s2) 0 var(--s2) var(--s4); margin: var(--s4) 0; }
   .finding.red { border-color: var(--danger); } .finding.yellow { border-color: var(--warn); }
   .finding.green { border-color: var(--pos); } .finding.info { border-color: var(--faint); }
   .finding b { font-size: .92rem; }
   .finding p { color: var(--text-2); font-size: .88rem; margin-top: 3px; }
-  .finding .src { color: var(--faint); font-size: .76rem; margin-top: 5px; }
-  .subhead { font-family: var(--mono); font-size: .74rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: var(--s5) 0 var(--s3); }
+  .finding .src { color: var(--faint); font-family: var(--mono); font-size: .74rem; margin-top: 6px; }
+  .subhead { font-family: var(--mono); font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: var(--s6) 0 var(--s3); }
   .qs { margin: 0; padding-left: 1.1rem; color: var(--text-2); }
   .qs li { margin: var(--s2) 0; font-size: .9rem; }
   .receipt { list-style: none; padding: 0; margin: 0; }
   .receipt li { display: flex; gap: var(--s3); padding: var(--s3) 0; border-bottom: 1px solid var(--border); }
   .receipt li:last-child { border-bottom: 0; }
   .receipt .tick { flex: 0 0 auto; width: 20px; text-align: center; font-weight: 700; }
-  .receipt .ok .tick, .receipt li.ok .tick { color: var(--pos); }
+  .receipt li.ok .tick { color: var(--pos); }
   .receipt li.skip .tick { color: var(--warn); } .receipt li.fail .tick { color: var(--danger); }
   .receipt .rl { font-weight: 550; font-size: .9rem; }
   .receipt .tags { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .receipt p { color: var(--text-2); font-size: .85rem; margin-top: 5px; }
   .receipt .sig { font-family: var(--mono); color: var(--faint); font-size: .74rem; border: 0; background: none; padding: 0; }
-  .share-line { margin-top: var(--s5); padding: var(--s4); background: var(--bg-soft); border: 1px solid var(--border); border-radius: var(--radius); font-size: .88rem; color: var(--text-2); }
+  .share-line { margin-top: var(--s5); padding: var(--s4); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); font-size: .88rem; color: var(--text-2); }
   .share-line a { word-break: break-all; }
 
   /* ── activity / telemetry ───────────────────────────────────────────── */
-  .telemetry { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-  .tcell { padding: var(--s5); border-right: 1px solid var(--border); }
+  .telemetry { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; border-top: 1px solid var(--border-strong); }
+  .tcell { padding: var(--s5) var(--s5) var(--s5) 0; border-right: 1px solid var(--border); }
   .tcell:last-child { border-right: 0; }
-  .tcell .n { font-family: var(--mono); font-size: 1.5rem; font-weight: 600; }
-  .tcell .l { color: var(--muted); font-size: .78rem; margin-top: 4px; }
-  .activity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s5); margin-top: var(--s5); }
-  .subpanel { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s5); }
-  .subpanel h3 { font-size: .95rem; font-weight: 600; margin-bottom: var(--s4); }
+  .tcell .n { font-family: var(--mono); font-size: 1.7rem; font-weight: 500; letter-spacing: -0.02em; }
+  .tcell .l { color: var(--muted); font-family: var(--mono); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; margin-top: 6px; }
+  .activity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s7); margin-top: var(--s7); }
+  .subpanel h3 { font-family: var(--mono); font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); font-weight: 500; margin: 0 0 var(--s4); }
   .miners { list-style: none; padding: 0; margin: 0; }
-  .miners li { display: flex; justify-content: space-between; gap: var(--s3); padding: var(--s2) 0; border-bottom: 1px dashed var(--border); font-size: .86rem; }
-  .miners li:last-child { border-bottom: 0; }
+  .miners li { display: flex; justify-content: space-between; gap: var(--s3); padding: var(--s3) 0; border-top: 1px solid var(--border); font-size: .86rem; }
+  .miners li:first-child { border-top: 0; }
   .miners .mn { font-family: var(--mono); color: var(--accent); font-size: .82rem; }
-  .miners .mc { color: var(--muted); font-size: .82rem; }
+  .miners .mc { color: var(--muted); font-family: var(--mono); font-size: .8rem; }
   .feed { list-style: none; padding: 0; margin: 0; }
-  .feed li { display: flex; justify-content: space-between; align-items: center; gap: var(--s3); padding: var(--s2) 0; border-bottom: 1px dashed var(--border); }
-  .feed li:last-child { border-bottom: 0; }
-  .feed a { color: var(--text-2); font-size: .9rem; }
-  .feed a:hover { color: var(--text); }
+  .feed li { display: flex; justify-content: space-between; align-items: center; gap: var(--s3); padding: var(--s3) 0; border-top: 1px solid var(--border); }
+  .feed li:first-child { border-top: 0; }
+  .feed a { color: var(--text); font-size: .92rem; }
+  .feed a:hover { color: var(--accent); }
   .feed .r { display: flex; align-items: center; gap: var(--s3); }
-  .feed .when { color: var(--faint); font-size: .78rem; }
-  .vpill { font-family: var(--mono); font-size: .7rem; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
+  .feed .when { color: var(--faint); font-family: var(--mono); font-size: .74rem; }
+  .vpill { font-family: var(--mono); font-size: .68rem; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .06em; }
   .vpill.clear { background: var(--pos-soft); color: var(--pos); } .vpill.caution { background: var(--warn-soft); color: var(--warn); }
   .vpill.avoid { background: var(--danger-soft); color: var(--danger); } .vpill.unknown { background: var(--surface-2); color: var(--muted); }
-  .empty { color: var(--faint); font-size: .88rem; }
+  .empty { color: var(--faint); font-size: .88rem; padding: var(--s2) 0; }
 
   /* ── footer ─────────────────────────────────────────────────────────── */
-  footer { border-top: 1px solid var(--border); padding: var(--s7) 0; color: var(--faint); font-size: .85rem; }
+  footer { border-top: 1px solid var(--border); padding: var(--s8) 0; color: var(--faint); font-size: .85rem; }
   footer .row { display: flex; justify-content: space-between; gap: var(--s5); flex-wrap: wrap; align-items: center; }
   footer a { color: var(--muted); }
 
@@ -291,32 +296,31 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
   .reveal.in { opacity: 1; transform: none; }
 
   /* ── responsive ─────────────────────────────────────────────────────── */
-  @media (max-width: 900px) {
-    .nav { display: none; }
-    .nav.open { display: flex; position: absolute; top: 60px; left: 0; right: 0; flex-direction: column; align-items: stretch; gap: 2px; background: var(--bg-soft); border-bottom: 1px solid var(--border); padding: var(--s3) var(--s5); margin: 0; }
-    .nav.open a { padding: 12px; }
+  @media (max-width: 960px) {
+    .nav, .hpills { display: none; }
+    .nav.open { display: flex; position: absolute; top: 66px; left: 0; right: 0; flex-direction: column; align-items: stretch; gap: 0; background: var(--bg); border-bottom: 1px solid var(--border); padding: var(--s3) var(--s6); margin: 0; }
+    .nav.open a { padding: 12px 0; border-bottom: 1px solid var(--border); border-top: 0; }
     .menu-btn { display: block; }
-    .live { display: none; }
+    .hero-grid { grid-template-columns: 1fr; gap: var(--s7); }
+    .hero-model { border-left: 0; border-top: 1px solid var(--border-strong); padding-left: 0; padding-top: var(--s5); }
+    .layers { grid-template-columns: 1fr; gap: var(--s6); }
+    .layers-head { position: static; }
     .vet-grid { grid-template-columns: 1fr; }
     .telemetry { grid-template-columns: repeat(2, 1fr); }
     .tcell:nth-child(2n) { border-right: 0; }
     .tcell { border-bottom: 1px solid var(--border); }
-    .activity-grid { grid-template-columns: 1fr; }
-    .pipeline { grid-template-columns: 1fr; }
-    .pnode { border-right: 1px solid var(--border) !important; border-bottom: 0; }
-    .pnode:not(:last-child) { border-bottom: 0; }
-    .pnode:first-child { border-radius: var(--radius) var(--radius) 0 0; }
-    .pnode:last-child { border-radius: 0 0 var(--radius) var(--radius); }
-    .pnode .arrow { right: 50%; top: auto; bottom: -9px; transform: translateX(50%); }
+    .activity-grid { grid-template-columns: 1fr; gap: var(--s6); }
   }
   @media (max-width: 620px) {
     .wrap { padding: 0 var(--s4); }
     .hero { padding: var(--s7) 0 var(--s6); }
+    section { padding: var(--s7) 0; }
     .searchfield { flex-wrap: wrap; padding: var(--s3); }
     .searchfield input { flex-basis: 100%; padding: 8px 4px; }
-    .searchfield .btn { flex: 1; }
+    .searchfield .btn { flex: 1; justify-content: center; }
     .job { grid-template-columns: 56px 1fr; }
     .job .side { grid-column: 1 / -1; flex-direction: row; justify-content: flex-start; text-align: left; align-items: center; min-width: 0; margin-top: var(--s2); }
+    .layer-rows li { grid-template-columns: 1fr; gap: var(--s2); }
     .telemetry { grid-template-columns: 1fr; }
     .tcell { border-right: 0; }
   }
@@ -329,15 +333,18 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
 <body>
 <header class="appbar">
   <div class="wrap row">
-    <a class="brand" href="/"><span class="dot"></span>Legwork</a>
+    <a class="brand" href="/"><span class="mark"></span> Legwork</a>
     <button class="menu-btn" id="menu-btn" aria-label="Menu" aria-expanded="false">≡</button>
     <nav class="nav" id="nav" aria-label="Primary">
-      <a href="#jobs">Jobs</a>
-      <a href="#vet">Vet an offer</a>
+      <a href="#jobs" class="active">Jobs</a>
       <a href="#trust">Trust network</a>
+      <a href="#vet">Vet an offer</a>
       <a href="#activity">Activity</a>
-      <span class="live"><span class="pulse"></span>Network live</span>
     </nav>
+    <div class="hpills">
+      <span class="hpill"><span class="ldot"></span>Network live</span>
+      <a class="hpill" href="/miner.yaml">Miner 8402 ›</a>
+    </div>
   </div>
 </header>
 
@@ -345,26 +352,40 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
   <!-- HERO + SEARCH -->
   <section class="flush hero" id="jobs" aria-labelledby="hero-h1">
     <div class="wrap">
-      <span class="eyebrow"><span class="tick">✦</span> Job search, independently verified</span>
-      <h1 id="hero-h1">Find jobs worth applying to.</h1>
-      <p class="lede">Legwork searches live job boards and verifies every opportunity through an independent trust network — so the score you see is checked, not guessed.</p>
+      <div class="hero-grid">
+        <div class="hero-main">
+          <span class="eyebrow">Live job search · independently verified</span>
+          <h1 class="display" id="hero-h1">Find jobs worth applying to. <span class="ital">Verified, not guessed.</span></h1>
+          <p class="lede">Legwork searches live job boards and verifies every opportunity through an independent trust network — so the score you see is checked, not guessed.</p>
 
-      <form class="searchbar" id="hunt-form" role="search">
-        <label class="visually-hidden" for="huntq" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Search live job boards</label>
-        <div class="searchfield">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
-          <input id="huntq" type="text" autocomplete="off" maxlength="500" placeholder="Senior backend engineer, TypeScript, remote, $150k+">
-          <button class="btn btn-primary" id="run-hunt" type="submit">Search live jobs</button>
+          <form class="searchbar" id="hunt-form" role="search">
+            <label for="huntq" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Search live job boards</label>
+            <div class="searchfield">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+              <input id="huntq" type="text" autocomplete="off" maxlength="500" placeholder="Senior backend engineer, TypeScript, remote, $150k+">
+              <button class="btn btn-primary" id="run-hunt" type="submit">Search live jobs →</button>
+            </div>
+            <div class="examples">
+              <span class="label">Try</span>
+              <button type="button" class="chip hq">registered nurse jobs in Austin</button>
+              <button type="button" class="chip hq">what does a data analyst earn in New York</button>
+              <button type="button" class="chip hq">remote product manager, $180k+</button>
+            </div>
+            <p class="secondary-cta">Have an offer already? <a href="#vet">Vet it for scams and red flags →</a></p>
+            <p class="inline-status" id="hunt-status" aria-live="polite"></p>
+          </form>
         </div>
-        <div class="examples">
-          <span class="label">Try</span>
-          <button type="button" class="chip hq">registered nurse jobs in Austin</button>
-          <button type="button" class="chip hq">what does a data analyst earn in New York</button>
-          <button type="button" class="chip hq">remote product manager, $180k+</button>
-        </div>
-        <p class="secondary-cta">Have an offer already? <a href="#vet">Vet it for scams and red flags →</a></p>
-        <p class="inline-status" id="hunt-status" aria-live="polite"></p>
-      </form>
+
+        <aside class="hero-model" aria-label="The Legwork model">
+          <div class="model-label">The Legwork model</div>
+          <ol class="model-list">
+            <li><span class="mnum">01</span><div><b>Live boards</b><span class="d">Adzuna, USAJOBS &amp; Remotive, scanned in real time.</span></div></li>
+            <li><span class="mnum">02</span><div><b>Explained score</b><span class="d">Every match graded 0–100 on a published rubric.</span></div></li>
+            <li><span class="mnum">03</span><div><b>Independent checks</b><span class="d">Scam, news, URL &amp; claims bought from miners.</span></div></li>
+            <li><span class="mnum">04</span><div><b>Named &amp; priced</b><span class="d">Every finding names its miner and its cost.</span></div></li>
+          </ol>
+        </aside>
+      </div>
 
       <div id="hunt-result" aria-live="polite"></div>
     </div>
@@ -372,19 +393,19 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
 
   <!-- TRUST NETWORK -->
   <section id="trust" class="reveal" aria-labelledby="trust-h">
-    <div class="wrap">
-      <div class="section-head">
-        <span class="kicker">The trust network</span>
-        <h2 id="trust-h">Every answer is independently checked.</h2>
-        <p>The verdict isn't one model's opinion. Each offer flows through independent checks — most run by separate miners on the Telegraph network — and every finding names the miner that produced it, its confidence, and what it cost.</p>
+    <div class="wrap layers">
+      <div class="layers-head">
+        <div class="model-label">The trust network</div>
+        <h2 class="display" id="trust-h">One answer. Five checks.</h2>
+        <p class="lede">The verdict isn't one model's opinion. Each offer flows through independent checks — most run by separate miners on the Telegraph network — and every finding names the miner that produced it, its confidence, and its cost.</p>
       </div>
-      <div class="pipeline" role="list">
-        <div class="pnode" role="listitem"><div class="idx">01</div><div class="pname">Recruiter scam scan</div><div class="pdesc">Fake-recruiter bait, fee harvesting, identity-theft signals.</div><span class="intent">FRAUD_DETECTION</span><span class="arrow">→</span></div>
-        <div class="pnode" role="listitem"><div class="idx">02</div><div class="pname">Company news</div><div class="pdesc">Layoffs, funding trouble, scandals, exec departures — live.</div><span class="intent">NEWS_SEARCH</span><span class="arrow">→</span></div>
-        <div class="pnode" role="listitem"><div class="idx">03</div><div class="pname">URL safety</div><div class="pdesc">Phishing or malware on the link they want you to click.</div><span class="intent">URL_SCAN</span><span class="arrow">→</span></div>
-        <div class="pnode" role="listitem"><div class="idx">04</div><div class="pname">Claims fact-check</div><div class="pdesc">Are the salary, funding and awards actually true?</div><span class="intent">FACT_CHECK</span><span class="arrow">→</span></div>
-        <div class="pnode final" role="listitem"><div class="idx">05</div><div class="pname">Independent verdict</div><div class="pdesc">Signals synthesized into an explained 0–100 verdict.</div><span class="intent">VERDICT</span></div>
-      </div>
+      <ol class="layer-rows">
+        <li><span class="mnum">01</span><div class="lr"><span class="lr-k">Fraud detection</span><span class="lr-t">Recruiter scam scan</span><p>Fake-recruiter bait, fee harvesting and identity-theft signals — caught before you reply.</p><span class="intent">FRAUD_DETECTION</span></div></li>
+        <li><span class="mnum">02</span><div class="lr"><span class="lr-k">News search</span><span class="lr-t">Company research</span><p>Layoffs, funding trouble, scandals and exec departures — checked live at request time.</p><span class="intent">NEWS_SEARCH</span></div></li>
+        <li><span class="mnum">03</span><div class="lr"><span class="lr-k">URL scan</span><span class="lr-t">Link safety</span><p>Phishing or malware on the career-page link they want you to click.</p><span class="intent">URL_SCAN</span></div></li>
+        <li><span class="mnum">04</span><div class="lr"><span class="lr-k">Fact check</span><span class="lr-t">Claims verification</span><p>Are the salary, funding and awards the posting claims actually true?</p><span class="intent">FACT_CHECK</span></div></li>
+        <li><span class="mnum">05</span><div class="lr final"><span class="lr-k">Synthesis</span><span class="lr-t">Independent verdict</span><p>Every signal is weighed into a single explained 0–100 verdict — with the receipt.</p><span class="intent">VERDICT</span></div></li>
+      </ol>
     </div>
   </section>
 
@@ -392,19 +413,19 @@ export const REDFLAG_PAGE_HTML = `<!doctype html>
   <section id="vet" class="reveal" aria-labelledby="vet-h">
     <div class="wrap vet">
       <div class="section-head">
-        <span class="kicker">Verification</span>
-        <h2 id="vet-h">Is this job offer legitimate?</h2>
+        <span class="model-label">Verification</span>
+        <h2 class="display" id="vet-h">Is this offer legitimate?</h2>
         <p>Paste an offer, recruiter email, or job posting. A free local scan runs instantly; the full verification buys four live checks from independent miners — on us.</p>
       </div>
       <div class="vet-grid">
         <div class="panel">
-          <label class="visually-hidden" for="posting" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Offer or job posting to verify</label>
+          <label for="posting" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Offer or job posting to verify</label>
           <textarea id="posting" placeholder="Paste the offer, recruiter email, or job posting here…
 
 e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply at https://acme.example/careers"></textarea>
           <p class="hint">No offer handy? Load <a id="load-clean">a clean posting</a> or <a id="load-scam">a classic scam</a>.</p>
           <div class="btnrow">
-            <button class="btn btn-primary" id="run-full" type="button">Run verification</button>
+            <button class="btn btn-primary" id="run-full" type="button">Run verification →</button>
             <button class="btn btn-ghost" id="run-free" type="button">Free scan</button>
             <span class="inline-status" id="status" aria-live="polite"></span>
           </div>
@@ -420,8 +441,8 @@ e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply
   <section id="activity" class="reveal" aria-labelledby="act-h">
     <div class="wrap">
       <div class="section-head">
-        <span class="kicker">Network activity</span>
-        <h2 id="act-h">The trust network, working.</h2>
+        <span class="model-label">Network activity</span>
+        <h2 class="display" id="act-h">The trust network, working.</h2>
         <p>Live telemetry from the checks this app has bought — real spend on real independent miners.</p>
       </div>
       <div class="telemetry" id="telemetry" role="list"></div>
@@ -598,7 +619,7 @@ e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply
           '</div>' +
         '</article>';
       }).join('');
-      host.innerHTML = '<div style="margin-top:var(--s6)">' + head + '<div class="results-grid">' + cards + '</div></div>';
+      host.innerHTML = '<div>' + head + '<div class="results-grid">' + cards + '</div></div>';
       Array.prototype.forEach.call(host.querySelectorAll('.ring'), function (ring) {
         animateRing(ring, Number(ring.getAttribute('data-score')) || 0, 64, 5);
       });
@@ -612,9 +633,9 @@ e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply
       });
     } else {
       // ANSWER shape — pay synthesis or a direct answer to a general question.
-      host.innerHTML = '<div style="margin-top:var(--s6)"><div class="answer-card">' +
+      host.innerHTML = '<div class="answer-card">' +
         '<div class="a-label">' + esc(signal.label) + '</div>' +
-        '<div class="a-body">' + esc((signal.reason || '').slice(0, 700)) + '</div></div></div>';
+        '<div class="a-body">' + esc((signal.reason || '').slice(0, 700)) + '</div></div>';
     }
   }
 
@@ -682,7 +703,7 @@ e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply
     var vcls = r.verdict || 'unknown';
     var out = [];
     out.push('<div class="verdict-head">' +
-      '<div class="verdict-ring">' + ringHtml(96, 7) + '<span class="num mono" data-count="1">0</span></div>' +
+      '<div class="verdict-ring">' + ringHtml(92, 7) + '<span class="num mono" data-count="1">0</span></div>' +
       '<div><div class="verdict-label ' + esc(vcls) + '">' + esc(VERDICT[vcls] || vcls) + '</div>' +
       '<div class="verdict-sub">' + esc(r.company || 'this offer') + (r.role ? ' · ' + esc(r.role) : '') + ' · confidence ' + score + '%</div>' +
       '<div class="verdict-sub">' + (full ? 'Full verification' : 'Free local scan') + ' · miner spend $' + Number(r.spendUsd || 0).toFixed(2) + ' of $' + Number(r.budgetUsd || 0).toFixed(2) + '</div>' +
@@ -709,13 +730,13 @@ e.g. Senior Backend Engineer at Acme Corp — remote-first, $170k–$210k. Apply
         (c.signalHash ? '<div class="sig">signal ' + esc(c.signalHash) + '</div>' : '') + '</div></li>');
     });
     out.push('</ul>');
-    if (shareUrl) out.push('<div class="share-line">🔗 Share this report: <a href="' + esc(shareUrl) + '">' + esc(shareUrl) + '</a> — a standing watch is included on the report page.</div>');
+    if (shareUrl) out.push('<div class="share-line">Share this report: <a href="' + esc(shareUrl) + '">' + esc(shareUrl) + '</a> — a standing watch is included on the report page.</div>');
     else out.push('<div class="share-line">This was the free local scan. Run the <b>full verification</b> to buy the four live miner checks and get a shareable report.</div>');
 
     var host = el('vet-out');
     host.innerHTML = out.join('');
     var ring = host.querySelector('.verdict-ring');
-    if (ring) animateRing(ring, score, 96, 7);
+    if (ring) animateRing(ring, score, 92, 7);
   }
 
   function runVet(url, body, full, working) {
